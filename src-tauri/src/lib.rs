@@ -1272,7 +1272,7 @@ mod tests {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     startup_recovery::initialize();
-    rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
+    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
     append_startup_probe("runtime prerequisites configured");
     #[cfg(target_os = "linux")]
     apply_linux_webkit_rendering_workarounds();

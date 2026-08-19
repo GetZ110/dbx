@@ -225,9 +225,9 @@ pub async fn auth_middleware(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    // Auth endpoints are always accessible.
+    // Auth endpoints and the readiness probe are always accessible.
     let api_suffix = middleware_api_path_suffix(req.uri().path(), &state.public_base_path);
-    if api_suffix.is_some_and(|suffix| suffix.starts_with("auth/")) {
+    if api_suffix.is_some_and(|suffix| suffix.starts_with("auth/") || suffix == "health") {
         return next.run(req).await;
     }
 

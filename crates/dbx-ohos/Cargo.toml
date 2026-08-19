@@ -1,0 +1,19 @@
+[package]
+name = "dbx-ohos"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi-ohos = "1.2"
+napi-derive-ohos = "1.2"
+dbx-web = { path = "../dbx-web", default-features = false, features = ["duckdb-sidecar", "mq-admin"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = "0.7"
+anyhow = "1"
+
+[build-dependencies]
+napi-build-ohos = "1.2"

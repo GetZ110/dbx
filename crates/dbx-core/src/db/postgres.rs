@@ -1851,7 +1851,7 @@ async fn connect_with_optional_local_timezone(
 ) -> Result<Pool, String> {
     let url_with_keepalive = inject_postgres_keepalive_params(url);
     let postgres_url = postgres_connection_url(&url_with_keepalive)?;
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let timeout = super::parse_connect_timeout_with_fallback(url, fallback_timeout);
 
@@ -2148,7 +2148,7 @@ fn postgres_tls_config(
     verifies_hostname: bool,
 ) -> Result<rustls::ClientConfig, String> {
     if pg_config.get_ssl_mode() != SslMode::Disable && accepts_invalid_certs {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoPostgresCertVerification { provider }));
@@ -2159,7 +2159,7 @@ fn postgres_tls_config(
     let builder = if verifies_hostname {
         rustls::ClientConfig::builder().with_root_certificates(root_store)
     } else {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(
             PostgresCaOnlyCertVerification { provider, roots: Arc::new(root_store) },
         ))
@@ -2192,7 +2192,7 @@ fn postgres_tls_client_auth(
                 return Err(format!("sslcert: no certificates found in {cert_path}"));
             }
             let private_key = read_postgres_private_key(key_path)?;
-            let provider = rustls::crypto::aws_lc_rs::default_provider();
+            let provider = rustls::crypto::ring::default_provider();
             let signing_key = provider
                 .key_provider
                 .load_private_key(private_key)
@@ -7744,7 +7744,7 @@ mod tests {
 
     #[test]
     fn postgres_tls_rejects_unpaired_client_cert_and_key() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let pg_config = tokio_postgres::Config::from_str("postgres://localhost/db?sslmode=require").unwrap();
         let ssl_files =
             PostgresSslFiles { sslcert: Some("/tmp/client.crt".to_string()), sslkey: None, sslrootcert: None };
@@ -7758,7 +7758,7 @@ mod tests {
 
     #[test]
     fn postgres_tls_rejects_empty_client_certificate() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::temp_dir();
         let suffix = uuid::Uuid::new_v4().simple();
         let cert = dir.join(format!("dbx-postgres-empty-client-{suffix}.crt"));
@@ -7782,7 +7782,7 @@ mod tests {
 
     #[test]
     fn postgres_tls_rejects_malformed_private_key() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::temp_dir();
         let suffix = uuid::Uuid::new_v4().simple();
         let cert = dir.join(format!("dbx-postgres-client-{suffix}.crt"));
@@ -7828,7 +7828,7 @@ mod tests {
     #[ignore = "requires DBX_TEST_POSTGRES_MTLS_URL with a valid client certificate"]
     fn postgres_mtls_cancel_connector_reuses_client_identity() {
         let url = std::env::var("DBX_TEST_POSTGRES_MTLS_URL").expect("DBX_TEST_POSTGRES_MTLS_URL");
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let context = build_postgres_cancel_context(&url).expect("build PostgreSQL TLS cancel context");
 
         make_rustls_connect_from_context(&context).expect("rebuild TLS connector with client certificate");
@@ -7846,7 +7846,7 @@ mod tests {
 
     #[test]
     fn postgres_accept_all_tls_signature_does_not_parse_unverified_cert() {
-        let verifier = NoPostgresCertVerification { provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()) };
+        let verifier = NoPostgresCertVerification { provider: Arc::new(rustls::crypto::ring::default_provider()) };
         let malformed_cert = CertificateDer::from(vec![0x30, 0x03, 0x02, 0x01, 0x00]);
 
         assert!(verifier.accept_tls_signature_for_unverified_cert(&malformed_cert).is_ok());

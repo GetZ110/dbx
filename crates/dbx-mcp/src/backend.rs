@@ -433,6 +433,16 @@ impl WebBackend {
 }
 
 impl LocalBackend {
+    /// Creates a local MCP backend that shares an already-open DBX [`AppState`].
+    ///
+    /// This avoids opening the SQLite database a second time during server
+    /// startup (which is especially slow on HarmonyOS) while still keeping the
+    /// same connection/query semantics.
+    pub fn with_app_state(state: Arc<AppState>) -> Self {
+        let data_dir = state.storage.data_dir().to_path_buf();
+        Self { state, data_dir }
+    }
+
     pub async fn open(path: &Path) -> Result<Self, String> {
         let storage = Storage::open(path).await?;
         let configs = storage.load_connections().await?;

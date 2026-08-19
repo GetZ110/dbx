@@ -17,6 +17,8 @@ system-fonts = ["dbx-core/system-fonts"]
 
 [dependencies]
 dbx-core = { path = "../dbx-core", default-features = false, features = ["openapi"] }
+dbx-mcp = { path = "../dbx-mcp", default-features = false, features = ["duckdb-sidecar", "mq-admin"] }
+rmcp = { version = "2.2.0", features = ["transport-streamable-http-server"] }
 redis = { version = "0.32", features = ["tokio-comp"] }
 axum = { version = "0.8", features = ["multipart", "ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "compression-gzip", "trace"] }
@@ -31,7 +33,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"]
 tracing = "0.1"
 async-stream = "0.3"
 futures = "0.3"
-rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-util = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 chrono = "0.4"
