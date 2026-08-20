@@ -436,6 +436,14 @@ const props = withDefaults(defineProps<DataGridProps>(), {
   allowDeleteRows: undefined,
 });
 
+const tableColumnsByResultIndex = computed(() =>
+  resolveDataGridColumnsByResultIndex({
+    resultColumns: props.result.columns,
+    sourceColumns: props.sourceColumns,
+    tableColumns: props.tableMeta?.columns ?? [],
+  }),
+);
+
 const dataGridTraceId = uuid().slice(0, 8);
 const dataGridCreatedAt = performance.now();
 const dataGridElapsed = () => `${Math.round(performance.now() - dataGridCreatedAt)}ms`;
@@ -739,6 +747,23 @@ const contextCell = ref<{
   rowIndex: number;
   col: number;
 } | null>(null);
+type ContextFilterTarget = {
+  id: number;
+  rowId: number;
+  rowIndex: number;
+  col: number;
+  columnName: string;
+  columnInfo?: ColumnInfo;
+  sourceResult: QueryResult;
+  sourceIndex?: number;
+  sourceValue: CellValue;
+  requiresHydration: boolean;
+};
+// The context menu closes before invoking its action. Keep an immutable target
+// for asynchronous filter actions instead of reading the cleared selection.
+const contextFilterTarget = ref<ContextFilterTarget | null>(null);
+let nextContextFilterTargetId = 0;
+const activeContextFilterActions = new Set<number>();
 // True when onCellContext created a synthetic single-cell selection (the cell
 // was not previously selected). Lets buildRequest distinguish a genuine 1×1
 // selection (user Ctrl+click) from a synthetic one (right-click on unselected).
@@ -755,13 +780,43 @@ function invalidateSyntheticContextSelection() {
 
 function onGridContextMenuOpen() {
   contextMenuLifecycle += 1;
+  const cell = contextCell.value;
+  const columnName = cell ? props.result.columns[cell.col] : undefined;
+  const sourceItem = cell ? getRowItem(cell.rowId) : undefined;
+  contextFilterTarget.value =
+    cell && columnName && sourceItem
+      ? {
+          id: ++nextContextFilterTargetId,
+          rowId: cell.rowId,
+          rowIndex: cell.rowIndex,
+          col: cell.col,
+          columnName,
+          columnInfo: props.tableMeta?.columns.find((column) => column.name === columnName),
+          sourceResult: props.result,
+          sourceIndex: sourceItem.sourceIndex,
+          sourceValue: sourceItem.data[cell.col] ?? null,
+          requiresHydration: sourceItem.sourceIndex !== undefined && isLargeValuePreview(sourceItem, cell.col),
+        }
+      : null;
 }
+
+watch(
+  () => props.result,
+  (result) => {
+    if (contextFilterTarget.value?.sourceResult !== result) contextFilterTarget.value = null;
+  },
+);
 
 function onGridContextMenuClose() {
   const lifecycle = ++contextMenuLifecycle;
+  const target = contextFilterTarget.value;
+  const targetId = target?.id;
   queueMicrotask(() => {
     if (lifecycle !== contextMenuLifecycle) return;
     invalidateSyntheticContextSelection();
+    // CustomContextMenu closes before starting an item action. Its action runs
+    // in this turn, so only a menu dismissal leaves this target unclaimed.
+    if (targetId !== undefined && contextFilterTarget.value?.id === targetId && !activeContextFilterActions.has(targetId)) contextFilterTarget.value = null;
   });
 }
 
@@ -820,6 +875,8 @@ const { searchText, deferredSearchText: deferredClientSearchText, overlayVisible
 
 const orderByInput = ref(props.initialOrderByInput ?? "");
 const whereFilterInput = ref(props.initialWhereInput ?? "");
+const conditionInputRevision = ref(0);
+const appliedConditionInputRevision = ref(0);
 const queryControlError = ref("");
 const conditionColumns = computed(() => dataGridConditionColumnOptions(props.tableMeta?.columns ?? props.result.columns, resolvedDatabaseType.value));
 const conditionIdentifierQuote = computed(() => dataGridConditionIdentifierQuote(resolvedDatabaseType.value, connectionStore.connectionIdentifierQuote?.(props.connectionId)));
@@ -1755,7 +1812,10 @@ function loadStructuredFilterStateForScope() {
     void buildStructuredWhereFromRules(structuredFilterRules.value).then((whereInput) => {
       if (structuredFilterCacheKey.value !== cacheKey || structuredFilterScopeKey.value !== scopeKey) return;
       appliedStructuredWhereInput.value = whereInput;
-      nextTick(() => emit("update:whereInput", currentWhereInput() ?? ""));
+      nextTick(() => {
+        emit("update:whereInput", currentWhereInput() ?? "");
+        markConditionInputsApplied();
+      });
     });
     return;
   }
@@ -1763,6 +1823,7 @@ function loadStructuredFilterStateForScope() {
   serverColumnFilters.value = {};
   structuredFilterRules.value = filterBuilderColumnOptions.value.length > 0 ? [defaultStructuredFilterRule()] : [];
   persistStructuredFilterState();
+  markConditionInputsApplied();
 }
 
 function ensureStructuredFilterRule() {
@@ -1986,6 +2047,22 @@ function onSearchKeydown(e: KeyboardEvent) {
     e.preventDefault();
     navigateMatch(e.shiftKey ? -1 : 1);
   }
+}
+
+watch(
+  [whereFilterInput, orderByInput],
+  () => {
+    conditionInputRevision.value += 1;
+  },
+  { flush: "sync" },
+);
+
+function markConditionInputsApplied() {
+  appliedConditionInputRevision.value = conditionInputRevision.value;
+}
+
+function hasPendingConditionInputs(): boolean {
+  return conditionInputRevision.value !== appliedConditionInputRevision.value;
 }
 
 watch(whereFilterInput, () => {
@@ -3730,14 +3807,6 @@ function measureCellTextWidthCached(text: string, font: string): number {
   return width;
 }
 
-const tableColumnsByResultIndex = computed(() =>
-  resolveDataGridColumnsByResultIndex({
-    resultColumns: props.result.columns,
-    sourceColumns: props.sourceColumns,
-    tableColumns: props.tableMeta?.columns ?? [],
-  }),
-);
-
 function tableColumnForGridColumn(columnIndex: number): ColumnInfo | undefined {
   return tableColumnsByResultIndex.value[columnIndex];
 }
@@ -3899,8 +3968,14 @@ async function onToolbarRefresh() {
   if (transactionActive.value) {
     discardChanges();
   }
+  const resetToFirstPage = hasPendingConditionInputs();
+  if (resetToFirstPage) {
+    currentPage.value = 1;
+    resetGridVerticalScroll(true);
+  }
+  markConditionInputsApplied();
   prepareFullReload();
-  emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, (currentPage.value - 1) * pageSize.value, "refresh");
+  emit("reload", props.sql, searchText.value, currentWhereInput(), currentOrderBy(), pageSize.value, resetToFirstPage ? 0 : (currentPage.value - 1) * pageSize.value, "refresh");
 }
 
 function setAutoRefreshInterval(seconds: number) {
@@ -5638,17 +5713,8 @@ function applyContextSort(direction: "asc" | "desc" | null, mode: DataGridSortMo
   applyColumnSort(contextColumn.value, contextCell.value.col, direction, mode);
 }
 
-async function contextFilterCondition(mode: FilterMode): Promise<string | null> {
-  const target = contextCell.value;
-  if (!target) return null;
-  const columnName = props.result.columns[target.col];
-  if (!columnName) return null;
-  const sourceResult = props.result;
-  const sourceItem = getRowItem(target.rowId);
-  if (!sourceItem) return null;
-  const sourceIndex = sourceItem.sourceIndex;
-  const requiresHydration = sourceIndex !== undefined && isLargeValuePreview(sourceItem, target.col);
-  const sourceValue = sourceItem.data[target.col] ?? null;
+async function contextFilterCondition(target: ContextFilterTarget, mode: FilterMode): Promise<string | null> {
+  const { columnName, sourceResult, sourceIndex, sourceValue, requiresHydration } = target;
   // CustomContextMenu closes before invoking its action. Keep the target
   // stable across hydration after the close lifecycle clears contextCell.
   if (mode !== "is-null" && mode !== "is-not-null") {
@@ -5656,25 +5722,32 @@ async function contextFilterCondition(mode: FilterMode): Promise<string | null> 
   }
   if (props.result !== sourceResult) return null;
   const value = requiresHydration && sourceIndex !== undefined ? (sourceResult.rows[sourceIndex]?.[target.col] ?? null) : sourceValue;
-  return (
-    (await buildDataGridContextFilterCondition({
-      databaseType: resolvedDatabaseType.value,
-      identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
-      columnName,
-      columnInfo: props.tableMeta?.columns.find((column) => column.name === columnName),
-      mode,
-      value,
-    })) ?? null
-  );
+  const condition = await buildDataGridContextFilterCondition({
+    databaseType: resolvedDatabaseType.value,
+    identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connectionId),
+    columnName,
+    columnInfo: target.columnInfo,
+    mode,
+    value,
+  });
+  return props.result === sourceResult ? (condition ?? null) : null;
 }
 
 async function applyContextFilter(mode: FilterMode) {
   if (!canUseWhereSearch.value) return;
-  const condition = await contextFilterCondition(mode);
-  if (!condition) return;
-  const existing = whereFilterInput.value.trim();
-  whereFilterInput.value = existing ? `(${existing}) AND (${condition})` : condition;
-  await applyWhereFilter();
+  const target = contextFilterTarget.value;
+  if (!target) return;
+  activeContextFilterActions.add(target.id);
+  try {
+    const condition = await contextFilterCondition(target, mode);
+    if (!condition || props.result !== target.sourceResult) return;
+    const existing = whereFilterInput.value.trim();
+    whereFilterInput.value = existing ? `(${existing}) AND (${condition})` : condition;
+    await applyWhereFilter();
+  } finally {
+    activeContextFilterActions.delete(target.id);
+    if (contextFilterTarget.value?.id === target.id) contextFilterTarget.value = null;
+  }
 }
 
 async function clearContextFilter() {
@@ -5731,6 +5804,7 @@ async function applyOrderBySearch() {
       whereInput: currentWhereInput(),
       includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
     });
+    markConditionInputsApplied();
     await props.onExecuteSql(sql);
   } catch (e: any) {
     queryControlError.value = String(e?.message || e);
@@ -5767,6 +5841,7 @@ async function applyWhereFilter() {
       whereInput,
       includeRowId: usesSyntheticRowIdKey(resolvedDatabaseType.value, tableMeta.primaryKeys, tableMeta.tableType),
     });
+    markConditionInputsApplied();
     await props.onExecuteSql(sql);
   } catch (e: any) {
     queryControlError.value = String(e?.message || e);

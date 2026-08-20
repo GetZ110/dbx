@@ -24,10 +24,10 @@ use dbx_core::sql_dialect::hot_reload::DialectHotReload;
 use dbx_core::storage::Storage;
 use state::WebState;
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
 use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
 use tower_http::compression::CompressionLayer;
 use utoipa::OpenApi;
+use tokio_util::sync::CancellationToken;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService};
 use dbx_mcp::{DbxBackend, DbxMcpServer, LocalBackend};
@@ -185,6 +185,7 @@ fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
         .route("/mq/messages/trace", post(routes::mq::query_message_trace))
         .route("/mq/subscriptions/list", post(routes::mq::list_subscriptions))
         .route("/mq/subscriptions/enrich", post(routes::mq::enrich_subscriptions))
+        .route("/mq/kafka/consumer-groups", post(routes::mq::get_kafka_consumer_group_snapshot))
         .route("/mq/subscriptions/create", post(routes::mq::create_subscription))
         .route("/mq/subscriptions/delete", post(routes::mq::delete_subscription))
         .route("/mq/subscriptions/skip-messages", post(routes::mq::skip_messages))
@@ -295,6 +296,11 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         ))
     };
 
+    // Reuse the already-open AppState/Storage for MCP instead of opening the
+    // SQLite database a second time. On HarmonyOS the duplicate open + schema
+    // init added roughly 10s to every cold start.
+    let mcp_backend: Arc<dyn DbxBackend> = Arc::new(LocalBackend::with_app_state(app_state.clone()));
+
     // Password hash: env var takes priority, then database
     let password_disabled = std::env::var("DBX_DISABLE_PASSWORD")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -310,10 +316,6 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
     };
 
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
-    // Reuse the already-open AppState/Storage for MCP instead of opening the
-    // SQLite database a second time. On HarmonyOS the duplicate open + schema
-    // init added roughly 10s to every cold start.
-    let mcp_backend: Arc<dyn DbxBackend> = Arc::new(LocalBackend::with_app_state(app_state.clone()));
 
     let web_state = Arc::new(WebState {
         app: app_state,
@@ -398,7 +400,9 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/agents/runtime/stop", post(routes::agents::stop_driver_runtime))
         .route("/agents/runtime/restart", post(routes::agents::restart_driver_runtime))
         .route("/agents/install", post(routes::agents::install_agent))
+        .route("/agents/cancel-install", post(routes::agents::cancel_install))
         .route("/agents/upgrade-all", post(routes::agents::upgrade_all_agents))
+        .route("/agents/cancel-upgrade-all", post(routes::agents::cancel_upgrade_all))
         .route("/agents/update-blockers", post(routes::agents::check_agent_update_blockers))
         .route("/agents/uninstall", post(routes::agents::uninstall_agent))
         .route("/agents/import-offline", post(routes::agents::import_agents_from_zip))
@@ -440,6 +444,8 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/schema/triggers", get(routes::schema::list_triggers))
         .route("/schema/constraints", get(routes::schema::list_constraints))
         .route("/schema/partitions", get(routes::schema::list_partitions))
+        .route("/schema/table-partition-status", get(routes::schema::get_table_partition_status))
+        .route("/schema/invalid-indexes", get(routes::schema::list_invalid_indexes))
         .route("/schema/subpartitions", get(routes::schema::list_subpartitions))
         .route("/schema/functions", get(routes::schema::list_functions))
         .route("/schema/sequences", get(routes::schema::list_sequences))
@@ -496,6 +502,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/query/build-drop-table-child-object-sql", post(routes::query::build_drop_table_child_object_sql))
         .route("/query/build-empty-table-sql", post(routes::query::build_empty_table_sql))
         .route("/query/build-truncate-table-sql", post(routes::query::build_truncate_table_sql))
+        .route("/query/build-vacuum-table-sql", post(routes::query::build_vacuum_table_sql))
         .route("/query/build-mysql-auto-increment-sql", post(routes::query::build_mysql_auto_increment_sql))
         .route("/query/build-drop-database-sql", post(routes::query::build_drop_database_sql))
         .route("/query/build-create-schema-sql", post(routes::query::build_create_schema_sql))
@@ -582,6 +589,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/redis/load-more", post(routes::redis::load_more))
         .route("/redis/set-string", post(routes::redis::set_string))
         .route("/redis/delete-key", post(routes::redis::delete_key))
+        .route("/redis/rename-key", post(routes::redis::rename_key))
         .route("/redis/hash-set", post(routes::redis::hash_set))
         .route("/redis/hash-del", post(routes::redis::hash_del))
         .route("/redis/hash-field-set-ttl", post(routes::redis::hash_field_set_ttl))
@@ -743,6 +751,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         // Nacos
         .route("/nacos/test-connection", post(routes::nacos::test_connection))
         .route("/nacos/namespaces/list", post(routes::nacos::list_namespaces))
+        .route("/nacos/sidebar/snapshot", post(routes::nacos::sidebar_snapshot))
         .route("/nacos/namespaces/create", post(routes::nacos::create_namespace))
         .route("/nacos/namespaces/update", post(routes::nacos::update_namespace))
         .route("/nacos/configs/list", post(routes::nacos::list_configs))
@@ -754,6 +763,18 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/nacos/configs/history/rollback", post(routes::nacos::rollback_config))
         .route("/nacos/rnacos-console/captcha", post(routes::nacos::get_rnacos_console_captcha))
         .route("/nacos/rnacos-console/login", post(routes::nacos::login_rnacos_console))
+        .route("/nacos/users/list", post(routes::nacos::list_users))
+        .route("/nacos/users/create", post(routes::nacos::create_user))
+        .route("/nacos/users/update", post(routes::nacos::update_user))
+        .route("/nacos/users/delete", post(routes::nacos::delete_user))
+        .route("/nacos/roles/list", post(routes::nacos::list_role_bindings))
+        .route("/nacos/roles/assign", post(routes::nacos::assign_role))
+        .route("/nacos/roles/remove", post(routes::nacos::remove_role))
+        .route("/nacos/access/snapshot", post(routes::nacos::access_snapshot))
+        .route("/nacos/access/operations/start", post(routes::nacos::start_access_operation))
+        .route("/nacos/access/operations/get", post(routes::nacos::get_access_operation))
+        .route("/nacos/access/operations/retry", post(routes::nacos::retry_access_operation))
+        .route("/nacos/access/operations/undo", post(routes::nacos::undo_access_operation))
         .route("/nacos/services/list", post(routes::nacos::list_services))
         .route("/nacos/services/get", post(routes::nacos::get_service))
         .route("/nacos/services/create", post(routes::nacos::create_service))
@@ -776,6 +797,8 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/mongo/list-databases", post(routes::mongo::list_databases))
         .route("/mongo/list-collections", post(routes::mongo::list_collections))
         .route("/mongo/vector-collection-detail", post(routes::mongo::vector_collection_detail))
+        .route("/vector/drop-database", post(routes::mongo::vector_drop_database))
+        .route("/vector/drop-collection", post(routes::mongo::vector_drop_collection))
         .route("/mongo/create-database", post(routes::mongo::create_database))
         .route("/mongo/drop-database", post(routes::mongo::drop_database))
         .route("/mongo/drop-collection", post(routes::mongo::drop_collection))
@@ -784,6 +807,8 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/document-store/list-databases", post(routes::document_store::list_databases))
         .route("/document-store/list-collections", post(routes::document_store::list_collections))
         .route("/document-store/find-documents", post(routes::document_store::find_documents))
+        .route("/document-store/count-documents", post(routes::document_store::count_documents))
+        .route("/document-store/dynamodb-describe-table", post(routes::document_store::describe_dynamodb_table))
         .route(
             "/document-store/elasticsearch-count-documents",
             post(routes::document_store::elasticsearch_count_documents),
@@ -799,6 +824,18 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/document-store/update-document", post(routes::document_store::update_document))
         .route("/document-store/delete-document", post(routes::document_store::delete_document))
         .route("/document-store/save-meilisearch-batch", post(routes::document_store::save_meilisearch_batch))
+        .route("/document-store/meilisearch/search", post(routes::document_store::meilisearch_search))
+        .route("/document-store/meilisearch/documents/fetch", post(routes::document_store::meilisearch_fetch_documents))
+        .route("/document-store/meilisearch/documents/get", post(routes::document_store::meilisearch_get_document))
+        .route("/document-store/meilisearch/settings/get", post(routes::document_store::meilisearch_get_settings))
+        .route("/document-store/meilisearch/settings/update", post(routes::document_store::meilisearch_update_settings))
+        .route("/document-store/meilisearch/stats", post(routes::document_store::meilisearch_get_stats))
+        .route("/document-store/meilisearch/overview", post(routes::document_store::meilisearch_get_overview))
+        .route("/document-store/meilisearch/index/delete", post(routes::document_store::meilisearch_delete_index))
+        .route(
+            "/document-store/meilisearch/documents/delete-all",
+            post(routes::document_store::meilisearch_delete_all_documents),
+        )
         .route("/mongo/find-documents", post(routes::mongo::find_documents))
         .route("/mongo/parse-shell-command", post(routes::mongo::parse_shell_command))
         .route("/mongo/explain-find", post(routes::mongo::explain_find))

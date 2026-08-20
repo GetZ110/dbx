@@ -5289,9 +5289,14 @@ fn prefers_text_protocol_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
 }
 
 pub(crate) fn is_result_set_query(sql: &str, dialect: MySqlQueryDialect) -> bool {
+    // MySQL 的表维护语句虽然不是 SELECT，但服务器会返回包含表名和执行结果的表格。
+    // 如果把它们当成普通写入语句，后续 drop_result 会直接丢弃这些返回行。
     starts_with_executable_sql_keyword_for_database(
         sql,
-        &["SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "CALL"],
+        &[
+            "SELECT", "SHOW", "DESCRIBE", "EXPLAIN", "WITH", "CALL", "CHECKSUM", "ANALYZE", "CHECK", "OPTIMIZE",
+            "REPAIR",
+        ],
         DatabaseType::Mysql,
     ) || mysql_statement_returns_rows(sql)
         || is_xa_recover_query(sql)
@@ -6085,6 +6090,22 @@ mod tests {
     #[test]
     fn mysql_desc_queries_are_treated_as_result_sets() {
         assert!(is_result_set_query("DESC users", MySqlQueryDialect::default()));
+    }
+
+    #[test]
+    fn mysql_table_maintenance_queries_are_treated_as_result_sets() {
+        let dialect = MySqlQueryDialect::default();
+
+        for sql in [
+            "CHECKSUM TABLE `users`;",
+            "analyze table users",
+            "-- 检查表状态\nCHECK TABLE users",
+            "/* 整理表 */ OPTIMIZE TABLE users",
+            "repair table users quick",
+        ] {
+            assert!(is_result_set_query(sql, dialect), "{sql}");
+            assert!(prefers_text_protocol_query(sql, dialect), "{sql}");
+        }
     }
 
     #[test]
