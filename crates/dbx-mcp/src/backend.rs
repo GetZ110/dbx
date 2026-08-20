@@ -2673,7 +2673,8 @@ mod tests {
             // A single default provider avoids the "could not automatically
             // determine the process-level CryptoProvider" panic in workspace
             // builds where multiple rustls crypto features are present.
-            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+            // HarmonyOS port: OHOS cannot link aws-lc-rs; use ring consistently.
+            let _ = rustls::crypto::ring::default_provider().install_default();
             let config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(certs, key).unwrap();
             let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
 

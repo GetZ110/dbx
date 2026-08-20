@@ -27,7 +27,7 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 
 [dev-dependencies]
-rustls = { version = "0.23", features = ["aws-lc-rs"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2.2"
 tempfile = "3"
 tokio = { version = "1", features = ["net", "io-util"] }
