@@ -13,7 +13,7 @@ use crate::query::{
     agent_execute_query_params, pool_error_action, PoolErrorAction, QueryExecutionOptions, AGENT_PROTOCOL_MAX_ROWS,
 };
 use crate::sql::{split_sql_statements, split_sql_statements_for_database};
-use crate::sql_dialect::{qualified_transfer_table, quote_transfer_identifier};
+use crate::sql_dialect::{normalize_len_params, qualified_transfer_table, quote_transfer_identifier};
 
 static CANCELLED: std::sync::LazyLock<RwLock<HashSet<String>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashSet::new()));
@@ -1170,12 +1170,17 @@ pub fn sqlserver_object_ddl_from_result(
         _ => Err(format!("SQL Server object DDL not supported for {:?}", kind)),
     }
 }
-pub fn rewrite_oracle_schema_qualifier(ddl: &str, source_schema: &str, target_schema: &str) -> String {
+fn rewrite_double_quoted_schema_qualifier(ddl: &str, source_schema: &str, target_schema: &str) -> String {
     if source_schema == target_schema || source_schema.is_empty() {
         return ddl.to_string();
     }
-    let re = Regex::new(&format!(r#""{}"\."#, regex::escape(source_schema))).unwrap();
-    re.replace_all(ddl, &format!("\"{target_schema}\".")).to_string()
+    let source = format!("\"{}\".", source_schema.replace('"', "\"\""));
+    let target = format!("\"{}\".", target_schema.replace('"', "\"\""));
+    map_sql_code_spans(ddl, false, |code| code.replace(&source, &target))
+}
+
+pub fn rewrite_oracle_schema_qualifier(ddl: &str, source_schema: &str, target_schema: &str) -> String {
+    rewrite_double_quoted_schema_qualifier(ddl, source_schema, target_schema)
 }
 
 pub(crate) fn quote_postgres_string_literal(value: &str) -> String {
@@ -1301,6 +1306,85 @@ pub(crate) fn normalize_integer_literal(
         return None;
     }
     Some(integer.to_string())
+}
+
+fn is_postgres_numeric_family(data_type: &str) -> bool {
+    let normalized = data_type.trim().to_ascii_lowercase();
+    let base = normalized.split(['(', ' ']).next().unwrap_or("");
+    matches!(
+        base,
+        "smallint"
+            | "int2"
+            | "integer"
+            | "int4"
+            | "bigint"
+            | "int8"
+            | "numeric"
+            | "decimal"
+            | "real"
+            | "float4"
+            | "float"
+            | "double"
+            | "doubleprecision"
+            | "float8"
+    )
+}
+
+/// Strips validated en-US thousands separators from a numeric literal for numeric target
+/// columns. Only standard 3-digit grouping is accepted ("1,234", "12,345,678"); malformed
+/// grouping ("1,23,4", "1,,234") or any non-numeric character returns None so the original
+/// text reaches the database and keeps its existing validation error instead of being
+/// silently coerced. Values without a comma are left untouched.
+pub(crate) fn normalize_thousands_numeric_literal(
+    value: &str,
+    db_type: &DatabaseType,
+    column_type: Option<&str>,
+) -> Option<String> {
+    if !is_postgres_transfer_dialect(db_type) || !column_type.is_some_and(is_postgres_numeric_family) {
+        return None;
+    }
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.bytes().any(|byte| matches!(byte, b'e' | b'E')) {
+        return None;
+    }
+    let (negative, unsigned) = match trimmed.as_bytes().first() {
+        Some(b'-') => (true, &trimmed[1..]),
+        Some(b'+') => (false, &trimmed[1..]),
+        _ => (false, trimmed),
+    };
+    if unsigned.is_empty() {
+        return None;
+    }
+    let (integer_part, fraction) = match unsigned.split_once('.') {
+        Some((integer, fraction)) => (integer, Some(fraction)),
+        None => (unsigned, None),
+    };
+    if fraction.is_some_and(|fraction| fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit())) {
+        return None;
+    }
+    let mut digits = String::with_capacity(unsigned.len());
+    for (index, group) in integer_part.split(',').enumerate() {
+        if group.is_empty() || !group.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        if (index == 0 && group.len() > 3) || (index > 0 && group.len() != 3) {
+            return None;
+        }
+        digits.push_str(group);
+    }
+    if !integer_part.contains(',') {
+        return None;
+    }
+    let mut canonical = String::with_capacity(trimmed.len());
+    if negative {
+        canonical.push('-');
+    }
+    canonical.push_str(&digits);
+    if let Some(fraction) = fraction {
+        canonical.push('.');
+        canonical.push_str(fraction);
+    }
+    Some(canonical)
 }
 
 fn is_postgres_sequence_default(default_value: Option<&str>) -> bool {
@@ -2711,6 +2795,17 @@ fn is_timezone_suffix(value: &str) -> bool {
     )
 }
 
+fn transfer_length_params(source_type: &str, target_db: &DatabaseType) -> String {
+    let params = &source_type[source_type.find('(').expect("caller checked length parameters")..];
+    if matches!(target_db, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng) {
+        params.to_string()
+    } else {
+        // Oracle length-unit qualifiers are invalid for non-Oracle-family
+        // targets, which only accept the numeric length.
+        normalize_len_params(params)
+    }
+}
+
 pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: &DatabaseType) -> String {
     if _source_db == target_db {
         return source_type.to_string();
@@ -2794,7 +2889,7 @@ pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: 
         }
         "varchar" | "nvarchar" | "character varying" | "varchar2" => {
             if t.contains('(') {
-                let len_part = &t[t.find('(').unwrap()..];
+                let len_part = transfer_length_params(&t, target_db);
                 match target_db {
                     target_db if is_postgres_transfer_dialect(target_db) => format!("VARCHAR{len_part}"),
                     DatabaseType::Mysql => format!("VARCHAR{len_part}"),
@@ -2807,7 +2902,7 @@ pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: 
         }
         "char" | "nchar" | "character" => {
             if t.contains('(') {
-                let len_part = &t[t.find('(').unwrap()..];
+                let len_part = transfer_length_params(&t, target_db);
                 format!("CHAR{len_part}")
             } else {
                 "CHAR(1)".into()
@@ -3473,6 +3568,8 @@ fn rewrite_transfer_source_table_ddl(
 ) -> String {
     if is_postgres_family_target(source_db_type) && is_postgres_family_target(target_db_type) {
         rewrite_postgres_schema_qualified_references(sql, source_schema, target_schema)
+    } else if matches!((source_db_type, target_db_type), (DatabaseType::Dameng, DatabaseType::Dameng)) {
+        rewrite_double_quoted_schema_qualifier(sql, source_schema, target_schema)
     } else {
         sql.to_string()
     }
@@ -7371,9 +7468,10 @@ where
             | db::ObjectSourceKind::Synonym
             | db::ObjectSourceKind::Package
             | db::ObjectSourceKind::PackageBody => object.source.clone(),
-            db::ObjectSourceKind::Trigger | db::ObjectSourceKind::Type | db::ObjectSourceKind::TypeBody => {
-                object.source.clone()
-            }
+            db::ObjectSourceKind::Trigger
+            | db::ObjectSourceKind::Event
+            | db::ObjectSourceKind::Type
+            | db::ObjectSourceKind::TypeBody => object.source.clone(),
         };
         let statements = build_executable_object_source_statements(EditableObjectSourceSqlInput {
             database_type: DatabaseType::Postgres,
@@ -8372,10 +8470,18 @@ mod tests {
 
         #[test]
         fn rewrites_oracle_schema_qualifiers() {
-            let ddl = "CREATE OR REPLACE TRIGGER \"HR\".\"TRG1\" ...";
+            let ddl = concat!(
+                "CREATE OR REPLACE TRIGGER \"HR\".\"TRG1\" ... '\"HR\".literal';\n",
+                "-- keep \"HR\".line_comment\n",
+                "/* keep \"HR\".block_comment */",
+            );
             assert_eq!(
                 rewrite_oracle_schema_qualifier(ddl, "HR", "APP"),
-                "CREATE OR REPLACE TRIGGER \"APP\".\"TRG1\" ..."
+                concat!(
+                    "CREATE OR REPLACE TRIGGER \"APP\".\"TRG1\" ... '\"HR\".literal';\n",
+                    "-- keep \"HR\".line_comment\n",
+                    "/* keep \"HR\".block_comment */",
+                )
             );
         }
     }
@@ -8938,6 +9044,29 @@ mod tests {
     }
 
     #[test]
+    fn oracle_to_mysql_create_table_ddl_strips_char_length_units() {
+        // Issue #6479 end-to-end: Oracle columns reported with CHAR length
+        // semantics must produce valid MySQL DDL (`VARCHAR(6)`, not
+        // `VARCHAR(6 char)` which fails with ERROR 1064).
+        let cols = vec![
+            test_column("ID", "VARCHAR2(6 CHAR)"),
+            test_column("DWMC", "VARCHAR2(50 CHAR)"),
+            test_column("JOB", "VARCHAR2(20 CHAR)"),
+            test_column("FLAG", "CHAR(1 CHAR)"),
+        ];
+        let ddl =
+            generate_create_table_ddl(&cols, "USERS", "", "", &DatabaseType::Mysql, &DatabaseType::Oracle, None, None);
+        assert!(ddl.contains("`ID` VARCHAR(6)"), "ddl: {ddl}");
+        assert!(ddl.contains("`DWMC` VARCHAR(50)"), "ddl: {ddl}");
+        assert!(ddl.contains("`JOB` VARCHAR(20)"), "ddl: {ddl}");
+        assert!(ddl.contains("`FLAG` CHAR(1)"), "ddl: {ddl}");
+        // A `char`/`CHAR` immediately before `)` would be a leaked Oracle unit
+        // qualifier (`VARCHAR(6 char)`); a legit `CHAR(1)` does not match.
+        assert!(!ddl.contains("char)"), "Oracle length unit leaked into DDL: {ddl}");
+        assert!(!ddl.contains("CHAR)"), "Oracle length unit leaked into DDL: {ddl}");
+    }
+
+    #[test]
     fn dameng_create_table_omits_if_not_exists_without_changing_other_prefixes() {
         let cols = vec![test_column("id", "int")];
 
@@ -9483,6 +9612,36 @@ mod tests {
     }
 
     #[test]
+    fn dameng_transfer_reused_table_ddl_rewrites_only_code_schema_qualifiers() {
+        let ddl = concat!(
+            "CREATE TABLE \"SRC\".\"items\" (\"note\" VARCHAR(100) DEFAULT '\"SRC\".literal');\n",
+            "COMMENT ON TABLE \"SRC\".\"items\" IS '\"SRC\".comment';\n",
+            "-- keep \"SRC\".line_comment\n",
+            "/* keep \"SRC\".block_comment */\n",
+            "ALTER TABLE \"SRC\".\"items\" ADD \"value\" INTEGER;",
+        );
+
+        let rewritten =
+            rewrite_transfer_source_table_ddl(ddl, "SRC", "DST", &DatabaseType::Dameng, &DatabaseType::Dameng);
+
+        assert!(rewritten.contains("CREATE TABLE \"DST\".\"items\""));
+        assert!(rewritten.contains("COMMENT ON TABLE \"DST\".\"items\""));
+        assert!(rewritten.contains("ALTER TABLE \"DST\".\"items\""));
+        assert!(rewritten.contains("'\"SRC\".literal'"));
+        assert!(rewritten.contains("'\"SRC\".comment'"));
+        assert!(rewritten.contains("-- keep \"SRC\".line_comment"));
+        assert!(rewritten.contains("/* keep \"SRC\".block_comment */"));
+        assert_eq!(
+            rewrite_transfer_source_table_ddl(ddl, "SRC", "SRC", &DatabaseType::Dameng, &DatabaseType::Dameng),
+            ddl
+        );
+        assert_eq!(
+            rewrite_transfer_source_table_ddl(ddl, "", "DST", &DatabaseType::Dameng, &DatabaseType::Dameng),
+            ddl
+        );
+    }
+
+    #[test]
     fn hive_create_table_uses_hive_friendly_columns() {
         let cols = vec![
             db::ColumnInfo { is_primary_key: true, is_nullable: false, ..test_column("id", "bigint") },
@@ -9977,6 +10136,7 @@ mod tests {
             index_type: Some("btree".to_string()),
             included_columns: Some(vec!["created_at".to_string()]),
             comment: Some("lookup index".to_string()),
+            key_is_expression: Vec::new(),
         }];
         let foreign_keys = vec![
             db::ForeignKeyInfo {
@@ -11270,6 +11430,69 @@ SELECT 1 FROM dual"#
             ),
             PoolErrorAction::Discard
         );
+    }
+
+    #[test]
+    fn map_column_type_oracle_char_semantics_to_mysql() {
+        // Issue #6479: Oracle `VARCHAR2(50 CHAR)` must rewrite to `VARCHAR(50)`,
+        // not `VARCHAR(50 char)` which MySQL rejects with ERROR 1064 (42000).
+        assert_eq!(map_column_type("VARCHAR2(6 CHAR)", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(6)");
+        assert_eq!(map_column_type("VARCHAR2(50 CHAR)", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(50)");
+        assert_eq!(map_column_type("VARCHAR2(20 char)", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(20)");
+        assert_eq!(map_column_type("VARCHAR2(50    CHAR)", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(50)");
+        // NVARCHAR2 keeps its pre-existing fallback (TEXT) — no length unit leaks.
+        assert_eq!(map_column_type("NVARCHAR2(50 CHAR)", &DatabaseType::Oracle, &DatabaseType::Mysql), "TEXT");
+    }
+
+    #[test]
+    fn map_column_type_oracle_plain_varchar2_to_mysql() {
+        // Plain VARCHAR2 without a length unit must keep working unchanged.
+        assert_eq!(map_column_type("VARCHAR2(50)", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(50)");
+        assert_eq!(map_column_type("VARCHAR2", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(255)");
+    }
+
+    #[test]
+    fn map_column_type_preserves_length_units_for_oracle_family_targets() {
+        for target in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle, DatabaseType::Dameng] {
+            let source =
+                if target == DatabaseType::Oracle { DatabaseType::OceanbaseOracle } else { DatabaseType::Oracle };
+            assert_eq!(map_column_type("VARCHAR2(50 CHAR)", &source, &target), "VARCHAR(50 char)");
+            assert_eq!(map_column_type("CHAR(20 BYTE)", &source, &target), "CHAR(20 byte)");
+        }
+    }
+
+    #[test]
+    fn map_column_type_strips_length_units_for_non_oracle_targets() {
+        for target in [DatabaseType::Mysql, DatabaseType::Postgres, DatabaseType::SqlServer] {
+            assert!(!map_column_type("VARCHAR2(50 CHAR)", &DatabaseType::Oracle, &target).contains("char"));
+            assert!(!map_column_type("CHAR(20 BYTE)", &DatabaseType::Oracle, &target).contains("byte"));
+        }
+    }
+
+    #[test]
+    fn map_column_type_keeps_real_char_type_untouched() {
+        // CHAR(10) is a valid type on its own and must not lose its length.
+        assert_eq!(map_column_type("CHAR(10)", &DatabaseType::Oracle, &DatabaseType::Mysql), "CHAR(10)");
+        assert_eq!(map_column_type("char(10)", &DatabaseType::Mysql, &DatabaseType::Postgres), "CHAR(10)");
+    }
+
+    #[test]
+    fn map_column_type_oracle_byte_semantics_locked() {
+        // MySQL has no BYTE length semantics. The qualifier is stripped so the
+        // generated DDL stays valid; `VARCHAR2(20 BYTE)` maps to `VARCHAR(20)`
+        // (character length). This intentionally locks in the conservative
+        // behavior: never emit `VARCHAR(20 byte)`.
+        assert_eq!(map_column_type("VARCHAR2(20 BYTE)", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(20)");
+        assert_eq!(map_column_type("VARCHAR2(20 byte)", &DatabaseType::Oracle, &DatabaseType::Mysql), "VARCHAR(20)");
+    }
+
+    #[test]
+    fn map_column_type_preserves_numeric_precision_scale() {
+        // Precision/scale parameter lists must not be disturbed.
+        assert_eq!(map_column_type("NUMBER(10,2)", &DatabaseType::Oracle, &DatabaseType::Mysql), "DECIMAL(10,2)");
+        assert_eq!(map_column_type("DECIMAL(10,2)", &DatabaseType::Oracle, &DatabaseType::Mysql), "DECIMAL(10,2)");
+        assert_eq!(map_column_type("NUMBER(10)", &DatabaseType::Oracle, &DatabaseType::Mysql), "DECIMAL(10)");
+        assert_eq!(map_column_type("TIMESTAMP(6)", &DatabaseType::Oracle, &DatabaseType::Mysql), "DATETIME");
     }
 
     #[test]

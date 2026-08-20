@@ -118,6 +118,8 @@ export interface AgentDriverUpdateIssue {
 
 export interface UpgradeAllAgentDriversResult {
   upgraded: number;
+  /** Drivers whose install was aborted by a user cancel (single-driver or batch). */
+  cancelled: number;
   failed: AgentDriverUpdateIssue[];
 }
 
@@ -186,6 +188,7 @@ export interface DesktopSettings {
   quit_on_close: boolean;
   close_action_prompted: boolean;
   debug_logging_enabled: boolean;
+  metadata_cache_max_memory_mb: number;
   duckdb_worker_process_isolation: boolean;
   duckdb_worker_max_processes: number;
   saved_sql_sync_dir?: string | null;
@@ -365,6 +368,11 @@ export interface DriverInstallProgress {
 export interface AiMessage {
   role: "user" | "assistant" | "system";
   content: string;
+  /** Transient images for this message. Persisted conversation history intentionally omits them. */
+  images?: Array<{
+    mediaType: string;
+    data: string;
+  }>;
 }
 
 export interface AiTaskContract {
@@ -1644,6 +1652,29 @@ export async function listPartitions(connectionId: string, database: string, sch
   });
 }
 
+export interface TablePartitionStatus {
+  isPartitionedParent: boolean;
+  isPartition: boolean;
+}
+
+export async function getTablePartitionStatus(connectionId: string, database: string, schema: string, table: string): Promise<TablePartitionStatus> {
+  return invoke("get_table_partition_status", {
+    connectionId,
+    database,
+    schema,
+    table,
+  });
+}
+
+export async function listInvalidIndexes(connectionId: string, database: string, schema: string, table: string): Promise<string[]> {
+  return invoke("list_invalid_indexes", {
+    connectionId,
+    database,
+    schema,
+    table,
+  });
+}
+
 export async function listSubpartitions(connectionId: string, database: string, schema: string, table: string, catalog?: string): Promise<SubpartitionInfo[]> {
   return invoke("list_subpartitions", {
     connectionId,
@@ -1654,7 +1685,7 @@ export async function listSubpartitions(connectionId: string, database: string, 
   });
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string): Promise<string> {
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, portable = false): Promise<string> {
   return invoke("get_table_ddl", {
     connectionId,
     database,
@@ -1662,6 +1693,7 @@ export async function getTableDdl(connectionId: string, database: string, schema
     table,
     objectType,
     catalog,
+    portable,
   });
 }
 
@@ -1674,6 +1706,7 @@ export async function getTableDisplayDdl(connectionId: string, database: string,
     objectType,
     catalog,
     includePostgresAccess: true,
+    portable: false,
   });
 }
 
@@ -1888,6 +1921,14 @@ export async function installAgent(dbType: string, source?: UpdateDownloadSource
 
 export async function upgradeAllAgents(source?: UpdateDownloadSource, operationId?: string): Promise<UpgradeAllAgentDriversResult> {
   return invoke("upgrade_all_agents", { source, operationId });
+}
+
+export async function cancelAgentInstall(dbType: string, operationId?: string): Promise<void> {
+  return invoke("cancel_agent_install", { dbType, operationId });
+}
+
+export async function cancelAgentUpgradeAll(operationId?: string): Promise<void> {
+  return invoke("cancel_agent_upgrade_all", { operationId });
 }
 
 export async function checkAgentUpdateBlockers(dbTypes: string[]): Promise<AgentUpdateBlocker[]> {
@@ -2315,6 +2356,10 @@ export async function redisSetString(connectionId: string, db: number, keyRaw: s
 
 export async function redisDeleteKey(connectionId: string, db: number, keyRaw: string): Promise<void> {
   return invoke("redis_delete_key", { connectionId, db, keyRaw });
+}
+
+export async function redisRenameKey(connectionId: string, db: number, keyRaw: string, newKeyRaw: string): Promise<void> {
+  return invoke("redis_rename_key", { connectionId, db, keyRaw, newKeyRaw });
 }
 
 export async function redisHashSet(connectionId: string, db: number, keyRaw: string, field: string, value: string, ttl?: number): Promise<void> {
@@ -3286,6 +3331,31 @@ export interface DocumentQueryResult {
   extended_documents?: any[];
   total: number;
   total_is_exact?: boolean;
+  next_cursor?: string;
+}
+
+export interface DynamoDbKeyInfo {
+  name: string;
+  attributeType: "S" | "N" | "B" | string;
+}
+
+export interface DynamoDbIndexInfo {
+  name: string;
+  kind: "global" | "local" | string;
+  partitionKey: DynamoDbKeyInfo;
+  sortKey?: DynamoDbKeyInfo;
+  projectionType: "ALL" | "KEYS_ONLY" | "INCLUDE" | string;
+  nonKeyAttributes: string[];
+}
+
+export interface DynamoDbTableDescription {
+  name: string;
+  status: string;
+  itemCount: number;
+  sizeBytes: number;
+  partitionKey: DynamoDbKeyInfo;
+  sortKey?: DynamoDbKeyInfo;
+  indexes: DynamoDbIndexInfo[];
 }
 
 // Kept for callers that are specifically using MongoDB APIs.
@@ -3448,7 +3518,7 @@ export async function mongoParseShellCommand(source: string): Promise<MongoComma
   return normalizeRustMongoCommand(raw);
 }
 
-export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string): Promise<DocumentQueryResult> {
+export async function documentFindDocuments(connectionId: string, database: string, collection: string, skip: number, limit: number, filter?: string, projection?: string, sort?: string, collation?: string, executionId?: string, cursor?: string): Promise<DocumentQueryResult> {
   return invoke("document_find_documents", {
     connectionId,
     database,
@@ -3459,8 +3529,22 @@ export async function documentFindDocuments(connectionId: string, database: stri
     projection,
     sort,
     collation,
+    cursor,
     executionId,
   });
+}
+
+export async function documentCountDocuments(connectionId: string, collection: string, filter?: string, executionId?: string): Promise<number> {
+  return invoke("document_count_documents", {
+    connectionId,
+    collection,
+    filter,
+    executionId,
+  });
+}
+
+export async function dynamodbDescribeTable(connectionId: string, table: string): Promise<DynamoDbTableDescription> {
+  return invoke("dynamodb_describe_table", { connectionId, table });
 }
 
 export async function elasticsearchCountDocuments(connectionId: string, index: string, filter?: string, executionId?: string): Promise<number> {
@@ -4246,6 +4330,7 @@ export interface QueryResultExportRequest {
   exportColumnTypes?: Array<string | null | undefined>;
   numericColumnRightAlign?: boolean;
   columnComments?: Array<string | null> | null;
+  identifierQuote?: string;
 }
 
 export async function startTableExport(request: TableExportRequest, onProgress: (progress: TableExportProgress) => void): Promise<TableExportProgress> {
@@ -4364,6 +4449,10 @@ export async function exportDatabaseSql(request: DatabaseExportRequest, onProgre
 
 export async function cancelDatabaseExport(exportId: string): Promise<void> {
   await invoke("cancel_database_export", { exportId });
+}
+
+export async function recordDatabaseExportDestination(directory: string): Promise<void> {
+  await invoke("record_database_export_destination", { directory });
 }
 
 export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[]): Promise<void> {

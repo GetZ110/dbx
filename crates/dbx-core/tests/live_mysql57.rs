@@ -450,6 +450,7 @@ async fn live_mysql_query_result_export_xlsx_streams_single_query_without_duplic
         export_table_name: None,
         export_column_types: None,
         column_comments: None,
+        identifier_quote: None,
         numeric_column_right_align: false,
     };
     let done_seen = AtomicBool::new(false);
@@ -540,6 +541,7 @@ async fn live_mysql_xlsx_export_can_outlive_query_timeout_while_rows_keep_arrivi
         export_table_name: None,
         export_column_types: None,
         column_comments: None,
+        identifier_quote: None,
         numeric_column_right_align: false,
     };
     let rows_exported = AtomicU64::new(0);
@@ -702,9 +704,10 @@ async fn live_oceanbase_mysql_setup_applies_query_timeout() {
 async fn live_mysql_query_cancel_kills_running_sleep() {
     let url = std::env::var("DBX_LIVE_MYSQL_CANCEL_URL").expect("DBX_LIVE_MYSQL_CANCEL_URL");
 
-    let opts = mysql_async::OptsBuilder::from_opts(mysql_async::Opts::from_url(&url).unwrap())
-        .pool_opts(mysql_async::PoolOpts::new().with_constraints(mysql_async::PoolConstraints::new(1, 1).unwrap()));
-    let pool = mysql_async::Pool::new(opts);
+    let pool =
+        dbx_core::db::mysql::connect_bare_with_pool_limit_and_setup(&url, std::time::Duration::from_secs(10), 1, &[])
+            .await
+            .unwrap();
     let mut conn = dbx_core::db::mysql::get_conn_with_health_check(&pool).await.unwrap();
     let connection_id = mysql_async::Conn::id(&conn);
     let kill_opts = conn.opts().clone();
