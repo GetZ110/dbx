@@ -1,6 +1,8 @@
 import type { GridCellValue } from "@/lib/dataGrid/dataGridSql";
 import type { DatabaseType, ColumnInfo } from "@/types/database";
+import { binaryCellBytesToHexValue, binaryCellUtf8Text, isBlobCellColumnType } from "@/lib/dataGrid/binaryCellDownload";
 import { isNumericColumnType } from "@/lib/dataGrid/dataGridColumnType";
+import { isBooleanColumnType } from "@/lib/dataGrid/dataGridBooleanColumn";
 
 export interface CoerceDataGridCellValueOptions {
   value: string;
@@ -8,43 +10,83 @@ export interface CoerceDataGridCellValueOptions {
   databaseType: DatabaseType | undefined;
   columnInfo: Pick<ColumnInfo, "data_type"> | undefined;
   preserveEmptyString?: boolean;
+  /** Treat an empty inline bulk edit as SQL NULL before type coercion. */
+  emptyStringAsNull?: boolean;
 }
 
 export function coerceDataGridCellValue(options: CoerceDataGridCellValueOptions): GridCellValue {
   const { value, oldValue } = options;
+  if (value === "" && options.emptyStringAsNull) return null;
   if (value === "" && oldValue === null && !options.preserveEmptyString) return null;
+  const blobValue = coerceMysqlBlobTextValue(options);
+  if (blobValue !== undefined) return blobValue;
   const postgresArrayValue = coercePostgresArrayValue(options);
   if (postgresArrayValue !== undefined) return postgresArrayValue;
   // Excel-pasted values often carry thousands separators (10,000.00) that make
   // Number() return NaN and the literal fail to convert on the server. Strip
   // only unambiguous groupings and keep the normalized text for the precision
   // checks below, so exact values survive as text.
-  const numericText = normalizeGroupedNumberText(value, options.columnInfo);
-  if (typeof oldValue === "number") {
+  const useSampledValueType = normalizeDataType(options.columnInfo?.data_type) === "";
+  const numericInput = isNumericColumnType(options.columnInfo?.data_type) || (useSampledValueType && typeof oldValue === "number");
+  const numericText = normalizeGroupedNumberText(value, options.columnInfo, oldValue);
+  if (isBooleanInputColumn(options) || (useSampledValueType && typeof oldValue === "boolean")) {
+    // MySQL exposes TINYINT(1) as an integer in the grid. Keep its numeric
+    // 0/1 edits numeric while still accepting explicit TRUE/FALSE aliases.
+    const booleanValue = parseBooleanInput(numericText, !isMysqlTinyintOneColumn(options));
+    if (booleanValue !== undefined) return booleanValue;
+  }
+  if (numericInput) {
     const num = Number(numericText);
     if (!Number.isNaN(num)) {
       if (shouldPreserveNumericText(options, num, numericText)) {
         // Keep precision-sensitive numeric edits as text; JS Number rounds 64-bit integers.
         const text = numericText.trim();
-        if (text === String(oldValue)) return oldValue;
+        if (oldValue !== undefined && text === String(oldValue)) return oldValue;
         return text;
       }
       return num;
     }
   }
-  if (typeof oldValue === "boolean") {
-    return numericText === "true" || numericText === "1";
-  }
   return normalizeSmartQuotedJsonInput(numericText);
+}
+
+function isBooleanInputColumn(options: CoerceDataGridCellValueOptions): boolean {
+  if (isBooleanColumnType(options.columnInfo?.data_type, options.databaseType)) return true;
+  return options.databaseType === "mysql" && options.columnInfo?.data_type.trim().toLowerCase() === "tinyint(1)";
+}
+
+function isMysqlTinyintOneColumn(options: CoerceDataGridCellValueOptions): boolean {
+  return options.databaseType === "mysql" && options.columnInfo?.data_type.trim().toLowerCase() === "tinyint(1)";
+}
+
+function parseBooleanInput(value: string, allowNumericAliases: boolean): boolean | undefined {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  if (allowNumericAliases && normalized === "1") return true;
+  if (allowNumericAliases && normalized === "0") return false;
+  return undefined;
 }
 
 export function dataGridCellEditorText(options: { value: GridCellValue | undefined; databaseType: DatabaseType | undefined; columnInfo: Pick<ColumnInfo, "data_type"> | undefined }): string {
   const value = options.value ?? null;
   if (value === null) return "";
+  if (options.databaseType === "mysql" && isBlobCellColumnType(options.columnInfo?.data_type)) {
+    const text = binaryCellUtf8Text(value, options.columnInfo?.data_type, options.databaseType);
+    if (text !== null) return text;
+  }
   if (Array.isArray(value) && options.databaseType === "postgres" && isPostgresArrayColumn(options.columnInfo, value)) {
     return formatPostgresArrayText(value);
   }
   return typeof value === "object" ? JSON.stringify(value) : String(value);
+}
+
+function coerceMysqlBlobTextValue(options: CoerceDataGridCellValueOptions): GridCellValue | undefined {
+  if (options.databaseType !== "mysql" || !isBlobCellColumnType(options.columnInfo?.data_type)) return undefined;
+  const originalText = binaryCellUtf8Text(options.oldValue, options.columnInfo?.data_type, options.databaseType);
+  if (originalText === null) return undefined;
+  if (options.value === originalText) return options.oldValue;
+  return binaryCellBytesToHexValue(new TextEncoder().encode(options.value));
 }
 
 export function dataGridCellDisplayText(options: { value: GridCellValue; databaseType: DatabaseType | undefined; columnInfo: Pick<ColumnInfo, "data_type"> | undefined }): string | undefined {
@@ -103,8 +145,9 @@ function shouldPreserveNumericText(options: CoerceDataGridCellValueOptions, pars
   return shouldPreserveNumericTextForType(options.columnInfo?.data_type, text, parsedNumber);
 }
 
-function normalizeGroupedNumberText(value: string, columnInfo: Pick<ColumnInfo, "data_type"> | undefined): string {
-  if (!isNumericColumnType(columnInfo?.data_type)) return value;
+function normalizeGroupedNumberText(value: string, columnInfo: Pick<ColumnInfo, "data_type"> | undefined, oldValue: GridCellValue | undefined): string {
+  const useSampledNumberType = normalizeDataType(columnInfo?.data_type) === "" && typeof oldValue === "number";
+  if (!isNumericColumnType(columnInfo?.data_type) && !useSampledNumberType) return value;
   return stripUnambiguousThousandSeparators(value);
 }
 

@@ -1,6 +1,7 @@
 import { cellImagePreviewUrl } from "@/lib/dataGrid/cellImageUrl";
 import { displayCellValue, type CellValue } from "@/lib/dataGrid/cellValue";
 import { formatJsonText } from "@/lib/dataGrid/cellDetailPresentation";
+import type { DatabaseType } from "@/types/database";
 
 export const CELL_DETAIL_VALUE_PREVIEW_MAX_LENGTH = 12_000;
 
@@ -48,6 +49,7 @@ export interface BuildDataGridCellDetailOptions {
   commentByColumn?: ReadonlyMap<string, string>;
   displayValue: (value: CellValue, columnIndex: number) => string;
   isEditable: boolean;
+  databaseType?: DatabaseType;
   includeBinaryImagePreview?: boolean;
   isValuePreviewTruncated?: boolean;
 }
@@ -109,7 +111,10 @@ export function buildDataGridCellDetail(options: BuildDataGridCellDetailOptions)
     displayValue,
     displayValuePreview,
     isValuePreviewTruncated: options.isValuePreviewTruncated === true || rawValuePreview.length < rawValue.length || displayValuePreview.length < displayValue.length,
-    imagePreviewUrl: cellImagePreviewUrl(value, type, { binary: options.includeBinaryImagePreview !== false }),
+    imagePreviewUrl: cellImagePreviewUrl(value, type, {
+      binary: options.includeBinaryImagePreview !== false,
+      databaseType: options.databaseType,
+    }),
     length: value === null ? 0 : String(value).length,
     formattedJson,
     isEditable: options.isEditable,
@@ -226,6 +231,22 @@ export function dataGridColumnDetailJson(detail: DataGridColumnDetail): string {
 
 export function dataGridColumnDetailTsv(detail: DataGridColumnDetail): string {
   return detail.fields.map((field) => displayCellValue(field.value)).join("\n");
+}
+
+export interface BuildDeleteRowConfirmDetailsOptions<TRow> {
+  header: string;
+  rowIds: readonly number[];
+  columns: readonly string[];
+  getRow: (rowId: number) => TRow | undefined;
+  formatCell: (row: TRow, columnIndex: number) => string;
+}
+
+export function buildDeleteRowConfirmDetails<TRow>(options: BuildDeleteRowConfirmDetailsOptions<TRow>): string {
+  const rowLines = options.rowIds
+    .map((rowId) => options.getRow(rowId))
+    .filter((row): row is TRow => row !== undefined)
+    .map((row) => JSON.stringify(Object.fromEntries(options.columns.map((name, columnIndex) => [name, options.formatCell(row, columnIndex)]))));
+  return rowLines.length > 0 ? [options.header, ...rowLines].join("\n") : options.header;
 }
 
 export function filterDataGridDetailFields<T extends DataGridCellDetail>(fields: readonly T[], keyword: string): T[] {

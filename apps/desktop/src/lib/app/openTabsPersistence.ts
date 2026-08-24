@@ -9,6 +9,7 @@ export interface SavedQueryResultRun {
   sequence: number;
   sql: string;
   createdAt: number;
+  pinned?: boolean;
   activeResultIndex?: number;
   resultCacheKey?: string;
   resultEvicted?: boolean;
@@ -42,6 +43,7 @@ export interface SavedOpenTab {
   whereInput?: string;
   pinned?: boolean;
   mode?: QueryTab["mode"];
+  autoCommit?: boolean;
   mqTenant?: string;
   mqInitialTab?: QueryTab["mqInitialTab"];
   nacosNamespace?: string;
@@ -117,6 +119,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.whereInput !== undefined ? { whereInput: tab.whereInput } : {}),
     pinned: tab.pinned,
     mode: tab.mode,
+    ...(tab.mode === "query" && tab.autoCommit !== undefined ? { autoCommit: tab.autoCommit } : {}),
     ...(tab.mqTenant !== undefined ? { mqTenant: tab.mqTenant } : {}),
     ...(tab.mqInitialTab !== undefined ? { mqInitialTab: tab.mqInitialTab } : {}),
     ...(tab.nacosNamespace !== undefined ? { nacosNamespace: tab.nacosNamespace } : {}),
@@ -136,6 +139,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
             sequence: run.sequence,
             sql: run.sql,
             createdAt: run.createdAt,
+            ...(run.pinned ? { pinned: true } : {}),
             activeResultIndex: run.activeResultIndex,
             ...(run.resultCacheKey !== undefined ? { resultCacheKey: run.resultCacheKey } : {}),
             ...(run.resultEvicted ? { resultEvicted: true } : {}),

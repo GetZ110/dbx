@@ -35,6 +35,8 @@ const DATA_GRID_COLUMN_DISTINCT_VALUES_DEFAULT_LIMIT: usize = 1000;
 const DATA_GRID_COLUMN_DISTINCT_VALUES_MAX_LIMIT: usize = 1000;
 const MYSQL_DATA_GRID_BATCH_MAX_ROWS: usize = 500;
 const MYSQL_DATA_GRID_BATCH_TARGET_SQL_BYTES: usize = 256 * 1024;
+const ORACLE_SQL_LITERAL_MAX_BYTES: usize = 4000;
+const ORACLE_LOB_LITERAL_CHUNK_BYTES: usize = 3900;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -277,6 +279,19 @@ pub struct DataGridCountSqlOptions {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DataGridConditionalUpdateSqlOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_type: Option<DatabaseType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_quote: Option<String>,
+    pub table_meta: DataGridTableMeta,
+    pub column_name: String,
+    pub value: Value,
+    pub where_input: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HiveTablePropertiesSqlOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
@@ -386,7 +401,11 @@ pub fn build_data_grid_copy_update_statements(options: DataGridCopyUpdateStateme
                 format!(
                     "{} = {}",
                     data_grid_identifier(options.database_type, column, options.identifier_quote.as_deref()),
-                    format_grid_sql_literal(row.get(*index).unwrap_or(&Value::Null), options.database_type, *info)
+                    format_grid_assignment_sql_literal(
+                        row.get(*index).unwrap_or(&Value::Null),
+                        options.database_type,
+                        *info,
+                    )
                 )
             })
             .collect::<Vec<_>>()
@@ -889,6 +908,50 @@ pub fn build_data_grid_count_sql(options: DataGridCountSqlOptions) -> String {
     let hint = options.count_hint.as_deref().unwrap_or("");
     let hint_part = if hint.is_empty() { String::new() } else { format!(" {hint}") };
     format!("SELECT{hint_part} COUNT(*) AS cnt FROM {table}{where_clause}")
+}
+
+pub fn build_data_grid_conditional_update_sql(options: DataGridConditionalUpdateSqlOptions) -> Option<String> {
+    if options.database_type != Some(DatabaseType::Mysql) {
+        return None;
+    }
+    let predicate = crate::sql_dialect::normalize_where_input(Some(&options.where_input));
+    if predicate.is_empty() {
+        return None;
+    }
+
+    let columns = options.table_meta.columns.as_deref()?;
+    let column_info = column_info_for(columns, &options.column_name)?;
+    let primary_key_set: Vec<String> =
+        options.table_meta.primary_keys.iter().map(|primary_key| normalize_column_name(primary_key)).collect();
+    if primary_key_set.contains(&normalize_column_name(&column_info.name))
+        || column_info.is_primary_key
+        || is_grid_update_omitted_column(
+            options.database_type,
+            Some(column_info),
+            Some(&column_info.name),
+            &primary_key_set,
+        )
+    {
+        return None;
+    }
+
+    let table = data_grid_qualified_table_name(
+        options.database_type,
+        options.table_meta.catalog.as_deref(),
+        options.table_meta.schema.as_deref(),
+        options.table_meta.database.as_deref(),
+        &options.table_meta.table_name,
+        options.identifier_quote.as_deref(),
+    );
+    let sets = format!(
+        "{} = {}",
+        data_grid_identifier(options.database_type, &column_info.name, options.identifier_quote.as_deref()),
+        format_grid_save_sql_literal(&options.value, options.database_type, Some(column_info))
+    );
+    Some(data_grid_statement(
+        options.database_type,
+        data_grid_update_sql(options.database_type, &table, &sets, &format!("({predicate})")),
+    ))
 }
 
 pub fn build_hive_table_properties_sql(options: HiveTablePropertiesSqlOptions) -> String {
@@ -1429,7 +1492,7 @@ fn build_data_grid_rollback_statements(
         let values = insert_pairs
             .iter()
             .map(|(column, value)| {
-                format_grid_sql_literal(value, options.database_type, column_info_for(column_info, column))
+                format_grid_assignment_sql_literal(value, options.database_type, column_info_for(column_info, column))
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -1487,7 +1550,7 @@ fn build_data_grid_rollback_statements(
                 format!(
                     "{} = {}",
                     data_grid_identifier(options.database_type, column, options.identifier_quote.as_deref()),
-                    format_grid_sql_literal(
+                    format_grid_assignment_sql_literal(
                         row.get(*column_index).unwrap_or(&Value::Null),
                         options.database_type,
                         column_info_for(column_info, column)
@@ -1780,7 +1843,7 @@ fn build_hive_values_insert(
             if save_literals {
                 format_grid_save_sql_literal(value, options.database_type, info)
             } else {
-                format_grid_sql_literal(value, options.database_type, info)
+                format_grid_assignment_sql_literal(value, options.database_type, info)
             }
         })
         .collect::<Vec<_>>()
@@ -1848,21 +1911,81 @@ fn format_grid_copy_insert_sql_literal(
             }
         }
     }
-    // JSON columns may expose a JSON array/object value (e.g. `[1,2,3]` or `{}`)
-    // instead of its string form. Keep it as a single JSON literal rather than
-    // letting format_grid_sql_literal serialize it as a PostgreSQL-style array
-    // (`{...}`). Serialize the value back to compact JSON text, format that as a
-    // string literal, then cast it for MySQL so it inserts as JSON.
-    if column_info.is_some_and(|column| {
-        let dt = column.data_type.trim();
-        dt.eq_ignore_ascii_case("json") || dt.eq_ignore_ascii_case("jsonb")
-    }) && (value.is_array() || value.is_object())
-    {
-        let json_text = value.to_string();
-        let string_literal = format_grid_sql_literal(&Value::String(json_text), database_type, column_info);
-        return mysql_json_predicate_literal(string_literal, database_type, column_info);
+    format_grid_assignment_sql_literal(value, database_type, column_info)
+}
+
+fn format_grid_assignment_sql_literal(
+    value: &Value,
+    database_type: Option<DatabaseType>,
+    column_info: Option<&DataGridColumnInfo>,
+) -> String {
+    if matches!(database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle)) {
+        if let Some(constructor) = column_info.and_then(|column| oracle_character_lob_constructor(&column.data_type)) {
+            if let Some(text) = value.as_str() {
+                return format_oracle_lob_assignment_literal(text, constructor);
+            }
+        }
+    }
+    if (value.is_array() || value.is_object()) && is_json_document_column(column_info) {
+        return format_grid_sql_literal(&Value::String(value.to_string()), database_type, column_info);
     }
     format_grid_sql_literal(value, database_type, column_info)
+}
+
+fn format_oracle_lob_assignment_literal(text: &str, constructor: &str) -> String {
+    // Keep each Oracle SQL literal below the parser limit while preserving a CLOB result.
+    let escaped_len = text.chars().map(oracle_sql_literal_char_len).sum::<usize>();
+    if escaped_len <= ORACLE_SQL_LITERAL_MAX_BYTES {
+        let mut escaped_text = String::with_capacity(escaped_len);
+        append_oracle_sql_literal_characters(&mut escaped_text, text);
+        return format!("'{escaped_text}'");
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::with_capacity(ORACLE_LOB_LITERAL_CHUNK_BYTES);
+    let mut current_len = 0;
+    for ch in text.chars() {
+        let char_len = oracle_sql_literal_char_len(ch);
+        if current_len > 0 && current_len + char_len > ORACLE_LOB_LITERAL_CHUNK_BYTES {
+            chunks.push(format!("{constructor}('{current}')"));
+            current = String::with_capacity(ORACLE_LOB_LITERAL_CHUNK_BYTES);
+            current_len = 0;
+        }
+        append_oracle_sql_literal_char(&mut current, ch);
+        current_len += char_len;
+    }
+    if current_len > 0 {
+        chunks.push(format!("{constructor}('{current}')"));
+    }
+    chunks.join(" || ")
+}
+
+fn oracle_sql_literal_char_len(ch: char) -> usize {
+    match ch {
+        '\\' | '\'' => 2,
+        _ => ch.len_utf8(),
+    }
+}
+
+fn append_oracle_sql_literal_characters(output: &mut String, text: &str) {
+    for ch in text.chars() {
+        append_oracle_sql_literal_char(output, ch);
+    }
+}
+
+fn append_oracle_sql_literal_char(output: &mut String, ch: char) {
+    match ch {
+        '\\' => output.push_str("\\\\"),
+        '\'' => output.push_str("''"),
+        _ => output.push(ch),
+    }
+}
+
+fn is_json_document_column(column_info: Option<&DataGridColumnInfo>) -> bool {
+    column_info.is_some_and(|column| {
+        let data_type = column.data_type.trim();
+        data_type.eq_ignore_ascii_case("json") || data_type.eq_ignore_ascii_case("jsonb")
+    })
 }
 
 pub fn format_grid_sql_literal(
@@ -2085,7 +2208,7 @@ fn format_grid_save_sql_literal(
     if empty_string_saves_as_null(value, column_info) {
         "NULL".to_string()
     } else {
-        format_grid_sql_literal(value, database_type, column_info)
+        format_grid_assignment_sql_literal(value, database_type, column_info)
     }
 }
 
@@ -2619,9 +2742,9 @@ pub(crate) fn build_column_predicate(
     if value.is_null() {
         format!("{ident} IS NULL")
     } else if use_binary_text_comparison && uses_mysql_binary_text_predicate(database_type, value, column_info) {
-        format!("BINARY {ident} = {}", format_grid_sql_literal(value, database_type, column_info))
+        format!("BINARY {ident} = {}", format_grid_assignment_sql_literal(value, database_type, column_info))
     } else {
-        let literal = format_grid_sql_literal(value, database_type, column_info);
+        let literal = format_grid_assignment_sql_literal(value, database_type, column_info);
         if use_binary_text_comparison {
             if let Some(predicate) = postgres_keyless_json_predicate(database_type, &ident, &literal, column_info) {
                 return predicate;
@@ -2753,6 +2876,17 @@ fn is_oracle_lob_type(data_type: &str) -> bool {
     matches!(base, "blob" | "clob" | "nclob" | "bfile" | "lob")
         || lower.starts_with("binary large object")
         || lower.starts_with("character large object")
+}
+
+fn oracle_character_lob_constructor(data_type: &str) -> Option<&'static str> {
+    let lower = data_type.trim().trim_matches('"').to_ascii_lowercase();
+    let base = lower.split(['(', ':', ' ']).next().unwrap_or("");
+    match base {
+        "clob" => Some("TO_CLOB"),
+        "nclob" => Some("TO_NCLOB"),
+        _ if lower.starts_with("character large object") => Some("TO_CLOB"),
+        _ => None,
+    }
 }
 
 fn is_oracle_row_id(database_type: Option<DatabaseType>, name: Option<&str>) -> bool {
@@ -2992,7 +3126,7 @@ pub(crate) fn data_grid_qualified_table_name(
 }
 
 fn column_filter_ref(database_type: Option<DatabaseType>, column_name: &str, identifier_quote: Option<&str>) -> String {
-    let quoted = data_grid_identifier(database_type, column_name, identifier_quote);
+    let quoted = predicate_ident(database_type, column_name, identifier_quote);
     if database_type == Some(DatabaseType::Neo4j) {
         format!("n.{quoted}")
     } else {
@@ -3227,6 +3361,45 @@ mod tests {
             }),
             "SELECT COUNT(*) AS cnt FROM \"SS\".\"SS_User\" WHERE (SSUSR_IsActive = 'Y')"
         );
+    }
+
+    #[test]
+    fn mysql_conditional_update_uses_typed_value_and_requires_a_writable_column_and_where() {
+        let options = DataGridConditionalUpdateSqlOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("app".to_string()),
+                table_name: "people".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: Some(vec![column("id", "bigint", false, None), column("status", "varchar(32)", true, None)]),
+            },
+            column_name: "status".to_string(),
+            value: json!("O'Reilly"),
+            where_input: "WHERE tenant_id = 7;".to_string(),
+        };
+
+        assert_eq!(
+            build_data_grid_conditional_update_sql(options.clone()),
+            Some("UPDATE `app`.`people` SET `status` = 'O''Reilly' WHERE (tenant_id = 7);".to_string())
+        );
+
+        let mut condition_only = options.clone();
+        condition_only.where_input = "tenant_id = 7".to_string();
+        assert_eq!(
+            build_data_grid_conditional_update_sql(condition_only),
+            Some("UPDATE `app`.`people` SET `status` = 'O''Reilly' WHERE (tenant_id = 7);".to_string())
+        );
+
+        let mut empty_where = options.clone();
+        empty_where.where_input = " ".to_string();
+        assert_eq!(build_data_grid_conditional_update_sql(empty_where), None);
+
+        let mut primary_key = options;
+        primary_key.column_name = "id".to_string();
+        assert_eq!(build_data_grid_conditional_update_sql(primary_key), None);
     }
 
     #[test]
@@ -3504,7 +3677,7 @@ mod tests {
             insert_mode: DataGridCopyInsertMode::Merged,
         });
 
-        assert_eq!(statement.as_deref(), Some("INSERT INTO table_name (`data`) VALUES (CAST('[1,2,3]' AS JSON));"));
+        assert_eq!(statement.as_deref(), Some("INSERT INTO table_name (`data`) VALUES ('[1,2,3]');"));
     }
 
     #[test]
@@ -3522,7 +3695,7 @@ mod tests {
             insert_mode: DataGridCopyInsertMode::Merged,
         });
 
-        assert_eq!(statement.as_deref(), Some("INSERT INTO table_name (`data`) VALUES (CAST('[]' AS JSON));"));
+        assert_eq!(statement.as_deref(), Some("INSERT INTO table_name (`data`) VALUES ('[]');"));
     }
 
     #[test]
@@ -3540,7 +3713,95 @@ mod tests {
             insert_mode: DataGridCopyInsertMode::Merged,
         });
 
-        assert_eq!(statement.as_deref(), Some("INSERT INTO table_name (`data`) VALUES (CAST('{\"a\":1}' AS JSON));"));
+        assert_eq!(statement.as_deref(), Some("INSERT INTO table_name (`data`) VALUES ('{\"a\":1}');"));
+    }
+
+    #[test]
+    fn copy_update_formats_mysql_json_documents_as_compact_strings() {
+        let statements = build_data_grid_copy_update_statements(DataGridCopyUpdateStatementOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: None,
+                table_name: "documents".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: Some(vec![column("id", "int", false, None), column("payload", "JSON", true, None)]),
+            },
+            columns: vec!["id".to_string(), "payload".to_string()],
+            source_columns: None,
+            rows: vec![
+                vec![json!(1), json!([111, 222, 333])],
+                vec![json!(2), json!({"nested": [1, 2]})],
+                vec![json!(3), json!([])],
+            ],
+        });
+
+        assert_eq!(
+            statements,
+            vec![
+                "UPDATE `documents` SET `payload` = '[111,222,333]' WHERE `id` = 1;",
+                "UPDATE `documents` SET `payload` = '{\"nested\":[1,2]}' WHERE `id` = 2;",
+                "UPDATE `documents` SET `payload` = '[]' WHERE `id` = 3;",
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_update_preserves_json_scalars_and_generic_arrays() {
+        let json_statements = build_data_grid_copy_update_statements(DataGridCopyUpdateStatementOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: None,
+                table_name: "documents".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: Some(vec![column("id", "int", false, None), column("payload", "json", true, None)]),
+            },
+            columns: vec!["id".to_string(), "payload".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!(r#"[1,2]"#)], vec![json!(2), json!(true)], vec![json!(3), Value::Null]],
+        });
+        assert_eq!(
+            json_statements,
+            vec![
+                "UPDATE `documents` SET `payload` = '[1,2]' WHERE `id` = 1;",
+                "UPDATE `documents` SET `payload` = TRUE WHERE `id` = 2;",
+                "UPDATE `documents` SET `payload` = NULL WHERE `id` = 3;",
+            ]
+        );
+
+        let generic_statements = build_data_grid_copy_update_statements(DataGridCopyUpdateStatementOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: None,
+                table_name: "arrays".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: None,
+            },
+            columns: vec!["id".to_string(), "payload".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!([1, 2])]],
+        });
+        assert_eq!(generic_statements, vec!["UPDATE `arrays` SET `payload` = '{1,2}' WHERE `id` = 1;"]);
+
+        assert_eq!(
+            format_grid_sql_literal(
+                &json!([1, 2]),
+                Some(DatabaseType::Postgres),
+                Some(&column("items", "integer[]", true, None)),
+            ),
+            "'{1,2}'"
+        );
+        for database_type in [DatabaseType::ClickHouse, DatabaseType::Databend] {
+            assert_eq!(format_grid_sql_literal(&json!([1, 2]), Some(database_type), None), "[1,2]");
+        }
     }
 
     #[test]
@@ -3889,6 +4150,33 @@ mod tests {
             .as_deref(),
             Some("[active] = 0")
         );
+    }
+
+    #[test]
+    fn builds_oracle_synthetic_rowid_context_filter_conditions() {
+        let equals = |database_type, column_name: &str, value| {
+            build_data_grid_context_filter_condition(DataGridContextFilterConditionOptions {
+                database_type,
+                identifier_quote: None,
+                column_name: column_name.to_string(),
+                mode: DataGridContextFilterMode::Equals,
+                value,
+                values: Vec::new(),
+                end_value: None,
+                column_info: None,
+            })
+        };
+
+        for database_type in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+            assert_eq!(
+                equals(Some(database_type), DBX_ROWID_COLUMN, json!("AAAFd1AAFAAAABSAA/")),
+                Some("ROWIDTOCHAR(ROWID) = 'AAAFd1AAFAAAABSAA/'".to_string())
+            );
+        }
+        assert_eq!(equals(Some(DatabaseType::Oracle), "REPORT_ID", json!(7)), Some("\"REPORT_ID\" = 7".to_string()));
+        assert_eq!(equals(Some(DatabaseType::Neo4j), "score", json!(7)), Some("n.`score` = 7".to_string()));
+        assert_eq!(equals(None, DBX_ROWID_COLUMN, json!("row-id")), Some("\"__DBX_ROWID\" = 'row-id'".to_string()));
+        assert_eq!(equals(Some(DatabaseType::VictoriaMetrics), DBX_ROWID_COLUMN, json!("row-id")), None);
     }
 
     #[test]
@@ -4453,6 +4741,19 @@ mod tests {
         );
         assert_eq!(
             build_data_grid_count_sql(DataGridCountSqlOptions {
+                database_type: Some(DatabaseType::Jdbc),
+                identifier_quote: None,
+                catalog: None,
+                database: None,
+                schema: Some("DEMO".to_string()),
+                table_name: "STUDENT".to_string(),
+                where_input: None,
+                count_hint: None,
+            }),
+            "SELECT COUNT(*) AS cnt FROM DEMO.STUDENT"
+        );
+        assert_eq!(
+            build_data_grid_count_sql(DataGridCountSqlOptions {
                 database_type: Some(DatabaseType::Doris),
                 identifier_quote: None,
                 catalog: Some("iceberg_catalog".to_string()),
@@ -4844,6 +5145,65 @@ mod tests {
             format_grid_sql_literal(&json!("2022-08-25T00:00:00Z"), Some(DatabaseType::Oracle), Some(&date)),
             "DATE '2022-08-25'"
         );
+    }
+
+    #[test]
+    fn prepares_oracle_clob_update_without_oversized_string_literals() {
+        let clob = column("body", "CLOB", true, None);
+        let large_value = "x".repeat(4205);
+        let literal = format_grid_assignment_sql_literal(&json!(large_value), Some(DatabaseType::Oracle), Some(&clob));
+        let chunks = literal
+            .split("TO_CLOB('")
+            .skip(1)
+            .map(|chunk| chunk.split("')").next().unwrap_or_default())
+            .collect::<Vec<_>>();
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= ORACLE_LOB_LITERAL_CHUNK_BYTES));
+        assert_eq!(chunks[0].len(), ORACLE_LOB_LITERAL_CHUNK_BYTES);
+        assert_eq!(chunks[1].len(), 4205 - ORACLE_LOB_LITERAL_CHUNK_BYTES);
+        assert_eq!(
+            format_grid_assignment_sql_literal(&json!("short"), Some(DatabaseType::Oracle), Some(&clob)),
+            "'short'"
+        );
+        let nclob = column("body", "NCLOB", true, None);
+        assert!(format_grid_assignment_sql_literal(&json!(large_value), Some(DatabaseType::Oracle), Some(&nclob))
+            .starts_with("TO_NCLOB('"));
+        let special_value = format!("{}'\\", "x".repeat(3998));
+        let special_literal =
+            format_grid_assignment_sql_literal(&json!(special_value), Some(DatabaseType::Oracle), Some(&clob));
+        assert!(special_literal.starts_with("TO_CLOB('"));
+        assert!(special_literal.contains("''"));
+        assert!(special_literal.contains("\\\\"));
+        let varchar = column("body", "VARCHAR2(5000)", true, None);
+        let varchar_literal =
+            format_grid_assignment_sql_literal(&json!(large_value), Some(DatabaseType::Oracle), Some(&varchar));
+        assert!(varchar_literal.starts_with("'"));
+        assert!(!varchar_literal.contains("TO_CLOB("));
+
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Oracle),
+            identifier_quote: Some("\"".to_string()),
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("APP".to_string()),
+                table_name: "DOCUMENTS".to_string(),
+                primary_keys: vec!["ID".to_string()],
+                columns: Some(vec![column("ID", "NUMBER", false, None), clob]),
+            },
+            columns: vec!["ID".to_string(), "BODY".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!("old")]],
+            dirty_rows: vec![(0, vec![(1, json!(large_value))])],
+            deleted_rows: vec![],
+            new_rows: vec![],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(result.statements.len(), 1);
+        assert!(result.statements[0].contains("\"BODY\" = TO_CLOB('"));
+        assert!(result.statements[0].contains("WHERE \"ID\" = 1;"));
     }
 
     #[test]
@@ -6033,6 +6393,44 @@ mod tests {
         assert_eq!(
             delete.rollback_statements,
             vec![r#"INSERT INTO `app`.`documents` (`payload`, `note`) VALUES ('{"name":"before"}', 'row-a');"#]
+        );
+    }
+
+    #[test]
+    fn mysql_json_save_assignments_are_compact_and_predicates_stay_cast() {
+        let result = prepare_data_grid_save(DataGridSaveStatementOptions {
+            database_type: Some(DatabaseType::Mysql),
+            identifier_quote: None,
+            table_meta: DataGridTableMeta {
+                catalog: None,
+                database: None,
+                schema: Some("app".to_string()),
+                table_name: "documents".to_string(),
+                primary_keys: vec!["id".to_string()],
+                columns: Some(vec![column("id", "int", false, None), column("payload", "JSON", true, None)]),
+            },
+            columns: vec!["id".to_string(), "payload".to_string()],
+            source_columns: None,
+            rows: vec![vec![json!(1), json!({"before": true})]],
+            dirty_rows: vec![(0, vec![(1, json!([]))])],
+            deleted_rows: vec![],
+            new_rows: vec![vec![json!(2), json!({"nested": [1, 2]})]],
+        });
+
+        assert_eq!(result.validation_error, None);
+        assert_eq!(
+            result.statements,
+            vec![
+                "UPDATE `app`.`documents` SET `payload` = '[]' WHERE `id` = 1;",
+                "INSERT INTO `app`.`documents` (`id`, `payload`) VALUES (2, '{\"nested\":[1,2]}');",
+            ]
+        );
+        assert_eq!(
+            result.rollback_statements,
+            vec![
+                "DELETE FROM `app`.`documents` WHERE `id` = 2;",
+                "UPDATE `app`.`documents` SET `payload` = '{\"before\":true}' WHERE `id` = 1 AND `payload` = CAST('[]' AS JSON);",
+            ]
         );
     }
 

@@ -113,6 +113,7 @@ function createQuickEntryEditor(options: {
   filterRowsInGetRowItem?: boolean;
   supportsInsert?: boolean;
   save?: (changes: { dirtyRows: Map<number, Map<number, CellValue>>; newRows: CellValue[][]; newRowMeta: Array<{ sourceIndex?: number; editedColumns?: number[] }> }) => Promise<void>;
+  onCellValueChanged?: (rowId: number, columnIndex: number) => void;
 }) {
   const result = computed(() => ({
     columns: ["id", "name"],
@@ -128,7 +129,7 @@ function createQuickEntryEditor(options: {
     database: computed(() => undefined),
     tableMeta: computed(() => ({
       tableName: "people",
-      columns: [column("id", true), column("name")],
+      columns: [{ ...column("id", true), data_type: "INTEGER" }, column("name")],
       primaryKeys: ["id"],
     })),
     onExecuteSql: computed(() => undefined),
@@ -143,6 +144,7 @@ function createQuickEntryEditor(options: {
     currentWhereInput: computed(() => undefined),
     rowStatusFilter,
     dataGridQuickEntryEnabled: computed(() => options.quickEntryEnabled),
+    onCellValueChanged: options.onCellValueChanged,
     pageSize: ref(50),
     currentPage: ref(1),
     cacheKey: options.cacheKey ? computed(() => options.cacheKey) : undefined,
@@ -1056,10 +1058,13 @@ test("addRows records the display placement alongside the pending rows", () => {
   const firstId = editor.addRows(2, { anchorId: 0, position: "below" });
   assert.equal(firstId, -1);
   assert.equal(editor.newRowMeta.value.length, 2);
-  assert.deepEqual(editor.newRowMeta.value.map((meta) => meta.placement), [
-    { anchorId: 0, position: "below" },
-    { anchorId: 0, position: "below" },
-  ]);
+  assert.deepEqual(
+    editor.newRowMeta.value.map((meta) => meta.placement),
+    [
+      { anchorId: 0, position: "below" },
+      { anchorId: 0, position: "below" },
+    ],
+  );
   // Stable tokens are unique and monotonic.
   assert.equal(editor.newRowMeta.value[0].token, 1);
   assert.equal(editor.newRowMeta.value[1].token, 2);
@@ -1071,7 +1076,10 @@ test("addRows with a null placement appends at the end", () => {
 
   const editor = createPeopleGridEditor();
   editor.addRows(2, null);
-  assert.deepEqual(editor.newRowMeta.value.map((meta) => meta.placement), [null, null]);
+  assert.deepEqual(
+    editor.newRowMeta.value.map((meta) => meta.placement),
+    [null, null],
+  );
 });
 
 test("addRows can anchor to another pending row by its token", () => {
@@ -1096,10 +1104,13 @@ test("undo and redo restore the placement metadata", () => {
   assert.equal(editor.newRowMeta.value.length, 0);
   editor.redoPendingChange();
   assert.equal(editor.newRows.value.length, 2);
-  assert.deepEqual(editor.newRowMeta.value.map((meta) => meta.placement), [
-    { anchorId: 0, position: "above" },
-    { anchorId: 0, position: "above" },
-  ]);
+  assert.deepEqual(
+    editor.newRowMeta.value.map((meta) => meta.placement),
+    [
+      { anchorId: 0, position: "above" },
+      { anchorId: 0, position: "above" },
+    ],
+  );
 });
 
 test("deleting a pending row keeps the placement metadata aligned", () => {
@@ -1119,16 +1130,25 @@ test("restoring a cached snapshot resumes token allocation past restored tokens"
   const firstEditor = createQuickEntryEditor({ quickEntryEnabled: true, cacheKey: "token-restore" });
 
   firstEditor.addRows(2);
-  assert.deepEqual(firstEditor.newRowMeta.value.map((m) => m.token), [1, 2]);
+  assert.deepEqual(
+    firstEditor.newRowMeta.value.map((m) => m.token),
+    [1, 2],
+  );
   firstEditor.savePendingSnapshot(false, false);
 
   const restoredEditor = createQuickEntryEditor({ quickEntryEnabled: true, cacheKey: "token-restore" });
-  assert.deepEqual(restoredEditor.newRowMeta.value.map((m) => m.token), [1, 2]);
+  assert.deepEqual(
+    restoredEditor.newRowMeta.value.map((m) => m.token),
+    [1, 2],
+  );
 
   restoredEditor.addRows(1);
   // The fresh instance restarts the allocator at 1; it must resume past the
   // restored tokens so a new row never shares a token with a restored row.
-  assert.deepEqual(restoredEditor.newRowMeta.value.map((m) => m.token), [1, 2, 3]);
+  assert.deepEqual(
+    restoredEditor.newRowMeta.value.map((m) => m.token),
+    [1, 2, 3],
+  );
 });
 
 test("batch row delete records a single undo snapshot", () => {
@@ -1645,6 +1665,88 @@ test("quick entry off keeps blur edits pending without saving", async () => {
   assert.equal(editor.dirtyRows.value.get(0)?.get(1), "Ada Lovelace");
 });
 
+test("unchanged cell blur commits do not create pending changes", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+  let callbackCount = 0;
+  const editor = createQuickEntryEditor({
+    quickEntryEnabled: false,
+    onCellValueChanged: () => {
+      callbackCount += 1;
+    },
+  });
+  const version = editor.pendingChangesVersion.value;
+  const transactionActive = editor.transactionActive.value;
+
+  editor.startEdit(0, 1);
+  await editor.commitEditFromBlur();
+
+  assert.equal(editor.dirtyRows.value.size, 0);
+  assert.equal(editor.hasPendingChanges.value, false);
+  assert.equal(editor.transactionActive.value, transactionActive);
+  assert.equal(editor.pendingChangesVersion.value, version);
+  assert.equal(callbackCount, 0);
+  assert.equal(editor.rowDataWithChanges([1, "Ada"], 0)[1], "Ada");
+});
+
+test("restoring the original cell value before blur is a no-op", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+  const editor = createQuickEntryEditor({ quickEntryEnabled: false });
+
+  editor.startEdit(0, 1);
+  editor.editValue.value = "Bob";
+  editor.editValue.value = "Ada";
+  await editor.commitEditFromBlur();
+
+  assert.equal(editor.dirtyRows.value.size, 0);
+  assert.equal(editor.hasPendingChanges.value, false);
+  assert.equal(editor.canUndoPendingChange.value, false);
+  assert.equal(editor.pendingChangesVersion.value, 0);
+  assert.equal(editor.rowDataWithChanges([1, "Ada"], 0)[1], "Ada");
+});
+
+test("unchanged cell blur commits preserve other dirty cells", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+  const editor = createQuickEntryEditor({ quickEntryEnabled: false });
+
+  editor.applyCellValue(0, 0, "2");
+  editor.startEdit(0, 1);
+  await editor.commitEditFromBlur();
+
+  assert.deepEqual([...(editor.dirtyRows.value.get(0)?.entries() ?? [])], [[0, 2]]);
+  assert.equal(editor.hasPendingChanges.value, true);
+  assert.equal(editor.rowDataWithChanges([1, "Ada"], 0)[1], "Ada");
+});
+
+test("changed cell blur commits remain pending", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+  const editor = createQuickEntryEditor({ quickEntryEnabled: false });
+
+  editor.startEdit(0, 1);
+  editor.editValue.value = "Bob";
+  await editor.commitEditFromBlur();
+
+  assert.equal(editor.dirtyRows.value.get(0)?.get(1), "Bob");
+  assert.equal(editor.hasPendingChanges.value, true);
+  assert.equal(editor.rowDataWithChanges([1, "Ada"], 0)[1], "Bob");
+});
+
+test("unchanged numeric cell blur commits keep the numeric baseline", async () => {
+  setActivePinia(createPinia());
+  installBrowserTestGlobals();
+  const editor = createPeopleGridEditor();
+
+  editor.startEdit(0, 0);
+  await editor.commitEditFromBlur();
+
+  assert.equal(editor.dirtyRows.value.size, 0);
+  assert.equal(editor.hasPendingChanges.value, false);
+  assert.equal(editor.rowDataWithChanges([1, "Ada"], 0)[0], 1);
+});
+
 test("explicit enum commits distinguish NULL, empty string, and the literal NULL", async () => {
   setActivePinia(createPinia());
   installBrowserTestGlobals();
@@ -2100,7 +2202,7 @@ test("quick entry draft row pasted values become a new row and save once", async
   await Promise.resolve();
 
   assert.equal(saveCalls, 1);
-  assert.deepEqual(savedNewRows, [[["2", "Grace"]]]);
+  assert.deepEqual(savedNewRows, [[[2, "Grace"]]]);
   assert.deepEqual(editor.newRows.value, []);
   assert.deepEqual(editor.quickEntryDraftRow.value, [null, null]);
   assert.equal(editor.saveError.value, "");

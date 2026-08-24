@@ -59,6 +59,7 @@ export type InterfaceLayout = "separated" | "classic";
 export type UpdateDownloadSource = "official" | "cnb";
 export type SqlSemanticDiagnosticsMode = "auto" | "enabled" | "disabled";
 export type OpenTabsRestoreMode = "all" | "pinned" | "none";
+export type AppCloseUnsavedTabsMode = "prompt" | "keep-drafts";
 
 export const DEFAULT_SIDEBAR_TABLE_PAGE_SIZE = 1000;
 export const DUCKDB_WORKER_MAX_PROCESSES_MIN = 1;
@@ -524,6 +525,7 @@ export interface EditorSettings {
   timeoutInheritanceMigrationVersion: number;
   showExecutionTargetPicker: boolean;
   showStatementRunButtons: boolean;
+  showLineNumbers: boolean;
   showCurrentStatementFrame: boolean;
   showInsertValueHints: boolean;
   autoAliasTables: boolean;
@@ -537,6 +539,7 @@ export interface EditorSettings {
   sqlSemanticDiagnosticsEnabled: boolean;
   confirmDangerousSqlExecution: boolean;
   confirmUnsavedSqlClose: boolean;
+  appCloseUnsavedTabsMode: AppCloseUnsavedTabsMode;
   savedSqlOpenTargetMode: SavedSqlOpenTargetMode;
   compactTabTitle: boolean;
   tabLayout: TabLayoutMode;
@@ -599,6 +602,7 @@ export interface EditorSettings {
   dataTabReuseMode: DataTabReuseMode;
   openDataTabsNextToActive: boolean;
   prefillNewQueryWithSelect: boolean;
+  generateSqlIncludeDatabaseName: boolean;
   updateNotificationsEnabled: boolean;
   sidebarHiddenTablePrefixes: string[];
   sidebarObjectInfoMode: SidebarObjectInfoMode;
@@ -730,6 +734,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   timeoutInheritanceMigrationVersion: 2,
   showExecutionTargetPicker: false,
   showStatementRunButtons: true,
+  showLineNumbers: true,
   showCurrentStatementFrame: true,
   showInsertValueHints: true,
   autoAliasTables: true,
@@ -743,6 +748,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   sqlSemanticDiagnosticsEnabled: SQL_SEMANTIC_DIAGNOSTICS_AUTO_ENABLED,
   confirmDangerousSqlExecution: true,
   confirmUnsavedSqlClose: true,
+  appCloseUnsavedTabsMode: "prompt",
   savedSqlOpenTargetMode: "saved",
   compactTabTitle: false,
   tabLayout: "scroll",
@@ -804,6 +810,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   dataTabReuseMode: DEFAULT_DATA_TAB_REUSE_MODE,
   openDataTabsNextToActive: false,
   prefillNewQueryWithSelect: true,
+  generateSqlIncludeDatabaseName: false,
   updateNotificationsEnabled: true,
   sidebarHiddenTablePrefixes: [],
   sidebarObjectInfoMode: "comment-inline",
@@ -951,6 +958,10 @@ function normalizeOpenTabsRestoreMode(value: unknown, legacyRestoreOpenTabsOnLau
   return DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
 }
 
+function normalizeAppCloseUnsavedTabsMode(value: unknown): AppCloseUnsavedTabsMode {
+  return value === "prompt" || value === "keep-drafts" ? value : DEFAULT_EDITOR_SETTINGS.appCloseUnsavedTabsMode;
+}
+
 function normalizeConnectionListSortMode(value: unknown): ConnectionListSortMode {
   return value === "asc" || value === "desc" ? value : "manual";
 }
@@ -1096,6 +1107,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
           : 0,
     showExecutionTargetPicker: settings.showExecutionTargetPicker ?? DEFAULT_EDITOR_SETTINGS.showExecutionTargetPicker,
     showStatementRunButtons: typeof settings.showStatementRunButtons === "boolean" ? settings.showStatementRunButtons : DEFAULT_EDITOR_SETTINGS.showStatementRunButtons,
+    showLineNumbers: typeof settings.showLineNumbers === "boolean" ? settings.showLineNumbers : DEFAULT_EDITOR_SETTINGS.showLineNumbers,
     showCurrentStatementFrame: typeof settings.showCurrentStatementFrame === "boolean" ? settings.showCurrentStatementFrame : DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame,
     showInsertValueHints: typeof settings.showInsertValueHints === "boolean" ? settings.showInsertValueHints : DEFAULT_EDITOR_SETTINGS.showInsertValueHints,
     autoAliasTables: settings.autoAliasTables ?? DEFAULT_EDITOR_SETTINGS.autoAliasTables,
@@ -1109,6 +1121,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     sqlSemanticDiagnosticsEnabled: sqlSemanticDiagnosticsEnabledForMode(sqlSemanticDiagnosticsMode),
     confirmDangerousSqlExecution: settings.confirmDangerousSqlExecution ?? DEFAULT_EDITOR_SETTINGS.confirmDangerousSqlExecution,
     confirmUnsavedSqlClose: settings.confirmUnsavedSqlClose ?? DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose,
+    appCloseUnsavedTabsMode: normalizeAppCloseUnsavedTabsMode(settings.appCloseUnsavedTabsMode),
     savedSqlOpenTargetMode: settings.savedSqlOpenTargetMode === "current" ? "current" : DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode,
     compactTabTitle: settings.compactTabTitle ?? DEFAULT_EDITOR_SETTINGS.compactTabTitle,
     tabLayout: normalizeTabLayout(settings.tabLayout),
@@ -1191,6 +1204,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     ),
     openDataTabsNextToActive: typeof settings.openDataTabsNextToActive === "boolean" ? settings.openDataTabsNextToActive : DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive,
     prefillNewQueryWithSelect: typeof settings.prefillNewQueryWithSelect === "boolean" ? settings.prefillNewQueryWithSelect : DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect,
+    generateSqlIncludeDatabaseName: settings.generateSqlIncludeDatabaseName === true,
     updateNotificationsEnabled: settings.updateNotificationsEnabled ?? DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(settings.sidebarHiddenTablePrefixes),
     sidebarObjectInfoMode: normalizeSidebarObjectInfoMode(
@@ -1296,23 +1310,34 @@ export const useSettingsStore = defineStore("settings", () => {
   const isEditorSettingsLoaded = ref(false);
   let initEditorSettingsPromise: Promise<void> | null = null;
   let pendingEditorSettingsPatches: Partial<EditorSettings>[] = [];
-  let editorSettingsSaveQueue: Promise<void> | null = null;
-  let editorSettingsAtomicUpdateQueue: Promise<void> = Promise.resolve();
+  let editorSettingsOperationQueue: Promise<void> | null = null;
   let editorSettingsPatchRevision = 0;
   const editorSettingsFieldRevisions = new Map<keyof EditorSettings, number>();
+  const customColumnFormatterDeleteVersions = new Map<string, number>();
   let pendingAiChatSelection: AiChatSelectionState | null = null;
   let aiChatSelectionSaveRunning = false;
 
   const editorSettings = ref<EditorSettings>(normalizeEditorSettings({}));
 
-  function enqueueEditorSettingsSave(): Promise<void> {
-    const saveCurrentSettings = () => api.saveEditorSettings(editorSettingsSnapshot(editorSettings.value));
-    const save = editorSettingsSaveQueue ? editorSettingsSaveQueue.catch(() => {}).then(saveCurrentSettings) : saveCurrentSettings();
-    const trackedSave = save.finally(() => {
-      if (editorSettingsSaveQueue === trackedSave) editorSettingsSaveQueue = null;
+  function enqueueEditorSettingsOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const queuedOperation = editorSettingsOperationQueue ? editorSettingsOperationQueue.then(operation) : operation();
+    const trackedOperation = queuedOperation.then(
+      () => undefined,
+      () => undefined,
+    );
+    editorSettingsOperationQueue = trackedOperation;
+    void trackedOperation.finally(() => {
+      if (editorSettingsOperationQueue === trackedOperation) editorSettingsOperationQueue = null;
     });
-    editorSettingsSaveQueue = trackedSave;
-    return trackedSave;
+    return queuedOperation;
+  }
+
+  function persistCurrentEditorSettings(): Promise<void> {
+    return api.saveEditorSettings(editorSettingsSnapshot(editorSettings.value));
+  }
+
+  function enqueueEditorSettingsSave(): Promise<void> {
+    return enqueueEditorSettingsOperation(persistCurrentEditorSettings);
   }
 
   function saveEditorSettings() {
@@ -1683,6 +1708,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.timeoutInheritanceMigrationVersion !== undefined) editorSettings.value.timeoutInheritanceMigrationVersion = Math.max(0, Math.floor(partial.timeoutInheritanceMigrationVersion));
     if (partial.showExecutionTargetPicker !== undefined) editorSettings.value.showExecutionTargetPicker = partial.showExecutionTargetPicker;
     if (partial.showStatementRunButtons !== undefined) editorSettings.value.showStatementRunButtons = partial.showStatementRunButtons === true;
+    if (partial.showLineNumbers !== undefined) editorSettings.value.showLineNumbers = partial.showLineNumbers === true;
     if (partial.showCurrentStatementFrame !== undefined) editorSettings.value.showCurrentStatementFrame = partial.showCurrentStatementFrame === true;
     if (partial.showInsertValueHints !== undefined) editorSettings.value.showInsertValueHints = partial.showInsertValueHints === true;
     if (partial.autoAliasTables !== undefined) editorSettings.value.autoAliasTables = partial.autoAliasTables;
@@ -1699,6 +1725,7 @@ export const useSettingsStore = defineStore("settings", () => {
     }
     if (partial.confirmDangerousSqlExecution !== undefined) editorSettings.value.confirmDangerousSqlExecution = partial.confirmDangerousSqlExecution;
     if (partial.confirmUnsavedSqlClose !== undefined) editorSettings.value.confirmUnsavedSqlClose = partial.confirmUnsavedSqlClose;
+    if (partial.appCloseUnsavedTabsMode !== undefined) editorSettings.value.appCloseUnsavedTabsMode = normalizeAppCloseUnsavedTabsMode(partial.appCloseUnsavedTabsMode);
     if (partial.savedSqlOpenTargetMode !== undefined) editorSettings.value.savedSqlOpenTargetMode = partial.savedSqlOpenTargetMode === "current" ? "current" : "saved";
     if (partial.compactTabTitle !== undefined) editorSettings.value.compactTabTitle = partial.compactTabTitle;
     if (partial.tabLayout !== undefined) editorSettings.value.tabLayout = normalizeTabLayout(partial.tabLayout);
@@ -1768,6 +1795,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.dataTabReuseMode !== undefined) editorSettings.value.dataTabReuseMode = normalizeDataTabReuseMode(partial.dataTabReuseMode);
     if (partial.openDataTabsNextToActive !== undefined) editorSettings.value.openDataTabsNextToActive = partial.openDataTabsNextToActive === true;
     if (partial.prefillNewQueryWithSelect !== undefined) editorSettings.value.prefillNewQueryWithSelect = partial.prefillNewQueryWithSelect;
+    if (partial.generateSqlIncludeDatabaseName !== undefined) editorSettings.value.generateSqlIncludeDatabaseName = partial.generateSqlIncludeDatabaseName === true;
     if (partial.updateNotificationsEnabled !== undefined) editorSettings.value.updateNotificationsEnabled = partial.updateNotificationsEnabled;
     if (partial.sidebarHiddenTablePrefixes !== undefined) editorSettings.value.sidebarHiddenTablePrefixes = normalizeSidebarHiddenTablePrefixes(partial.sidebarHiddenTablePrefixes);
     if (partial.sidebarObjectInfoMode !== undefined) editorSettings.value.sidebarObjectInfoMode = normalizeSidebarObjectInfoMode(partial.sidebarObjectInfoMode);
@@ -1814,32 +1842,33 @@ export const useSettingsStore = defineStore("settings", () => {
     await enqueueEditorSettingsSave();
   }
 
+  async function enqueueEditorSettingsAtomicMutation<T>(mutation: () => Promise<T>): Promise<T> {
+    await initEditorSettings();
+    return enqueueEditorSettingsOperation(mutation);
+  }
+
   function updateEditorSettingsAndPersist(partial: Partial<EditorSettings>): Promise<void> {
-    const update = editorSettingsAtomicUpdateQueue
-      .catch(() => {})
-      .then(async () => {
-        await initEditorSettings();
-        const previous = editorSettingsSnapshot(editorSettings.value);
-        applyEditorSettingsPatch(partial);
-        const revision = markEditorSettingsPatch(partial);
-        try {
-          await enqueueEditorSettingsSave();
-        } catch (error) {
-          const restored = editorSettingsSnapshot(editorSettings.value) as unknown as Record<string, unknown>;
-          const previousSettings = previous as unknown as Record<string, unknown>;
-          let changed = false;
-          for (const key of Object.keys(partial) as (keyof EditorSettings)[]) {
-            if (partial[key] === undefined || editorSettingsFieldRevisions.get(key) !== revision) continue;
-            restored[key] = previousSettings[key];
-            editorSettingsFieldRevisions.set(key, ++editorSettingsPatchRevision);
-            changed = true;
-          }
-          if (changed) editorSettings.value = normalizeEditorSettings(restored);
-          throw error;
+    return enqueueEditorSettingsAtomicMutation(async () => {
+      await initEditorSettings();
+      const previous = editorSettingsSnapshot(editorSettings.value);
+      applyEditorSettingsPatch(partial);
+      const revision = markEditorSettingsPatch(partial);
+      try {
+        await persistCurrentEditorSettings();
+      } catch (error) {
+        const restored = editorSettingsSnapshot(editorSettings.value) as unknown as Record<string, unknown>;
+        const previousSettings = previous as unknown as Record<string, unknown>;
+        let changed = false;
+        for (const key of Object.keys(partial) as (keyof EditorSettings)[]) {
+          if (partial[key] === undefined || editorSettingsFieldRevisions.get(key) !== revision) continue;
+          restored[key] = previousSettings[key];
+          editorSettingsFieldRevisions.set(key, ++editorSettingsPatchRevision);
+          changed = true;
         }
-      });
-    editorSettingsAtomicUpdateQueue = update.catch(() => {});
-    return update;
+        if (changed) editorSettings.value = normalizeEditorSettings(restored);
+        throw error;
+      }
+    });
   }
 
   function updateColumnFormatter(key: string, formatter: ColumnFormatterConfig | undefined) {
@@ -1853,29 +1882,101 @@ export const useSettingsStore = defineStore("settings", () => {
     updateEditorSettings({ columnFormatters });
   }
 
-  function upsertCustomColumnFormatter(formatter: CustomColumnFormatterConfig): CustomColumnFormatterConfig | undefined {
-    const normalized = normalizeCustomColumnFormatter(formatter);
-    if (!normalized) return undefined;
-    updateEditorSettings({
-      customColumnFormatters: {
-        ...editorSettings.value.customColumnFormatters,
-        [normalized.id]: normalized,
-      },
-    });
-    return normalized;
+  function customColumnFormatterDeleteVersion(id: string): number {
+    return customColumnFormatterDeleteVersions.get(id) ?? 0;
   }
 
-  function deleteCustomColumnFormatter(id: string) {
-    const customColumnFormatters = {
-      ...editorSettings.value.customColumnFormatters,
-    };
-    delete customColumnFormatters[id];
-    const columnFormatters = Object.fromEntries(
-      Object.entries(editorSettings.value.columnFormatters).filter(([, formatter]) => {
-        return formatter.kind !== "custom-ref" || formatter.formatterId !== id;
-      }),
-    );
-    updateEditorSettings({ customColumnFormatters, columnFormatters });
+  async function upsertCustomColumnFormatter(formatter: CustomColumnFormatterConfig, expectedDeleteVersion?: number): Promise<CustomColumnFormatterConfig | undefined> {
+    const normalized = normalizeCustomColumnFormatter(formatter);
+    if (!normalized) return undefined;
+    return enqueueEditorSettingsAtomicMutation(async () => {
+      await initEditorSettings();
+      if (expectedDeleteVersion !== undefined && customColumnFormatterDeleteVersion(normalized.id) !== expectedDeleteVersion) return undefined;
+      const previous = editorSettings.value.customColumnFormatters[normalized.id];
+      const partial = {
+        customColumnFormatters: {
+          ...editorSettings.value.customColumnFormatters,
+          [normalized.id]: normalized,
+        },
+      } satisfies Partial<EditorSettings>;
+      applyEditorSettingsPatch(partial);
+      markEditorSettingsPatch(partial);
+      try {
+        await persistCurrentEditorSettings();
+      } catch (error) {
+        const customColumnFormatters = {
+          ...editorSettings.value.customColumnFormatters,
+        };
+        const current = customColumnFormatters[normalized.id];
+        if (current?.name === normalized.name && current.template === normalized.template) {
+          if (previous) {
+            customColumnFormatters[normalized.id] = previous;
+          } else {
+            delete customColumnFormatters[normalized.id];
+          }
+          const rollback = { customColumnFormatters } satisfies Partial<EditorSettings>;
+          applyEditorSettingsPatch(rollback);
+          markEditorSettingsPatch(rollback);
+        }
+        throw error;
+      }
+      return normalized;
+    });
+  }
+
+  async function deleteCustomColumnFormatter(id: string): Promise<void> {
+    return enqueueEditorSettingsAtomicMutation(async () => {
+      await initEditorSettings();
+      const previousDeleteVersion = customColumnFormatterDeleteVersion(id);
+      const deleteVersion = previousDeleteVersion + 1;
+      customColumnFormatterDeleteVersions.set(id, deleteVersion);
+      const previousFormatter = editorSettings.value.customColumnFormatters[id];
+      const customColumnFormatters = {
+        ...editorSettings.value.customColumnFormatters,
+      };
+      delete customColumnFormatters[id];
+      const removedColumnFormatters = Object.fromEntries(
+        Object.entries(editorSettings.value.columnFormatters).filter(([, formatter]) => {
+          return formatter.kind === "custom-ref" && formatter.formatterId === id;
+        }),
+      );
+      const columnFormatters = Object.fromEntries(
+        Object.entries(editorSettings.value.columnFormatters).filter(([, formatter]) => {
+          return formatter.kind !== "custom-ref" || formatter.formatterId !== id;
+        }),
+      );
+      const partial = { customColumnFormatters, columnFormatters } satisfies Partial<EditorSettings>;
+      applyEditorSettingsPatch(partial);
+      markEditorSettingsPatch(partial);
+      try {
+        await persistCurrentEditorSettings();
+      } catch (error) {
+        if (customColumnFormatterDeleteVersion(id) === deleteVersion) {
+          if (previousDeleteVersion === 0) {
+            customColumnFormatterDeleteVersions.delete(id);
+          } else {
+            customColumnFormatterDeleteVersions.set(id, previousDeleteVersion);
+          }
+        }
+        const restoredCustomColumnFormatters = {
+          ...editorSettings.value.customColumnFormatters,
+        };
+        if (previousFormatter && !restoredCustomColumnFormatters[id]) restoredCustomColumnFormatters[id] = previousFormatter;
+        const restoredColumnFormatters = {
+          ...editorSettings.value.columnFormatters,
+        };
+        for (const [key, formatter] of Object.entries(removedColumnFormatters)) {
+          if (!restoredColumnFormatters[key]) restoredColumnFormatters[key] = formatter;
+        }
+        const rollback = {
+          customColumnFormatters: restoredCustomColumnFormatters,
+          columnFormatters: restoredColumnFormatters,
+        } satisfies Partial<EditorSettings>;
+        applyEditorSettingsPatch(rollback);
+        markEditorSettingsPatch(rollback);
+        throw error;
+      }
+    });
   }
 
   return {
@@ -1912,6 +2013,7 @@ export const useSettingsStore = defineStore("settings", () => {
     initMcpGlobalPolicy,
     updateMcpGlobalPolicy,
     updateColumnFormatter,
+    customColumnFormatterDeleteVersion,
     upsertCustomColumnFormatter,
     deleteCustomColumnFormatter,
   };

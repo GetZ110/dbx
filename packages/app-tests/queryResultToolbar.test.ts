@@ -80,6 +80,22 @@ test("ContentArea exposes retained result runs as switchable tabs or a compact l
   assert.equal((contentArea.match(/<QueryResultToolbarActions\b/g) ?? []).length, 2);
 });
 
+test("appending a result run preserves the tab-strip scroll position", () => {
+  const contentArea = source(contentAreaPath);
+  const resultRunWatcherStart = contentArea.indexOf("function resultRunIdsWereAppended");
+  const resultRunWatcherEnd = contentArea.indexOf("const summaryItems", resultRunWatcherStart);
+  const resultRunWatcher = contentArea.slice(resultRunWatcherStart, resultRunWatcherEnd);
+
+  assert.ok(resultRunWatcherStart >= 0);
+  assert.match(resultRunWatcher, /current\.length > previous\.length/);
+  assert.match(resultRunWatcher, /activeRunId: props\.activeTab\.activeResultRunId/);
+  assert.match(resultRunWatcher, /activeRunChanged && !resultRunIdsWereAppended\(previous\.runIds, current\.runIds\)/);
+  assert.match(resultRunWatcher, /updateResultTabsAfterRender/);
+  assert.match(resultRunWatcher, /revealActiveResultRunAfterRender/);
+  assert.match(contentArea, /function focusResultRunByIndex[\s\S]*scrollIntoView/);
+  assert.match(contentArea, /async function removeResultRun[\s\S]*scrollIntoView/);
+});
+
 test("the close-tab shortcut clears query results before closing the tab", () => {
   const app = source(appPath);
   const closeShortcutStart = app.indexOf("if (isCloseTabShortcut(e, shortcuts))");
@@ -111,9 +127,12 @@ test("DataGrid exposes persistent result toolbar slots", () => {
 test("table-data toolbar refresh keeps page size independent from SQL editor settings", () => {
   const dataGrid = source(dataGridPath);
 
-  assert.match(dataGrid, /props\.context === "table-data" \? \(props\.pageLimit \?\? tableOpenPageLimit\(settingsStore\.editorSettings\.tableOpenPageSize\)\) : settingsStore\.editorSettings\.pageSize/);
-  assert.match(dataGrid, /if \(props\.context === "table-data"\) return;[\s\S]*pageSize\.value = normalizeResultPageSize\(value, pageSize\.value\)/);
-  assert.match(dataGrid, /props\.context === "table-data" \? \{ tableOpenPageSize: normalizedSize \} : \{ pageSize: normalizedSize \}/);
+  // Table-data grids resolve page size through the table-open preference
+  // (pageLimit ?? tableOpenPageLimit(tableOpenPageSize)) instead of the SQL editor pageSize.
+  assert.match(dataGrid, /pageSizePreference = computed\(\(\) => resolveDataGridPageSizePreference\(props\.context, props\.pageSizePreference\)\)/);
+  assert.match(dataGrid, /pageSize = ref\(preferredDataGridPageSize\(settingsStore\.editorSettings, pageSizePreference\.value, props\.pageLimit\)\)/);
+  assert.match(dataGrid, /watch\([\s\S]*\(\) => settingsStore\.editorSettings\.pageSize,[\s\S]*if \(pageSizePreference\.value !== "results"\) return;[\s\S]*pageSize\.value = normalizeResultPageSize\(value, pageSize\.value\)/);
+  assert.match(dataGrid, /settingsStore\.updateEditorSettings\(dataGridPageSizeSettingsPatch\(pageSizePreference\.value, normalizedSize\)\)/);
   assert.match(dataGrid, /const resetToFirstPage = hasPendingConditionInputs\(\);/);
   assert.match(dataGrid, /emit\("reload", props\.sql, searchText\.value, currentWhereInput\(\), currentOrderBy\(\), pageSize\.value, resetToFirstPage \? 0 : \(currentPage\.value - 1\) \* pageSize\.value, "refresh"\)/);
 });

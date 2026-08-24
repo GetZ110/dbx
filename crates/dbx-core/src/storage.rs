@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::warn;
-use rusqlite::{params, params_from_iter, types::Value, Connection, DatabaseName, OpenFlags, OptionalExtension, ToSql};
+use rusqlite::{
+    params, params_from_iter, types::Value, Connection, DatabaseName, OpenFlags, OptionalExtension, ToSql,
+    TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -466,8 +469,50 @@ impl Storage {
         let db_path = db_path.to_string_lossy().to_string();
         let db = connect_path_create_if_missing(&db_path).await?;
         let storage = Self { db, path };
+        // Best-effort: switching journal mode is itself a lock-sensitive
+        // operation, so a transient failure here (e.g. another process
+        // racing to open the same brand-new database file) must never stop
+        // the app from starting.
+        storage.enable_wal_mode().await;
         storage.init_schema().await?;
         Ok(storage)
+    }
+
+    /// Multiple `dbx` processes can end up pointed at the same data directory
+    /// (e.g. a portable install shared by several users on one machine).
+    /// WAL mode lets readers and writers proceed without blocking each other,
+    /// which combined with `TransactionBehavior::Immediate` on every write
+    /// transaction (see `conn.transaction_with_behavior` call sites below)
+    /// avoids the instant `SQLITE_BUSY` that a deferred transaction's
+    /// SHARED-to-RESERVED lock upgrade can trigger under concurrent access.
+    /// Never fails: this is a best-effort upgrade, retried a handful of
+    /// times, that logs and gives up rather than blocking startup.
+    async fn enable_wal_mode(&self) {
+        const ATTEMPTS: u32 = 5;
+        for attempt in 1..=ATTEMPTS {
+            let result = self
+                .with_conn(|conn| {
+                    conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))
+                        .map_err(|e| e.to_string())
+                })
+                .await;
+            match result {
+                Ok(mode) if mode.eq_ignore_ascii_case("wal") => return,
+                Ok(mode) => {
+                    // Non-lock reasons WAL can't apply (e.g. an in-memory
+                    // database in tests) won't be fixed by retrying.
+                    warn!("dbx.db journal_mode did not switch to WAL (got '{mode}'); concurrent multi-process access may hit 'database is locked' more often");
+                    return;
+                }
+                Err(_) if attempt < ATTEMPTS => {
+                    std::thread::sleep(std::time::Duration::from_millis(100 * attempt as u64));
+                }
+                Err(error) => {
+                    warn!("dbx.db could not switch journal_mode to WAL after {ATTEMPTS} attempts: {error}; concurrent multi-process access may hit 'database is locked' more often");
+                    return;
+                }
+            }
+        }
     }
 
     /// Directory containing the SQLite database (`dbx.db`). SSH host keys are
@@ -1248,7 +1293,7 @@ impl Storage {
     pub async fn save_ai_configs(&self, configs: &[AiConfigItem]) -> Result<(), String> {
         let configs = configs.to_vec();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM ai_configs", []).map_err(|e| e.to_string())?;
             for config in &configs {
                 let json = serde_json::to_string(&config.config).map_err(|e| e.to_string())?;
@@ -1317,7 +1362,7 @@ impl Storage {
     pub async fn set_default_ai_config(&self, config_id: &str) -> Result<(), String> {
         let config_id = config_id.to_string();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             tx.execute("UPDATE ai_configs SET is_default = 0 WHERE is_default = 1", []).map_err(|e| e.to_string())?;
             tx.execute("UPDATE ai_configs SET is_default = 1 WHERE id = ?1", params![config_id])
                 .map_err(|e| e.to_string())?;
@@ -1332,7 +1377,7 @@ impl Storage {
         self.with_conn(move |conn| {
             let json = serde_json::to_string(&config.config).map_err(|e| e.to_string())?;
             let models_json = serde_json::to_string(&config.config.models).map_err(|e| e.to_string())?;
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
 
             // 如果设该配置为默认，先清除其他默认，避免与 idx_ai_configs_default 冲突
             if config.is_default {
@@ -1411,7 +1456,7 @@ impl Storage {
         }
         let profiles = profiles.to_vec();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM tunnel_profiles", []).map_err(|e| e.to_string())?;
             for profile in &profiles {
                 let json = serde_json::to_string(profile).map_err(|e| e.to_string())?;
@@ -2501,7 +2546,7 @@ impl Storage {
     ) -> Result<(), String> {
         let configs = configs.to_vec();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             let replacement_ids = configs.iter().map(|config| config.id.clone()).collect::<HashSet<_>>();
             let mut retained_ids = preserve_unreadable_connections_for_replacement(&tx, &replacement_ids)?;
 
@@ -2513,6 +2558,7 @@ impl Storage {
                     // This preference is an exception: retaining the old password would
                     // make a no-save connection silently authenticate without prompting.
                     persist_secret_in_tx(&tx, &config.id, "password", "")?;
+                    delete_secret_prefix_in_tx(&tx, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
                 }
                 let mut sanitized = config;
                 sanitized.password = String::new();
@@ -2540,7 +2586,7 @@ impl Storage {
     pub async fn save_connections(&self, configs: &[ConnectionConfig]) -> Result<(), String> {
         let configs = configs.to_vec();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             let replacement_ids = configs.iter().map(|config| config.id.clone()).collect::<HashSet<_>>();
             let mut retained_ids = preserve_unreadable_connections_for_replacement(&tx, &replacement_ids)?;
 
@@ -2559,7 +2605,7 @@ impl Storage {
     pub async fn add_connection_for_mcp(&self, config: ConnectionConfig) -> Result<ConnectionConfig, String> {
         let config = config.canonicalized();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             ensure_mcp_connection_change_allowed_in_tx(&tx, None)?;
             persist_connection_in_tx(&tx, &config)?;
             tx.commit().map_err(|e| e.to_string())?;
@@ -2579,7 +2625,8 @@ impl Storage {
         let copied_id = copy_id.clone();
         let copy_name = copy_name.to_string();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|error| error.to_string())?;
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
             ensure_mcp_connection_change_allowed_in_tx(&tx, Some(&source_id))?;
             let copy_name_lower = copy_name.to_lowercase();
             let mut names = tx.prepare("SELECT config_json FROM connections").map_err(|error| error.to_string())?;
@@ -2627,7 +2674,7 @@ impl Storage {
     pub async fn remove_connection_for_mcp(&self, connection_id: &str) -> Result<bool, String> {
         let connection_id = connection_id.to_string();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             ensure_mcp_connection_change_allowed_in_tx(&tx, Some(&connection_id))?;
             let removed =
                 tx.execute("DELETE FROM connections WHERE id = ?1", [&connection_id]).map_err(|e| e.to_string())? > 0;
@@ -2919,6 +2966,31 @@ impl Storage {
         if config.db_type != DatabaseType::Nacos {
             return Ok(false);
         }
+        if !config.save_password {
+            let primary_needs_rewrite = nacos_auth_object(config.external_config.as_ref())
+                .filter(|auth| auth.get("kind").and_then(serde_json::Value::as_str) == Some("usernamePassword"))
+                .and_then(|auth| auth.get("password").and_then(serde_json::Value::as_str))
+                .is_some_and(|password| !password.is_empty());
+            let console_needs_rewrite = nacos_console_auth_object(config.external_config.as_ref())
+                .filter(|auth| auth.get("kind").and_then(serde_json::Value::as_str) == Some("usernamePassword"))
+                .and_then(|auth| auth.get("password").and_then(serde_json::Value::as_str))
+                .is_some_and(|password| !password.is_empty());
+            scrub_nacos_auth_secrets(config);
+
+            let connection_id = connection_id.to_string();
+            let key_prefix = format!("{NACOS_AUTH_SECRET_PREFIX}%");
+            self.with_conn(move |conn| {
+                conn.execute(
+                    "DELETE FROM connection_secrets WHERE connection_id = ?1 AND key LIKE ?2",
+                    params![connection_id, key_prefix],
+                )
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+            .await?;
+
+            return Ok(primary_needs_rewrite || console_needs_rewrite);
+        }
         let mut rewritten = false;
         if let Some(auth) = nacos_auth_object_mut(config.external_config.as_mut()) {
             if auth.get("kind").and_then(serde_json::Value::as_str) == Some("usernamePassword") {
@@ -2943,7 +3015,7 @@ impl Storage {
     pub async fn replace_saved_sql_library(&self, library: &SavedSqlLibrary) -> Result<(), String> {
         let library = library.clone();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM saved_sql_files", []).map_err(|e| e.to_string())?;
             tx.execute("DELETE FROM saved_sql_folders", []).map_err(|e| e.to_string())?;
 
@@ -3210,7 +3282,7 @@ impl Storage {
     pub async fn delete_saved_sql_folder(&self, id: &str) -> Result<(), String> {
         let id = id.to_string();
         self.with_conn(move |conn| {
-            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             let mut folder_ids = vec![id.clone()];
             let mut index = 0;
             while index < folder_ids.len() {
@@ -3547,7 +3619,8 @@ impl Storage {
         let owner_id = schema_cache_owner(&cache_key).to_string();
         let now_ms = unix_timestamp_millis();
         self.with_conn(move |conn| {
-            let transaction = conn.transaction().map_err(|error| error.to_string())?;
+            let transaction =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
             transaction
                 .execute(
                     "INSERT INTO schema_cache (
@@ -3574,7 +3647,9 @@ impl Storage {
         let now_ms = unix_timestamp_millis();
         let json: Option<String> = self
             .with_conn(move |conn| {
-                let transaction = conn.transaction().map_err(|error| error.to_string())?;
+                let transaction = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| error.to_string())?;
                 let json = transaction
                     .query_row(
                         "SELECT payload_json FROM schema_cache
@@ -3871,7 +3946,8 @@ impl Storage {
 
             let deleted_bytes =
                 entries.iter().filter(|(key, _, _, _)| deleted.contains(key)).map(|(_, bytes, _, _)| *bytes).sum();
-            let transaction = conn.transaction().map_err(|e| e.to_string())?;
+            let transaction =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
             for key in &deleted {
                 transaction
                     .execute("DELETE FROM tab_runtime_cache WHERE cache_key = ?1", [key])
@@ -4161,7 +4237,7 @@ fn persist_mq_token_signing_secret_in_tx(
 }
 
 fn persist_nacos_auth_secrets_in_tx(tx: &rusqlite::Transaction<'_>, config: &ConnectionConfig) -> Result<(), String> {
-    if config.db_type != DatabaseType::Nacos {
+    if config.db_type != DatabaseType::Nacos || !config.save_password {
         delete_secret_prefix_in_tx(tx, &config.id, NACOS_AUTH_SECRET_PREFIX)?;
         return Ok(());
     }
@@ -4323,7 +4399,7 @@ mod tests {
         ConnectionConfig, DatabaseConnectionInfo, DatabaseType, SshTunnelConfig, TransportLayerConfig,
     };
     use crate::saved_sql::SavedSqlFile;
-    use rusqlite::Connection;
+    use rusqlite::{Connection, TransactionBehavior};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     fn temp_db_path(name: &str) -> std::path::PathBuf {
@@ -4618,6 +4694,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_save_connections_from_two_connections_does_not_lock() {
+        // Regression test for issue #6605: multiple `dbx` processes sharing one
+        // data directory (e.g. a portable install shared by several users on
+        // the same machine) each open their own connection to the same
+        // `dbx.db`. Opening two independent `Storage` instances here exercises
+        // the same inter-connection SQLite file locking that separate OS
+        // processes would hit.
+        let path = temp_db_path("concurrent-save-connections");
+        let storage_a = std::sync::Arc::new(Storage::open(&path).await.unwrap());
+        let storage_b = std::sync::Arc::new(Storage::open(&path).await.unwrap());
+
+        let mut tasks = Vec::new();
+        for i in 0..20 {
+            let storage = if i % 2 == 0 { storage_a.clone() } else { storage_b.clone() };
+            let config = plain_connection(&format!("concurrent-{i}"), "hunter2");
+            tasks.push(tokio::spawn(async move { storage.save_connections(std::slice::from_ref(&config)).await }));
+        }
+
+        for task in tasks {
+            task.await.unwrap().expect("concurrent save_connections should not fail with 'database is locked'");
+        }
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn save_connections_persists_password_when_save_password_true() {
         let path = temp_db_path("save-password-true");
         let storage = Storage::open(&path).await.unwrap();
@@ -4821,6 +4923,24 @@ mod tests {
 
     fn nacos_auth_password(config: &ConnectionConfig) -> Option<&str> {
         config.external_config.as_ref()?.get("auth")?.get("password")?.as_str()
+    }
+
+    fn nacos_console_auth_password(config: &ConnectionConfig) -> Option<&str> {
+        config.external_config.as_ref()?.get("rnacosConsoleAuth")?.get("password")?.as_str()
+    }
+
+    fn nacos_connection_with_console_auth(
+        id: &str,
+        primary_password: &str,
+        console_password: &str,
+    ) -> ConnectionConfig {
+        let mut config = nacos_connection(id, primary_password);
+        config.external_config.as_mut().unwrap()["rnacosConsoleAuth"] = serde_json::json!({
+            "kind": "usernamePassword",
+            "username": "console",
+            "password": console_password
+        });
+        config
     }
 
     async fn create_data_dir_with_connection(name: &str, connection_id: &str, token: &str) -> std::path::PathBuf {
@@ -5082,7 +5202,7 @@ mod tests {
         let inserted_json = future_json.clone();
         storage
             .with_conn(move |conn| {
-                let tx = conn.transaction().map_err(|e| e.to_string())?;
+                let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
                 tx.execute(
                     "INSERT INTO connections (id, config_json) VALUES (?1, ?2)",
                     rusqlite::params!["future", inserted_json],
@@ -5261,6 +5381,76 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("console-secret")
         );
+    }
+
+    #[tokio::test]
+    async fn save_connections_does_not_persist_nacos_passwords_when_save_password_is_false() {
+        let path = temp_db_path("nacos-auth-no-save");
+        let storage = Storage::open(&path).await.unwrap();
+        let mut config = nacos_connection_with_console_auth("nacos", "primary-secret", "console-secret");
+        config.save_password = false;
+
+        storage.save_connections(&[config]).await.unwrap();
+
+        assert_eq!(storage.get_secret("nacos", NACOS_AUTH_PASSWORD_KEY).await.unwrap(), None);
+        assert_eq!(storage.get_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY).await.unwrap(), None);
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(nacos_auth_password(&loaded[0]), Some(""));
+        assert_eq!(nacos_console_auth_password(&loaded[0]), Some(""));
+    }
+
+    #[tokio::test]
+    async fn switching_nacos_password_saving_off_removes_all_stored_auth_secrets() {
+        let path = temp_db_path("nacos-auth-disable-save");
+        let storage = Storage::open(&path).await.unwrap();
+        let mut config = nacos_connection_with_console_auth("nacos", "primary-secret", "console-secret");
+        storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
+        assert!(storage.get_secret("nacos", NACOS_AUTH_PASSWORD_KEY).await.unwrap().is_some());
+        assert!(storage.get_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY).await.unwrap().is_some());
+
+        config.save_password = false;
+        storage.save_connections(&[config]).await.unwrap();
+
+        assert_eq!(storage.get_secret("nacos", NACOS_AUTH_PASSWORD_KEY).await.unwrap(), None);
+        assert_eq!(storage.get_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn metadata_sync_removes_nacos_auth_secrets_when_password_saving_is_disabled() {
+        let path = temp_db_path("nacos-auth-no-save-metadata-sync");
+        let storage = Storage::open(&path).await.unwrap();
+        let mut config = nacos_connection_with_console_auth("nacos", "primary-secret", "console-secret");
+        storage.save_connections(std::slice::from_ref(&config)).await.unwrap();
+
+        config.save_password = false;
+        storage.save_connection_metadata_preserving_secrets(&[config]).await.unwrap();
+
+        assert_eq!(storage.get_secret("nacos", NACOS_AUTH_PASSWORD_KEY).await.unwrap(), None);
+        assert_eq!(storage.get_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY).await.unwrap(), None);
+        let loaded = storage.load_connections().await.unwrap();
+        assert_eq!(nacos_auth_password(&loaded[0]), Some(""));
+        assert_eq!(nacos_console_auth_password(&loaded[0]), Some(""));
+    }
+
+    #[tokio::test]
+    async fn load_connections_cleans_legacy_nacos_passwords_when_saving_is_disabled() {
+        let path = temp_db_path("nacos-auth-no-save-legacy-cleanup");
+        let storage = Storage::open(&path).await.unwrap();
+        let mut config = nacos_connection_with_console_auth("nacos", "legacy-primary-secret", "legacy-console-secret");
+        config.save_password = false;
+        insert_raw_connection(&storage, &config).await;
+        storage.set_secret("nacos", NACOS_AUTH_PASSWORD_KEY, "stale-primary-secret").await.unwrap();
+        storage.set_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY, "stale-console-secret").await.unwrap();
+
+        let loaded = storage.load_connections().await.unwrap();
+
+        assert_eq!(nacos_auth_password(&loaded[0]), Some(""));
+        assert_eq!(nacos_console_auth_password(&loaded[0]), Some(""));
+        assert_eq!(storage.get_secret("nacos", NACOS_AUTH_PASSWORD_KEY).await.unwrap(), None);
+        assert_eq!(storage.get_secret("nacos", NACOS_RNACOS_CONSOLE_PASSWORD_KEY).await.unwrap(), None);
+        let raw_json = raw_connection_json(&storage, "nacos").await;
+        assert!(!raw_json.contains("legacy-primary-secret"));
+        assert!(!raw_json.contains("legacy-console-secret"));
     }
 
     #[tokio::test]
@@ -5613,7 +5803,9 @@ mod tests {
         let storage = Storage::open(&path).await.unwrap();
         storage
             .with_conn(|conn| {
-                let transaction = conn.transaction().map_err(|error| error.to_string())?;
+                let transaction = conn
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| error.to_string())?;
                 {
                     let mut statement = transaction
                         .prepare(

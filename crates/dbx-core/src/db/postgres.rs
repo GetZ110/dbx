@@ -1,6 +1,7 @@
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use deadpool_postgres::{ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime};
 use futures::{SinkExt, StreamExt};
+use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
 use percent_encoding::percent_decode_str;
 use rust_decimal::Decimal;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -163,6 +164,34 @@ impl<'a> FromSql<'a> for PgAnyString {
 
     fn accepts(_: &Type) -> bool {
         true
+    }
+}
+
+/// PostgreSQL `money` is sent in the binary protocol as a signed 64-bit
+/// integer scaled by 100 (the smallest unit of the currency). It is not
+/// decoded by `rust_decimal`, so attempting to read it as `Decimal` produces
+/// NULL in the result grid.
+struct PgMoney(i64);
+
+impl<'a> FromSql<'a> for PgMoney {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let bytes: [u8; 8] = raw.try_into().map_err(|_| "expected 8 bytes for PostgreSQL money")?;
+        Ok(Self(i64::from_be_bytes(bytes)))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::MONEY
+    }
+}
+
+fn format_pg_money(value: i64) -> String {
+    let negative = value < 0;
+    let absolute = (value as i128).abs();
+    let formatted = format!("{}.{:02}", absolute / 100, absolute % 100);
+    if negative {
+        format!("-{formatted}")
+    } else {
+        formatted
     }
 }
 
@@ -597,6 +626,7 @@ pub(crate) enum PgColType {
     DateRange,
     Temporal { fallback: PgTemporalFallback },
     Numeric,
+    Money,
     Uuid,
     Inet { cidr: bool },
     MacAddr,
@@ -701,7 +731,10 @@ pub(crate) fn classify_pg_type(type_name: &str) -> PgColType {
         };
         return PgColType::Temporal { fallback };
     }
-    if upper == "NUMERIC" || upper == "DECIMAL" || upper == "MONEY" {
+    if upper == "MONEY" {
+        return PgColType::Money;
+    }
+    if upper == "NUMERIC" || upper == "DECIMAL" {
         return PgColType::Numeric;
     }
     if upper == "UUID" {
@@ -788,6 +821,10 @@ pub(crate) fn pg_value_to_json_classified(row: &Row, idx: usize, col_type: PgCol
         PgColType::Numeric => row
             .try_get::<_, Decimal>(idx)
             .map(|v: Decimal| serde_json::Value::String(v.to_string()))
+            .unwrap_or(serde_json::Value::Null),
+        PgColType::Money => row
+            .try_get::<_, PgMoney>(idx)
+            .map(|v| serde_json::Value::String(format_pg_money(v.0)))
             .unwrap_or(serde_json::Value::Null),
         PgColType::Uuid => row
             .try_get::<_, uuid::Uuid>(idx)
@@ -2119,17 +2156,27 @@ async fn connect_postgres_pool_attempt(
         // executor's ReconnectAndRetry path (see pool_error_action / do_execute
         // in query.rs).
         let mgr_config = ManagerConfig { recycling_method: RecyclingMethod::Fast };
-        let tls_config = postgres_tls_config(
-            &pg_config,
-            &postgres_url.ssl_files,
-            postgres_url.accepts_invalid_certs,
-            postgres_url.verifies_hostname,
-        )?;
-        let mgr = deadpool_postgres::Manager::from_connect(
-            pg_config.clone(),
-            NoticeCapturingConnect { tls: tokio_postgres_rustls::MakeRustlsConnect::new(tls_config) },
-            mgr_config,
-        );
+        let mgr = if postgres_url.legacy_tls {
+            log::info!("PostgreSQL legacy TLS compatibility enabled");
+            let tls = postgres_openssl_connector(
+                &postgres_url.ssl_files,
+                postgres_url.accepts_invalid_certs,
+                postgres_url.verifies_hostname,
+            )?;
+            deadpool_postgres::Manager::from_connect(pg_config.clone(), NoticeCapturingConnect { tls }, mgr_config)
+        } else {
+            let tls_config = postgres_tls_config(
+                &pg_config,
+                &postgres_url.ssl_files,
+                postgres_url.accepts_invalid_certs,
+                postgres_url.verifies_hostname,
+            )?;
+            deadpool_postgres::Manager::from_connect(
+                pg_config.clone(),
+                NoticeCapturingConnect { tls: tokio_postgres_rustls::MakeRustlsConnect::new(tls_config) },
+                mgr_config,
+            )
+        };
         let pool = Pool::builder(mgr)
             .max_size(10)
             .runtime(Runtime::Tokio1)
@@ -2266,6 +2313,7 @@ pub struct PostgresCancelContext {
     pub accepts_invalid_certs: bool,
     pub verifies_hostname: bool,
     pub ssl_mode: SslMode,
+    pub legacy_tls: bool,
 }
 
 /// Build a TLS cancel context from the connection URL.
@@ -2281,6 +2329,7 @@ pub fn build_postgres_cancel_context(url: &str) -> Option<PostgresCancelContext>
         accepts_invalid_certs: postgres_url.accepts_invalid_certs,
         verifies_hostname: postgres_url.verifies_hostname,
         ssl_mode: pg_config.get_ssl_mode(),
+        legacy_tls: postgres_url.legacy_tls,
     })
 }
 
@@ -2295,12 +2344,19 @@ fn make_rustls_connect_from_context(
     Ok(tokio_postgres_rustls::MakeRustlsConnect::new(tls_config))
 }
 
+fn make_openssl_connect_from_context(
+    ctx: &PostgresCancelContext,
+) -> Result<postgres_openssl::MakeTlsConnector, String> {
+    postgres_openssl_connector(&ctx.ssl_files, ctx.accepts_invalid_certs, ctx.verifies_hostname)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PostgresConnectionUrl {
     url: String,
     ssl_files: PostgresSslFiles,
     accepts_invalid_certs: bool,
     verifies_hostname: bool,
+    legacy_tls: bool,
 }
 
 /// Inject TCP keepalive parameters into the PostgreSQL URL (only when the user has not explicitly specified them).
@@ -2333,6 +2389,7 @@ fn postgres_connection_url(url: &str) -> Result<PostgresConnectionUrl, String> {
             ssl_files: PostgresSslFiles::default(),
             accepts_invalid_certs: postgres_sslmode_accepts_invalid_certs(pg_config.get_ssl_mode()),
             verifies_hostname: false,
+            legacy_tls: false,
         });
     };
 
@@ -2343,6 +2400,7 @@ fn postgres_connection_url(url: &str) -> Result<PostgresConnectionUrl, String> {
     let mut kept_params = Vec::new();
     let mut accepts_invalid_certs = true;
     let mut verifies_hostname = false;
+    let mut legacy_tls = false;
 
     for param in query_string.split('&') {
         if param.is_empty() {
@@ -2354,7 +2412,9 @@ fn postgres_connection_url(url: &str) -> Result<PostgresConnectionUrl, String> {
             continue;
         };
 
-        if key.eq_ignore_ascii_case("sslcert")
+        if key.eq_ignore_ascii_case("legacy_tls") {
+            legacy_tls = matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        } else if key.eq_ignore_ascii_case("sslcert")
             || key.eq_ignore_ascii_case("sslkey")
             || key.eq_ignore_ascii_case("sslrootcert")
         {
@@ -2416,7 +2476,49 @@ fn postgres_connection_url(url: &str) -> Result<PostgresConnectionUrl, String> {
         sanitized_url.push_str(fragment);
     }
 
-    Ok(PostgresConnectionUrl { url: sanitized_url, ssl_files, accepts_invalid_certs, verifies_hostname })
+    Ok(PostgresConnectionUrl { url: sanitized_url, ssl_files, accepts_invalid_certs, verifies_hostname, legacy_tls })
+}
+
+fn postgres_openssl_connector(
+    ssl_files: &PostgresSslFiles,
+    accepts_invalid_certs: bool,
+    verifies_hostname: bool,
+) -> Result<postgres_openssl::MakeTlsConnector, String> {
+    let mut builder = SslConnector::builder(SslMethod::tls_client())
+        .map_err(|e| format!("Failed to initialize PostgreSQL legacy TLS: {e}"))?;
+
+    if accepts_invalid_certs {
+        builder.set_verify(SslVerifyMode::NONE);
+    } else {
+        builder.set_verify(SslVerifyMode::PEER);
+        if let Some(path) = ssl_files.sslrootcert.as_deref() {
+            builder
+                .set_ca_file(path)
+                .map_err(|e| format!("sslrootcert: failed to load CA certificate from {path}: {e}"))?;
+        }
+    }
+
+    match (ssl_files.sslcert.as_deref(), ssl_files.sslkey.as_deref()) {
+        (Some(cert_path), Some(key_path)) => {
+            builder
+                .set_certificate_chain_file(cert_path)
+                .map_err(|e| format!("sslcert: failed to load certificate from {cert_path}: {e}"))?;
+            builder
+                .set_private_key_file(key_path, SslFiletype::PEM)
+                .map_err(|e| format!("sslkey: failed to load private key from {key_path}: {e}"))?;
+            builder.check_private_key().map_err(|e| format!("sslkey: private key does not match sslcert: {e}"))?;
+        }
+        (Some(_), None) => return Err("PostgreSQL sslcert requires sslkey".to_string()),
+        (None, Some(_)) => return Err("PostgreSQL sslkey requires sslcert".to_string()),
+        (None, None) => {}
+    }
+
+    let mut connector = postgres_openssl::MakeTlsConnector::new(builder.build());
+    connector.set_callback(move |config, _| {
+        config.set_verify_hostname(verifies_hostname);
+        Ok(())
+    });
+    Ok(connector)
 }
 
 fn postgres_tls_config(
@@ -2732,6 +2834,29 @@ pub async fn list_tables_filtered(
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<TableInfo>, String> {
+    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, false).await
+}
+
+/// Lists only table-like relations, excluding views and materialized views while
+/// retaining server-side filtering and pagination.
+pub async fn list_table_objects_filtered(
+    pool: &Pool,
+    schema: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> Result<Vec<TableInfo>, String> {
+    list_tables_filtered_by_kind(pool, schema, filter, limit, offset, true).await
+}
+
+async fn list_tables_filtered_by_kind(
+    pool: &Pool,
+    schema: &str,
+    filter: Option<&str>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    table_objects_only: bool,
+) -> Result<Vec<TableInfo>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let filter = filter.unwrap_or("").trim();
     let filter_pattern = like_contains_pattern(filter);
@@ -2740,7 +2865,11 @@ pub async fn list_tables_filtered(
     let limit_param = limit.and_then(|value| i64::try_from(value).ok());
     let offset_param = offset.and_then(|value| i64::try_from(value).ok()).unwrap_or(0);
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let sql = postgres_tables_sql(limit_param, offset_param);
+    let sql = if table_objects_only {
+        postgres_table_objects_sql(limit_param, offset_param)
+    } else {
+        postgres_tables_sql(limit_param, offset_param)
+    };
     let params: &[(&(dyn tokio_postgres::types::ToSql + Sync), Type)] =
         &[(&schema, Type::VARCHAR), (&filter_pattern, Type::VARCHAR), (&fuzzy_filter_pattern, Type::VARCHAR)];
     // The pagination literals make this SQL vary by page. Use an unnamed typed
@@ -3081,9 +3210,13 @@ pub async fn get_table_partition_info(
         return Ok(PostgresTablePartitionInfo::default());
     }
 
-    let rows = postgres_query_cached(&client, postgres_table_partition_info_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
+    let rows = query_with_compat_fallback(
+        "get_table_partition_info",
+        &[postgres_table_partition_info_sql(), postgres_table_partition_info_compat_sql()],
+        |sql| postgres_query_cached(&client, sql, &params),
+    )
+    .await?;
     let Some(row) = rows.first() else {
         return Ok(PostgresTablePartitionInfo { is_partition, is_foreign, ..Default::default() });
     };
@@ -3210,6 +3343,28 @@ fn postgres_partition_tree_sql() -> &'static str {
      ORDER BY t.oid"
 }
 
+/// 9.x 没有 relispartition/relpartbound/pg_get_partkeydef，主查询会用到一个
+/// 不存在的列，直接报错；旧式 INHERITS 子表在 9.x 按普通表处理，
+/// 这里只返回请求的关系本身。
+///
+/// Pre-10 servers lack the declarative-partition catalog (relispartition /
+/// relpartbound / pg_get_partkeydef) the primary query needs; old-style
+/// INHERITS children are plain tables there, so just the requested relation
+/// is returned.
+fn postgres_partition_tree_compat_sql() -> &'static str {
+    "SELECT c.oid::bigint AS oid, n.nspname::text AS schema, c.relname::text AS relname, \
+            NULL::bigint AS parent_oid, NULL::text AS parent_schema, NULL::text AS parent_relname, \
+            c.relkind::text AS relkind, \
+            NULL::text AS partition_bound, NULL::text AS partition_key, \
+            fs.srvname AS foreign_server, \
+            ft.ftoptions AS foreign_options \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     LEFT JOIN pg_catalog.pg_foreign_table ft ON ft.ftrelid = c.oid \
+     LEFT JOIN pg_catalog.pg_foreign_server fs ON fs.oid = ft.ftserver \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f')"
+}
+
 /// The whole partition tree rooted at (schema, table) — the root itself plus
 /// every descendant partition at any depth — plus each node's partition info,
 /// in a single round trip. Used by `pg_ddl_with_partitions` instead of
@@ -3222,9 +3377,13 @@ pub async fn fetch_postgres_partition_tree(
 ) -> Result<Vec<PostgresPartitionTreeNode>, String> {
     let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_partition_tree_sql(), &[&schema, &table])
-        .await
-        .map_err(pg_error_to_string)?;
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
+    let rows = query_with_compat_fallback(
+        "fetch_postgres_partition_tree",
+        &[postgres_partition_tree_sql(), postgres_partition_tree_compat_sql()],
+        |sql| postgres_query_cached(&client, sql, &params),
+    )
+    .await?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -3521,7 +3680,7 @@ fn postgres_indexes_for_relations_query_tiers() -> [&'static str; 2] {
 fn postgres_indexes_for_relations_sql() -> &'static str {
     "SELECT t.oid::bigint AS relid, i.relname AS index_name, \
              array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, true)) ORDER BY k.n) AS columns, \
-             ix.indisunique AS is_unique, \
+             (ix.indisunique AND ix.indisvalid) AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
              am.amname AS index_type, \
@@ -3536,7 +3695,7 @@ fn postgres_indexes_for_relations_sql() -> &'static str {
              JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) ON true \
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
              WHERE t.oid = ANY($1::bigint[]) \
-             GROUP BY t.oid, i.relname, i.oid, ix.indisunique, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
+             GROUP BY t.oid, i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY t.oid, i.relname"
 }
 
@@ -3553,7 +3712,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
                 AND a.attnum > 0 \
                ORDER BY pos.n \
              ) AS columns, \
-             ix.indisunique AS is_unique, \
+             (ix.indisunique AND ix.indisvalid) AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
              am.amname AS index_type, \
@@ -3831,6 +3990,24 @@ fn postgres_table_partition_info_sql() -> &'static str {
      LIMIT 1"
 }
 
+/// 9.x 没有分区父表（也没有 relpartbound/pg_get_partkeydef），只保留
+/// 外部表字段，其余列给 NULL，列序与主查询保持一致。
+///
+/// Pre-10 servers have no partition parent (nor the 10+ columns/functions);
+/// only the foreign-table fields are kept, same column order as the primary.
+fn postgres_table_partition_info_compat_sql() -> &'static str {
+    "SELECT NULL::text AS parent_schema, NULL::text AS parent_table, NULL::text AS partition_bound, \
+            NULL::text AS partition_key, \
+            CASE WHEN c.relkind = 'f' THEN fs.srvname ELSE NULL END AS foreign_server, \
+            CASE WHEN c.relkind = 'f' THEN ft.ftoptions ELSE NULL END AS foreign_options \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     LEFT JOIN pg_catalog.pg_foreign_table ft ON ft.ftrelid = c.oid \
+     LEFT JOIN pg_catalog.pg_foreign_server fs ON fs.oid = ft.ftserver \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
+     LIMIT 1"
+}
+
 fn postgres_table_partition_local_objects_sql() -> &'static str {
     "SELECT 'constraint'::text AS object_kind, con.conname AS object_name, con.contype::text AS object_type \
      FROM pg_catalog.pg_constraint con \
@@ -3882,6 +4059,14 @@ fn postgres_table_comment_sql() -> &'static str {
 }
 
 fn postgres_tables_sql(limit: Option<i64>, offset: i64) -> String {
+    postgres_tables_sql_with_kind(limit, offset, false)
+}
+
+fn postgres_table_objects_sql(limit: Option<i64>, offset: i64) -> String {
+    postgres_tables_sql_with_kind(limit, offset, true)
+}
+
+fn postgres_tables_sql_with_kind(limit: Option<i64>, offset: i64, table_objects_only: bool) -> String {
     // PostgreSQL-compatible servers do not agree on the inferred wire types
     // or accepted expression grammar for LIMIT/OFFSET parameters. These values
     // originate as usize and are converted to non-negative i64 literals.
@@ -3891,6 +4076,7 @@ fn postgres_tables_sql(limit: Option<i64>, offset: i64) -> String {
         Some(limit) => format!("LIMIT {limit} OFFSET {offset}"),
         None => format!("OFFSET {offset}"),
     };
+    let relation_kinds = if table_objects_only { "'r','f','p'" } else { "'r','v','m','f','p'" };
     format!(
         "SELECT c.relname AS table_name, \
          CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'v' THEN 'VIEW' \
@@ -3904,7 +4090,7 @@ fn postgres_tables_sql(limit: Option<i64>, offset: i64) -> String {
          LEFT JOIN pg_catalog.pg_inherits i ON i.inhrelid = c.oid \
          LEFT JOIN pg_catalog.pg_class pc ON pc.oid = i.inhparent \
          LEFT JOIN pg_catalog.pg_namespace pn ON pn.oid = pc.relnamespace \
-         WHERE n.nspname = $1 AND c.relkind IN ('r','v','m','f','p') \
+         WHERE n.nspname = $1 AND c.relkind IN ({relation_kinds}) \
            AND ($2 = '%%' OR c.relname ILIKE $2 OR ($3 <> '' AND c.relname ILIKE $3)) \
          ORDER BY CASE WHEN pc.relkind = 'p' THEN 1 ELSE 0 END, c.relname \
          {pagination}"
@@ -5218,6 +5404,8 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
                               FROM pg_enum e WHERE e.enumtypid = enum_t.oid), '[]') END AS enum_values \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
+             JOIN pg_class relation_class ON relation_class.oid = a.attrelid \
+             JOIN pg_namespace relation_namespace ON relation_namespace.oid = relation_class.relnamespace \
              LEFT JOIN pg_type enum_t ON enum_t.oid = CASE WHEN t.typtype = 'd' THEN t.typbasetype WHEN t.typtype = 'e' THEN t.oid ELSE NULL END AND enum_t.typtype = 'e' \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN LATERAL ( \
@@ -5243,8 +5431,8 @@ const POSTGRES_COLUMNS_SQL: &str = "SELECT a.attname AS column_name, \
              ) dep ON TRUE \
              LEFT JOIN pg_sequence pseq ON pseq.seqrelid = dep.objid \
              LEFT JOIN information_schema.columns c \
-               ON c.table_schema = $1 AND c.table_name = $2 AND c.column_name = a.attname \
-             WHERE a.attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass \
+               ON c.table_schema = relation_namespace.nspname AND c.table_name = relation_class.relname AND c.column_name = a.attname \
+             WHERE a.attrelid = (CASE WHEN $1 = '' THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
 
@@ -5277,6 +5465,8 @@ const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
              NULL::text AS enum_values \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
+             JOIN pg_class relation_class ON relation_class.oid = a.attrelid \
+             JOIN pg_namespace relation_namespace ON relation_namespace.oid = relation_class.relnamespace \
              LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum \
              LEFT JOIN pg_catalog.pg_class serial_seq ON serial_seq.oid = ( \
                SELECT sequence_dep.objid \
@@ -5299,8 +5489,8 @@ const POSTGRES_COLUMNS_COMPAT_SQL: &str = "SELECT a.attname AS column_name, \
                LIMIT 1 \
              ) AND serial_seq.relkind = 'S' \
              LEFT JOIN information_schema.columns c \
-               ON c.table_schema = $1 AND c.table_name = $2 AND c.column_name = a.attname \
-             WHERE a.attrelid = (quote_ident($1) || '.' || quote_ident($2))::regclass \
+               ON c.table_schema = relation_namespace.nspname AND c.table_name = relation_class.relname AND c.column_name = a.attname \
+             WHERE a.attrelid = (CASE WHEN $1 = '' THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum";
 
@@ -5427,7 +5617,6 @@ async fn get_columns_with_sql(
 }
 
 pub async fn get_columns(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ColumnInfo>, String> {
-    let schema = if schema.is_empty() { "public" } else { schema };
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let tiers = [POSTGRES_COLUMNS_SQL, POSTGRES_COLUMNS_COMPAT_SQL, POSTGRES_COLUMNS_INFORMATION_SCHEMA_SQL];
     query_with_compat_fallback("get_columns", &tiers, |sql| get_columns_with_sql(&client, sql, schema, table)).await
@@ -6336,8 +6525,25 @@ async fn cancel_postgres_query(
 ) {
     let cancel_timeout = postgres_cancel_attempt_timeout(cancel_timeout, cancel_context);
     if let Some(ctx) = cancel_context {
-        match make_rustls_connect_from_context(ctx) {
-            Ok(tls) => match tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(tls)).await {
+        let tls_result = if ctx.legacy_tls {
+            match make_openssl_connect_from_context(ctx) {
+                Ok(tls) => Some(tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(tls)).await),
+                Err(err) => {
+                    log::warn!("Failed to build legacy TLS connector for cancel: {err}; falling back to NoTls cancel");
+                    None
+                }
+            }
+        } else {
+            match make_rustls_connect_from_context(ctx) {
+                Ok(tls) => Some(tokio::time::timeout(cancel_timeout, pg_cancel_token.cancel_query(tls)).await),
+                Err(err) => {
+                    log::warn!("Failed to build TLS connector for cancel: {err}; falling back to NoTls cancel");
+                    None
+                }
+            }
+        };
+        if let Some(result) = tls_result {
+            match result {
                 Ok(Ok(())) => return,
                 Ok(Err(err)) => {
                     log::warn!("Failed to send PostgreSQL TLS cancel request: {err}");
@@ -6351,9 +6557,6 @@ async fn cancel_postgres_query(
                         return;
                     }
                 }
-            },
-            Err(err) => {
-                log::warn!("Failed to build TLS connector for cancel: {err}; falling back to NoTls cancel");
             }
         }
     }
@@ -6436,7 +6639,7 @@ async fn execute_query_with_max_rows_inner(
 // (schema, table) instead of a batch of oids — see the note there.
 const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              array_agg(COALESCE(a.attname, pg_get_indexdef(ix.indexrelid, k.n::int, true)) ORDER BY k.n) AS columns, \
-             ix.indisunique AS is_unique, \
+             (ix.indisunique AND ix.indisvalid) AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
              am.amname AS index_type, \
@@ -6451,8 +6654,8 @@ const POSTGRES_INDEXES_SQL: &str = "SELECT i.relname AS index_name, \
              JOIN pg_am am ON am.oid = i.relam \
              JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, n) ON true \
              LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum AND k.attnum > 0 \
-             WHERE n.nspname = $1 AND t.relname = $2 \
-             GROUP BY i.relname, i.oid, ix.indisunique, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
+             WHERE t.oid = (CASE WHEN $1 = '' THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
+             GROUP BY i.relname, i.oid, ix.indisunique, ix.indisvalid, ix.indisprimary, ix.indpred, ix.indrelid, am.amname, ix.indnkeyatts, ix.indkey \
              ORDER BY i.relname";
 
 // Compat-tier sibling of `postgres_indexes_for_relations_compat_sql` (~line
@@ -6467,7 +6670,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
                 AND a.attnum > 0 \
                ORDER BY pos.n \
              ) AS columns, \
-             ix.indisunique AS is_unique, \
+             (ix.indisunique AND ix.indisvalid) AS is_unique, \
              ix.indisprimary AS is_primary, \
              pg_get_expr(ix.indpred, ix.indrelid) AS filter_expr, \
              am.amname AS index_type, \
@@ -6488,7 +6691,7 @@ const POSTGRES_INDEXES_COMPAT_SQL: &str = "SELECT i.relname AS index_name, \
              JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
              JOIN pg_am am ON am.oid = i.relam \
-             WHERE n.nspname = $1 AND t.relname = $2 \
+             WHERE t.oid = (CASE WHEN $1 = '' THEN quote_ident($2) ELSE quote_ident($1) || '.' || quote_ident($2) END)::regclass \
              ORDER BY i.relname";
 
 const POSTGRES_OWNERS_SQL: &str =
@@ -6707,13 +6910,43 @@ fn postgres_table_dependencies_sql() -> &'static str {
      ORDER BY table_name, ref_table"
 }
 
+/// 9.x 没有 relispartition；INHERITS 子表同样要先建父表，所以保留这条边。
+///
+/// No relispartition pre-10; INHERITS children still need their parent
+/// created first, so the edge is kept without the filter.
+fn postgres_table_dependencies_compat_sql() -> &'static str {
+    "SELECT child.relname AS table_name, parent.relname AS ref_table \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class child ON child.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace child_schema ON child_schema.oid = child.relnamespace \
+     JOIN pg_catalog.pg_class parent ON parent.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace parent_schema ON parent_schema.oid = parent.relnamespace \
+     WHERE con.contype = 'f' \
+       AND child_schema.nspname = $1 \
+       AND parent_schema.nspname = $1 \
+     UNION \
+     SELECT child.relname AS table_name, parent.relname AS ref_table \
+     FROM pg_catalog.pg_inherits i \
+     JOIN pg_catalog.pg_class child ON child.oid = i.inhrelid \
+     JOIN pg_catalog.pg_namespace child_schema ON child_schema.oid = child.relnamespace \
+     JOIN pg_catalog.pg_class parent ON parent.oid = i.inhparent \
+     JOIN pg_catalog.pg_namespace parent_schema ON parent_schema.oid = parent.relnamespace \
+     WHERE child_schema.nspname = $1 \
+       AND parent_schema.nspname = $1 \
+     ORDER BY table_name, ref_table"
+}
+
 /// Fetch all same-schema table dependencies in one round trip. Whole-database
 /// exports use this instead of issuing one information_schema query per table.
 pub async fn list_table_dependencies(pool: &Pool, schema: &str) -> Result<Vec<(String, String)>, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_table_dependencies_sql(), &[&schema])
-        .await
-        .map_err(|e| e.to_string())?;
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 1] = [&schema];
+    let rows = query_with_compat_fallback(
+        "list_table_dependencies",
+        &[postgres_table_dependencies_sql(), postgres_table_dependencies_compat_sql()],
+        |sql| postgres_query_cached(&client, sql, &params),
+    )
+    .await?;
 
     Ok(rows.iter().map(|row| (pg_row_try_string(row, 0), pg_row_try_string(row, 1))).collect())
 }
@@ -7109,6 +7342,14 @@ pub async fn list_owners(pool: &Pool, schema: &str) -> Result<Vec<OwnerInfo>, St
         .collect())
 }
 
+pub async fn get_table_owner(pool: &Pool, schema: &str, table: &str) -> Result<Option<String>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
+    let rows = postgres_query_cached(&client, POSTGRES_TABLE_OWNER_SQL, &params).await.map_err(pg_error_to_string)?;
+
+    Ok(rows.first().map(|row| pg_row_try_string(row, 0)).filter(|owner| !owner.is_empty()))
+}
+
 pub async fn get_table_access(pool: &Pool, schema: &str, table: &str) -> Result<PostgresTableAccessInfo, String> {
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
@@ -7230,12 +7471,31 @@ pub async fn copy_in(pool: &Pool, sql: &str, data: &[u8]) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openssl::asn1::Asn1Time;
+    use openssl::bn::{BigNum, MsbOption};
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::ssl::{Ssl, SslAcceptor, SslMethod, SslVersion};
+    use openssl::x509::extension::{BasicConstraints, KeyUsage, SubjectAlternativeName};
+    use openssl::x509::{X509NameBuilder, X509};
     use std::cell::Cell;
+    use std::pin::Pin;
     use std::process::Command;
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_postgres::types::FromSql;
+
+    #[test]
+    fn postgres_money_binary_values_are_decoded_with_two_decimal_places() {
+        assert_eq!(format_pg_money(12345), "123.45");
+        assert_eq!(format_pg_money(-5), "-0.05");
+        assert_eq!(format_pg_money(0), "0.00");
+
+        let decoded = PgMoney::from_sql(&Type::MONEY, &(-12345_i64).to_be_bytes()).unwrap();
+        assert_eq!(format_pg_money(decoded.0), "-123.45");
+    }
 
     fn postgres_error_response(message: &str) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -7282,6 +7542,125 @@ mod tests {
         plain_socket.write_all(&postgres_error_response("identity probe unavailable")).await.unwrap();
     }
 
+    fn tls12_rsa_certificate_acceptor(cipher_list: &str) -> (SslAcceptor, Vec<u8>) {
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "localhost").unwrap();
+        let name = name.build();
+
+        let mut serial = BigNum::new().unwrap();
+        serial.rand(64, MsbOption::MAYBE_ZERO, false).unwrap();
+        let serial = serial.to_asn1_integer().unwrap();
+        let mut certificate = X509::builder().unwrap();
+        certificate.set_version(2).unwrap();
+        certificate.set_serial_number(&serial).unwrap();
+        certificate.set_subject_name(&name).unwrap();
+        certificate.set_issuer_name(&name).unwrap();
+        certificate.set_pubkey(&key).unwrap();
+        certificate.set_not_before(Asn1Time::days_from_now(0).unwrap().as_ref()).unwrap();
+        certificate.set_not_after(Asn1Time::days_from_now(1).unwrap().as_ref()).unwrap();
+        certificate.append_extension(BasicConstraints::new().critical().ca().build().unwrap()).unwrap();
+        certificate
+            .append_extension(KeyUsage::new().digital_signature().key_encipherment().key_cert_sign().build().unwrap())
+            .unwrap();
+        let subject_alt_name =
+            SubjectAlternativeName::new().dns("localhost").build(&certificate.x509v3_context(None, None)).unwrap();
+        certificate.append_extension(subject_alt_name).unwrap();
+        certificate.sign(&key, MessageDigest::sha256()).unwrap();
+        let certificate = certificate.build();
+        let certificate_pem = certificate.to_pem().unwrap();
+
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls_server()).unwrap();
+        acceptor.set_min_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+        acceptor.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+        acceptor.set_cipher_list(cipher_list).unwrap();
+        acceptor.set_private_key(&key).unwrap();
+        acceptor.set_certificate(&certificate).unwrap();
+        acceptor.check_private_key().unwrap();
+        (acceptor.build(), certificate_pem)
+    }
+
+    async fn accept_tls12_with_acceptor(
+        mut socket: tokio::net::TcpStream,
+        acceptor: &SslAcceptor,
+    ) -> Result<tokio_openssl::SslStream<tokio::net::TcpStream>, openssl::ssl::Error> {
+        let mut ssl_request = [0_u8; 8];
+        socket.read_exact(&mut ssl_request).await.unwrap();
+        assert_eq!(ssl_request, [0, 0, 0, 8, 4, 210, 22, 47]);
+        socket.write_all(b"S").await.unwrap();
+
+        let ssl = Ssl::new(acceptor.context()).unwrap();
+        let mut tls_socket = tokio_openssl::SslStream::new(ssl, socket).unwrap();
+        Pin::new(&mut tls_socket).accept().await?;
+        Ok(tls_socket)
+    }
+
+    async fn accept_tls12(
+        socket: tokio::net::TcpStream,
+        cipher_list: &str,
+    ) -> Result<tokio_openssl::SslStream<tokio::net::TcpStream>, openssl::ssl::Error> {
+        let (acceptor, _) = tls12_rsa_certificate_acceptor(cipher_list);
+        accept_tls12_with_acceptor(socket, &acceptor).await
+    }
+
+    async fn authenticate_tls12_postgres(tls_socket: &mut tokio_openssl::SslStream<tokio::net::TcpStream>) {
+        let startup_len = tls_socket.read_u32().await.unwrap();
+        assert!(startup_len >= 8);
+        let mut startup = vec![0_u8; startup_len as usize - 4];
+        tls_socket.read_exact(&mut startup).await.unwrap();
+        assert_eq!(&startup[..4], &[0, 3, 0, 0]);
+        tls_socket
+            .write_all(&[
+                b'R', 0, 0, 0, 8, 0, 0, 0, 0, // AuthenticationOk
+                b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 2, // BackendKeyData
+                b'Z', 0, 0, 0, 5, b'I', // ReadyForQuery
+            ])
+            .await
+            .unwrap();
+
+        let mut request = [0_u8; 1024];
+        let read = tls_socket.read(&mut request).await.unwrap();
+        assert!(read > 0, "client should issue the best-effort identity query");
+        tls_socket.write_all(&postgres_error_response("identity probe unavailable")).await.unwrap();
+    }
+
+    async fn serve_tls12_postgres(listener: TcpListener, cipher_list: &'static str, expect_handshake: bool) {
+        let (socket, _) = listener.accept().await.unwrap();
+        let handshake = accept_tls12(socket, cipher_list).await;
+        if !expect_handshake {
+            assert!(handshake.is_err(), "rustls unexpectedly negotiated a static RSA cipher suite");
+            return;
+        }
+        let mut tls_socket = handshake.unwrap();
+        authenticate_tls12_postgres(&mut tls_socket).await;
+    }
+
+    async fn serve_tls12_postgres_with_acceptor(listener: TcpListener, acceptor: SslAcceptor, expect_handshake: bool) {
+        let (socket, _) = listener.accept().await.unwrap();
+        let handshake = accept_tls12_with_acceptor(socket, &acceptor).await;
+        if !expect_handshake {
+            assert!(handshake.is_err(), "TLS handshake unexpectedly succeeded");
+            return;
+        }
+        let mut tls_socket = handshake.unwrap();
+        authenticate_tls12_postgres(&mut tls_socket).await;
+    }
+
+    async fn serve_static_rsa_postgres_with_cancel(listener: TcpListener) {
+        let (main_socket, _) = listener.accept().await.unwrap();
+        let mut main_tls = accept_tls12(main_socket, "AES128-GCM-SHA256").await.unwrap();
+        authenticate_tls12_postgres(&mut main_tls).await;
+
+        let (cancel_socket, _) = listener.accept().await.unwrap();
+        let mut cancel_tls = accept_tls12(cancel_socket, "AES128-GCM-SHA256").await.unwrap();
+        let mut cancel_request = [0_u8; 16];
+        cancel_tls.read_exact(&mut cancel_request).await.unwrap();
+        assert_eq!(u32::from_be_bytes(cancel_request[0..4].try_into().unwrap()), 16);
+        assert_eq!(u32::from_be_bytes(cancel_request[4..8].try_into().unwrap()), 80_877_102);
+        assert_eq!(u32::from_be_bytes(cancel_request[8..12].try_into().unwrap()), 1);
+        assert_eq!(u32::from_be_bytes(cancel_request[12..16].try_into().unwrap()), 2);
+    }
+
     #[tokio::test]
     async fn postgres_prefer_retries_plaintext_after_tls_handshake_failure() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7291,6 +7670,104 @@ mod tests {
 
         let result = connect_with_optional_local_timezone(&url, Duration::from_secs(2), None).await;
         assert!(result.is_ok(), "prefer mode should retry without TLS: {result:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_default_tls_rejects_static_rsa_key_exchange() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_tls12_postgres(listener, "AES128-GCM-SHA256", false));
+        let url = format!("postgres://postgres@127.0.0.1:{port}/postgres?sslmode=require");
+
+        let error = connect_with_optional_local_timezone(&url, Duration::from_secs(2), None)
+            .await
+            .expect_err("rustls must not negotiate static RSA key exchange");
+        assert!(error.to_ascii_lowercase().contains("tls"), "{error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_tls_connects_with_static_rsa_key_exchange() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_tls12_postgres(listener, "AES128-GCM-SHA256", true));
+        let url = format!("postgres://postgres@127.0.0.1:{port}/postgres?sslmode=require&legacy_tls=true");
+
+        let result = connect_with_optional_local_timezone(&url, Duration::from_secs(2), None).await;
+        assert!(result.is_ok(), "legacy TLS should negotiate static RSA: {result:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_tls_verify_ca_uses_configured_root_without_hostname_check() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (acceptor, certificate_pem) = tls12_rsa_certificate_acceptor("AES128-GCM-SHA256");
+        let root_dir = tempfile::tempdir().unwrap();
+        let root_path = root_dir.path().join("root.pem");
+        std::fs::write(&root_path, certificate_pem).unwrap();
+        let root_path_text = root_path.to_string_lossy();
+        let encoded_root =
+            percent_encoding::utf8_percent_encode(root_path_text.as_ref(), percent_encoding::NON_ALPHANUMERIC);
+        let server = tokio::spawn(serve_tls12_postgres_with_acceptor(listener, acceptor, true));
+        let url = format!(
+            "postgres://postgres@127.0.0.1:{port}/postgres?sslmode=verify-ca&legacy_tls=true&sslrootcert={encoded_root}"
+        );
+
+        let result = connect_with_optional_local_timezone(&url, Duration::from_secs(2), None).await;
+        assert!(result.is_ok(), "verify-ca should trust the configured root without checking the host: {result:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_tls_verify_full_rejects_hostname_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (acceptor, certificate_pem) = tls12_rsa_certificate_acceptor("AES128-GCM-SHA256");
+        let root_dir = tempfile::tempdir().unwrap();
+        let root_path = root_dir.path().join("root.pem");
+        std::fs::write(&root_path, certificate_pem).unwrap();
+        let root_path_text = root_path.to_string_lossy();
+        let encoded_root =
+            percent_encoding::utf8_percent_encode(root_path_text.as_ref(), percent_encoding::NON_ALPHANUMERIC);
+        let server = tokio::spawn(serve_tls12_postgres_with_acceptor(listener, acceptor, false));
+        let url = format!(
+            "postgres://postgres@127.0.0.1:{port}/postgres?sslmode=verify-full&legacy_tls=true&sslrootcert={encoded_root}"
+        );
+
+        let error = connect_with_optional_local_timezone(&url, Duration::from_secs(2), None)
+            .await
+            .expect_err("verify-full must reject a certificate for another host");
+        assert!(error.to_ascii_lowercase().contains("certificate"), "{error}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_default_tls_still_connects_with_ecdhe_rsa() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_tls12_postgres(listener, "ECDHE-RSA-AES128-GCM-SHA256", true));
+        let url = format!("postgres://postgres@127.0.0.1:{port}/postgres?sslmode=require");
+
+        let result = connect_with_optional_local_timezone(&url, Duration::from_secs(2), None).await;
+        assert!(result.is_ok(), "default TLS should keep negotiating ECDHE-RSA: {result:?}");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn postgres_legacy_tls_cancel_uses_static_rsa_connector() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(serve_static_rsa_postgres_with_cancel(listener));
+        let url = format!("postgres://postgres@127.0.0.1:{port}/postgres?sslmode=require&legacy_tls=true");
+
+        let pool = connect_with_optional_local_timezone(&url, Duration::from_secs(2), None).await.unwrap();
+        let client = pool.get().await.unwrap();
+        let context = build_postgres_cancel_context(&url).unwrap();
+        assert!(context.legacy_tls);
+        cancel_postgres_query(client.cancel_token(), Some(&context), Duration::from_secs(2)).await;
+
         server.await.unwrap();
     }
 
@@ -7905,7 +8382,7 @@ mod tests {
         // 同时命中时间关键字与 VECTOR( 前缀的类型名，原实现时间解码失败后走 vector 分支
         assert_eq!(classify_pg_type("vector(timestamp)"), PgColType::Temporal { fallback: PgTemporalFallback::Vector });
         assert_eq!(classify_pg_type("numeric"), PgColType::Numeric);
-        assert_eq!(classify_pg_type("money"), PgColType::Numeric);
+        assert_eq!(classify_pg_type("money"), PgColType::Money);
         assert_eq!(classify_pg_type("uuid"), PgColType::Uuid);
         assert_eq!(classify_pg_type("inet"), PgColType::Inet { cidr: false });
         assert_eq!(classify_pg_type("cidr"), PgColType::Inet { cidr: true });
@@ -8681,6 +9158,7 @@ mod tests {
     #[test]
     fn postgres_table_dependencies_sql_batches_schema_foreign_keys() {
         let sql = postgres_table_dependencies_sql();
+        let compat_sql = postgres_table_dependencies_compat_sql();
 
         assert!(sql.contains("pg_catalog.pg_constraint"));
         assert!(sql.contains("con.contype = 'f'"));
@@ -8689,6 +9167,12 @@ mod tests {
         assert!(!sql.contains("information_schema"));
         assert!(sql.contains("pg_catalog.pg_inherits"));
         assert!(sql.contains("child.relispartition"));
+        // 兼容版面向 9.x：不能引用 relispartition，但 INHERITS 边要保留
+        // （旧式子表同样要先建父表）。
+        assert!(!compat_sql.contains("relispartition"));
+        assert!(compat_sql.contains("pg_catalog.pg_inherits"));
+        assert!(compat_sql.contains("con.contype = 'f'"));
+        assert!(compat_sql.contains("ORDER BY table_name, ref_table"));
     }
 
     #[test]
@@ -9038,6 +9522,21 @@ mod tests {
     }
 
     #[test]
+    fn postgres_connection_url_extracts_legacy_tls_before_driver_parse() {
+        let parsed =
+            postgres_connection_url("postgres://localhost/db?sslmode=require&legacy_tls=true&application_name=dbx")
+                .unwrap();
+
+        assert_eq!(parsed.url, "postgres://localhost/db?sslmode=require&application_name=dbx");
+        assert!(parsed.legacy_tls);
+        tokio_postgres::Config::from_str(&parsed.url).unwrap();
+
+        let parsed = postgres_connection_url("postgres://localhost/db?legacy_tls=false").unwrap();
+        assert_eq!(parsed.url, "postgres://localhost/db");
+        assert!(!parsed.legacy_tls);
+    }
+
+    #[test]
     fn postgres_connection_url_normalizes_channel_binding_require_to_prefer() {
         let parsed =
             postgres_connection_url("postgres://localhost/db?sslmode=require&channel_binding=require").unwrap();
@@ -9186,6 +9685,7 @@ mod tests {
                     accepts_invalid_certs: true,
                     verifies_hostname: false,
                     ssl_mode: SslMode::Require,
+                    legacy_tls: false,
                 })
             ),
             Duration::from_secs(5)
@@ -9370,6 +9870,14 @@ mod tests {
     }
 
     #[test]
+    fn postgres_table_objects_sql_excludes_views_before_pagination() {
+        let sql = postgres_table_objects_sql(Some(101), 100);
+
+        assert!(sql.contains("c.relkind IN ('r','f','p')"));
+        assert!(sql.contains("LIMIT 101 OFFSET 100"));
+    }
+
+    #[test]
     fn postgres_table_comment_sql_targets_single_table() {
         let sql = postgres_table_comment_sql();
 
@@ -9384,6 +9892,7 @@ mod tests {
     fn postgres_table_partition_sql_tracks_parents_bounds_and_local_objects() {
         let relation_sql = postgres_table_partition_relation_sql();
         let info_sql = postgres_table_partition_info_sql();
+        let info_compat_sql = postgres_table_partition_info_compat_sql();
         let local_objects_sql = postgres_table_partition_local_objects_sql();
 
         assert!(!relation_sql.contains("row_to_json"));
@@ -9406,12 +9915,54 @@ mod tests {
         assert!(info_sql.contains("fs.srvname"));
         assert!(info_sql.contains("ft.ftoptions"));
         assert!(info_sql.contains("c.relkind IN ('r','p','f')"));
+        // 兼容版面向 9.x：没有 relispartition/relpartbound/pg_get_partkeydef，
+        // 但保留了与主查询一致的列序和 LIMIT 形状。
+        assert!(!info_compat_sql.contains("relispartition"));
+        assert!(!info_compat_sql.contains("relpartbound"));
+        assert!(!info_compat_sql.contains("pg_get_partkeydef"));
+        assert!(!info_compat_sql.contains("pg_inherits"));
+        assert!(info_compat_sql.contains("NULL::text AS parent_schema"));
+        assert!(info_compat_sql.contains("NULL::text AS parent_table"));
+        assert!(info_compat_sql.contains("NULL::text AS partition_bound"));
+        assert!(info_compat_sql.contains("NULL::text AS partition_key"));
+        assert!(info_compat_sql.contains("fs.srvname"));
+        assert!(info_compat_sql.contains("ft.ftoptions"));
+        assert!(info_compat_sql.contains("c.relkind IN ('r','p','f')"));
+        assert!(info_compat_sql.contains("LIMIT 1"));
         assert!(local_objects_sql.contains("row_to_json(con)->>'conparentid'"));
         assert!(local_objects_sql.contains("con.contype IN ('p','f')"));
         assert!(local_objects_sql.contains("i.inhrelid = idx.oid"));
         assert!(local_objects_sql.contains("con.contype = 'c' AND con.conislocal"));
         assert!(!local_objects_sql.contains("con.coninhcount = 0"));
         assert!(local_objects_sql.contains("pg_catalog.pg_attrdef"));
+    }
+
+    #[test]
+    fn postgres_partition_tree_compat_sql_collapses_to_single_relation() {
+        let sql = postgres_partition_tree_sql();
+        let compat_sql = postgres_partition_tree_compat_sql();
+
+        // 主查询只支持 PostgreSQL 10+（声明式分区）；兼容版不能引用任何
+        // 10+ 的目录列/函数。
+        assert!(sql.contains("c.relispartition"));
+        assert!(sql.contains("pg_catalog.pg_get_expr(c.relpartbound"));
+        assert!(sql.contains("pg_catalog.pg_get_partkeydef"));
+
+        assert!(!compat_sql.contains("relispartition"));
+        assert!(!compat_sql.contains("relpartbound"));
+        assert!(!compat_sql.contains("pg_get_partkeydef"));
+        assert!(!compat_sql.contains("pg_inherits"));
+        assert!(!compat_sql.contains("WITH RECURSIVE"));
+        assert!(compat_sql.contains("NULL::bigint AS parent_oid"));
+        assert!(compat_sql.contains("NULL::text AS parent_schema"));
+        assert!(compat_sql.contains("NULL::text AS parent_relname"));
+        assert!(compat_sql.contains("NULL::text AS partition_bound"));
+        assert!(compat_sql.contains("NULL::text AS partition_key"));
+        assert!(compat_sql.contains("c.relkind::text AS relkind"));
+        assert!(compat_sql.contains("fs.srvname AS foreign_server"));
+        assert!(compat_sql.contains("ft.ftoptions AS foreign_options"));
+        assert!(compat_sql.contains("n.nspname = $1 AND c.relname = $2"));
+        assert!(compat_sql.contains("c.relkind IN ('r','p','f')"));
     }
 
     #[test]
@@ -9433,6 +9984,17 @@ mod tests {
         assert!(POSTGRES_COLUMNS_SQL.contains("LEFT JOIN information_schema.columns"));
         assert!(POSTGRES_COLUMNS_SQL.contains("pg_enum"));
         assert!(POSTGRES_COLUMNS_SQL.contains("AS enum_values"));
+    }
+
+    #[test]
+    fn postgres_single_relation_metadata_can_resolve_through_search_path() {
+        for sql in [POSTGRES_COLUMNS_SQL, POSTGRES_COLUMNS_COMPAT_SQL] {
+            assert!(sql.contains("CASE WHEN $1 = '' THEN quote_ident($2)"));
+            assert!(sql.contains("c.table_schema = relation_namespace.nspname"));
+        }
+        for sql in [POSTGRES_INDEXES_SQL, POSTGRES_INDEXES_COMPAT_SQL] {
+            assert!(sql.contains("t.oid = (CASE WHEN $1 = '' THEN quote_ident($2)"));
+        }
     }
 
     #[test]
@@ -9601,6 +10163,48 @@ mod tests {
             state_enum_values(&columns),
             Some(vec!["pending".to_string(), "active".to_string(), "archived".to_string()])
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a writable PostgreSQL database"]
+    async fn postgres_unqualified_metadata_follows_search_path() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect(&url, Duration::from_secs(5)).await.expect("connect postgres");
+        let client =
+            checkout_postgres_client(&pool, None, crate::db::connection_timeout()).await.expect("checkout client");
+        let suffix = std::process::id();
+        let schema = format!("dbx_search_path_meta_{suffix}");
+        let table = format!("comments_{suffix}");
+        let schema_ident = format!("\"{}\"", schema.replace('\"', "\"\""));
+        let table_ident = format!("\"{}\"", table.replace('\"', "\"\""));
+
+        client
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema_ident}; \
+                 CREATE TABLE {schema_ident}.{table_ident} (id integer PRIMARY KEY, display_name text); \
+                 COMMENT ON COLUMN {schema_ident}.{table_ident}.display_name IS '客户姓名'; \
+                 SET search_path TO {schema_ident}, public;"
+            ))
+            .await
+            .expect("create search_path metadata fixtures");
+
+        let columns = get_columns_with_sql(&client, POSTGRES_COLUMNS_SQL, "", &table)
+            .await
+            .expect("load columns through search_path");
+        assert_eq!(
+            columns.iter().find(|column| column.name == "display_name").and_then(|column| column.comment.as_deref()),
+            Some("客户姓名")
+        );
+
+        let indexes = list_indexes_with_sql(&client, POSTGRES_INDEXES_SQL, "", &table)
+            .await
+            .expect("load indexes through search_path");
+        assert!(indexes.iter().any(|index| index.is_primary && index.columns == ["id"]));
+
+        client
+            .batch_execute(&format!("RESET search_path; DROP SCHEMA {schema_ident} CASCADE"))
+            .await
+            .expect("clean search_path metadata fixtures");
     }
 
     #[tokio::test]
@@ -9947,10 +10551,18 @@ mod tests {
         let partition_info =
             get_table_partition_info(&pool, &schema, "child").await.expect("classify PostgreSQL 9.x inherited table");
         let ddl = crate::schema::pg_ddl(&pool, &schema, "child").await;
+        // 查看表 DDL（DISPLAY 路径）在 9.x 上不能因 relispartition 报错，
+        // INHERITS 子表也不能被当成声明式分区渲染。
+        // The view-DDL path must not fail on the missing relispartition
+        // column pre-10, and INHERITS children must render as plain tables.
+        let ddl_with_partitions = crate::schema::pg_ddl_with_partitions(&pool, &schema, "child").await;
+        let parent_ddl = crate::schema::pg_ddl_with_partitions(&pool, &schema, "parent").await;
         execute_query(&pool, &format!("DROP SCHEMA {schema_ident} CASCADE"))
             .await
             .expect("drop PostgreSQL 9.x DDL fixtures");
         let ddl = ddl.expect("generate PostgreSQL 9.x table DDL");
+        let ddl_with_partitions = ddl_with_partitions.expect("generate PostgreSQL 9.x partition-tree DDL");
+        let parent_ddl = parent_ddl.expect("generate PostgreSQL 9.x partition-tree DDL for parent");
 
         assert!(ddl.contains("CREATE TABLE"), "ddl: {ddl}");
         assert!(ddl.contains("PRIMARY KEY"), "ddl: {ddl}");
@@ -9959,6 +10571,11 @@ mod tests {
         assert!(ddl.contains("CREATE TRIGGER child_bi"), "ddl: {ddl}");
         assert_eq!(partition_info, PostgresTablePartitionInfo::default());
         assert!(!ddl.contains("PARTITION OF"), "ddl: {ddl}");
+        assert!(ddl_with_partitions.contains("CREATE TABLE"), "ddl_with_partitions: {ddl_with_partitions}");
+        assert!(!ddl_with_partitions.contains("PARTITION OF"), "ddl_with_partitions: {ddl_with_partitions}");
+        // 9.x 没有声明式分区：父表的分区树只含父表自身（子表按普通表）。
+        assert_eq!(parent_ddl.matches("CREATE TABLE").count(), 1, "parent_ddl: {parent_ddl}");
+        assert!(!parent_ddl.contains("PARTITION OF"), "parent_ddl: {parent_ddl}");
     }
 
     #[tokio::test]
@@ -10363,6 +10980,14 @@ mod tests {
         assert!(!POSTGRES_INDEXES_COMPAT_SQL.contains("WITH ORDINALITY"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("generate_series"));
         assert!(POSTGRES_INDEXES_COMPAT_SQL.contains("string_to_array(ix.indkey::text, ' ')"));
+        for sql in [
+            POSTGRES_INDEXES_SQL,
+            POSTGRES_INDEXES_COMPAT_SQL,
+            postgres_indexes_for_relations_sql(),
+            postgres_indexes_for_relations_compat_sql(),
+        ] {
+            assert!(sql.contains("ix.indisunique AND ix.indisvalid"));
+        }
     }
 
     #[test]

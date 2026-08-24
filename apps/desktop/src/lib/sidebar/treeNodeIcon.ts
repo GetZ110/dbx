@@ -71,7 +71,7 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
     case "group-events":
       return { icon: Clock, colorClass: "text-orange-400" };
     case "event":
-      return { icon: Clock, colorClass: "text-orange-300" };
+      return { icon: Clock, colorClass: "text-orange-400" };
     case "group-constraints":
     case "constraint":
       return { icon: Key, colorClass: "text-amber-500" };
@@ -102,6 +102,8 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
       return { icon: TableProperties, colorClass: "text-cyan-400" };
     case "elasticsearch-index":
       return { icon: Table, colorClass: "text-emerald-400" };
+    case "meilisearch-system":
+      return { icon: Gauge, colorClass: "text-emerald-500" };
     case "procedure":
       return { icon: ScrollText, colorClass: "text-blue-500" };
     case "function":

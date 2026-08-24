@@ -344,7 +344,7 @@ describe("connectionStore timeout recovery", () => {
     const { useConnectionStore } = await import("@/stores/connectionStore");
     const store = useConnectionStore();
     await store.initFromDisk();
-    await store.exportConnectionsToFile("test-passphrase");
+    await store.exportConnectionsToFile({ mode: "encrypted", passphrase: "test-passphrase" });
 
     const exported = JSON.parse(encryptConfig.mock.calls[0]?.[0] as string);
     expect(exported.connections[0]).toMatchObject({
@@ -354,6 +354,32 @@ describe("connectionStore timeout recovery", () => {
       query_timeout_inherit: true,
     });
     expect(click).toHaveBeenCalledOnce();
+  });
+
+  it("reports cancellation when the native export save dialog is dismissed", async () => {
+    const save = vi.fn().mockResolvedValue(null);
+    const writeTextFile = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => true }));
+    vi.doMock("@tauri-apps/plugin-dialog", () => ({ save }));
+    vi.doMock("@tauri-apps/plugin-fs", () => ({ writeTextFile }));
+    vi.doMock("@/lib/backend/api", () => ({
+      deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
+      loadEditorSettings: vi.fn().mockResolvedValue(null),
+      loadConnections: vi.fn().mockResolvedValue([postgresConnection()]),
+      loadPinnedTreeNodeIds: vi.fn().mockResolvedValue([]),
+      loadSidebarLayout: vi.fn().mockResolvedValue(null),
+      loadTunnelProfiles: vi.fn().mockResolvedValue([]),
+      saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveEditorSettings: vi.fn().mockResolvedValue(undefined),
+      saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    await store.initFromDisk();
+
+    await expect(store.exportConnectionsToFile({ mode: "plaintext" })).resolves.toBe("cancelled");
+    expect(writeTextFile).not.toHaveBeenCalled();
   });
 
   it("clears connection node loading when health check timeout forces reconnect failure", async () => {
@@ -648,7 +674,9 @@ describe("connectionStore timeout recovery", () => {
       connectDb,
       deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
       disconnectDb,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
       saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
       saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
     }));
 
@@ -710,7 +738,9 @@ describe("connectionStore timeout recovery", () => {
       deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
       disconnectDb,
       listInstalledAgents: vi.fn().mockResolvedValue([]),
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
       saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
       saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
     }));
 
@@ -750,7 +780,9 @@ describe("connectionStore timeout recovery", () => {
       connectDb,
       deleteSchemaCachePrefix: vi.fn().mockResolvedValue(undefined),
       disconnectDb,
+      loadSchemaCache: vi.fn().mockResolvedValue(null),
       saveConnections: vi.fn().mockResolvedValue(undefined),
+      saveSchemaCache: vi.fn().mockResolvedValue(undefined),
       saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
     }));
 

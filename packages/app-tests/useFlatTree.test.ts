@@ -1,7 +1,10 @@
 import { strict as assert } from "node:assert";
+import { readFileSync } from "node:fs";
 import { test } from "vitest";
 import { SIDEBAR_TREE_ROW_HEIGHT, SIDEBAR_TREE_PRERENDER_COUNT, SIDEBAR_TREE_SCROLL_BUFFER, flattenTree, shouldVirtualizeFlatTree } from "../../apps/desktop/src/composables/useFlatTree.ts";
 import type { TreeNode } from "../../apps/desktop/src/types/database.ts";
+
+const connectionTreeSource = readFileSync(new URL("../../apps/desktop/src/components/sidebar/ConnectionTree.vue", import.meta.url), "utf8");
 
 test("flattenTree preserves depth and node type for virtualized sidebar rows", () => {
   const nodes: TreeNode[] = [
@@ -51,10 +54,13 @@ test("connection groups use per-node pool types to avoid recycled row state", ()
   assert.equal(flat[2].poolType, "connection");
 });
 
-test("shouldVirtualizeFlatTree virtualizes every non-empty sidebar tree", () => {
+test("shouldVirtualizeFlatTree keeps small/medium trees on the plain renderer", () => {
   assert.equal(shouldVirtualizeFlatTree(0), false);
-  assert.equal(shouldVirtualizeFlatTree(1), true);
-  assert.equal(shouldVirtualizeFlatTree(100), true);
+  assert.equal(shouldVirtualizeFlatTree(1), false);
+  assert.equal(shouldVirtualizeFlatTree(100), false);
+  assert.equal(shouldVirtualizeFlatTree(499), false);
+  assert.equal(shouldVirtualizeFlatTree(500), true);
+  assert.equal(shouldVirtualizeFlatTree(5000), true);
 });
 
 test("sidebar virtual tree keeps enough buffered rows for fast scrolling", () => {
@@ -65,4 +71,10 @@ test("sidebar virtual tree keeps enough buffered rows for fast scrolling", () =>
 
 test("sidebar virtual tree prerenders enough rows for the first frame", () => {
   assert.ok(SIDEBAR_TREE_PRERENDER_COUNT >= 40);
+});
+
+test("sidebar virtual tree recycles rows by render identity", () => {
+  assert.match(connectionTreeSource, /key-field="renderKey"/);
+  assert.match(connectionTreeSource, /type-field="poolType"/);
+  assert.match(connectionTreeSource, /\bflow-mode\b/);
 });

@@ -344,17 +344,22 @@ export function activeResultRun(tab: Pick<QueryTab, "resultRuns" | "activeResult
   return tab.resultRuns?.find((run) => run.id === tab.activeResultRunId);
 }
 
-export function resultRunItems(tab: Pick<QueryTab, "resultRuns" | "activeResultRunId">): { id: string; title: string; sequence: number; active: boolean }[] {
+export function resultRunItems(tab: Pick<QueryTab, "resultRuns" | "activeResultRunId">): { id: string; title: string; sequence: number; active: boolean; pinned: boolean }[] {
   return (tab.resultRuns ?? []).map((run) => ({
     id: run.id,
     title: run.title,
     sequence: run.sequence,
     active: run.id === tab.activeResultRunId,
+    pinned: run.pinned === true,
   }));
 }
 
 export function resultGridCacheKey(tab: Pick<QueryTab, "id" | "activeResultRunId" | "activeResultIndex">): string {
   return `${tab.id}-${tab.activeResultRunId ?? "current"}-${tab.activeResultIndex ?? 0}`;
+}
+
+export function resultGridColumnWidthCacheKey(tab: Pick<QueryTab, "id"> & Partial<Pick<QueryTab, "activeResultIndex">>): string {
+  return `result-column-width-${tab.id}-${tab.activeResultIndex ?? 0}`;
 }
 
 export function resultGridInstanceKey(tab: Pick<QueryTab, "id" | "activeResultRunId" | "activeResultIndex" | "resultGridRevision">): string {
