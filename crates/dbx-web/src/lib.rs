@@ -357,6 +357,10 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/connection/check-health", post(routes::connection::check_connection_health))
         .route("/connection/session-credential-status", post(routes::connection::session_credential_status))
         .route("/connection/forget-session-credential", post(routes::connection::forget_session_credential))
+        .route(
+            "/connection/replace-nacos-session-credential",
+            post(routes::connection::replace_nacos_session_credential),
+        )
         .route("/connection/identifier-quote", post(routes::connection::connection_identifier_quote))
         .route("/connection/close-database", post(routes::connection::close_database_connection))
         .route("/connection/save", post(routes::connection::save_connections))
@@ -435,6 +439,9 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
         .route("/schema/completion-assistant", post(routes::schema::completion_assistant_search))
         .route("/schema/object-source", get(routes::schema::get_object_source))
+        .route("/schema/event-info", get(routes::schema::get_event_info))
+        .route("/schema/reference-key-columns", get(routes::schema::list_reference_key_columns))
+        .route("/schema/table-owner", get(routes::schema::get_table_owner))
         .route("/schema/custom-type-details", get(routes::schema::get_custom_type_details))
         .route("/schema/columns", get(routes::schema::list_columns))
         .route("/schema/all-columns", get(routes::schema::get_all_columns))
@@ -462,6 +469,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/dialect/data-types", get(routes::dialect::list_data_types))
         .route("/schema-diff/prepare", post(routes::schema_diff::prepare_schema_diff))
         .route("/schema-diff/generate-sync-sql", post(routes::schema_diff::generate_schema_sync_sql))
+        .route("/schema-diff/generate-sync-plan", post(routes::schema_diff::generate_schema_sync_plan))
         .route(
             "/schema/cache",
             post(routes::schema_cache::save_schema_cache).get(routes::schema_cache::load_schema_cache),
@@ -478,6 +486,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/tab-runtime-cache/owner", delete(routes::tab_runtime_cache::delete_tab_runtime_cache_owner))
         // Query
         .route("/query/execute", post(routes::query::execute_query))
+        .route("/query/execute-conditional-update", post(routes::query::execute_conditional_update))
         .route("/query/execute-multi", post(routes::query::execute_multi))
         .route("/query/execute-batch", post(routes::query::execute_batch))
         .route("/query/execute-script", post(routes::query::execute_script))
@@ -495,6 +504,8 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/query/build-database-search-sql", post(routes::query::build_database_search_sql))
         .route("/query/build-search-result-where", post(routes::query::build_search_result_where))
         .route("/query/build-rename-object-sql", post(routes::query::build_rename_object_sql))
+        .route("/query/build-rename-database-sql", post(routes::query::build_rename_database_sql))
+        .route("/query/build-rename-database-preflight-sql", post(routes::query::build_rename_database_preflight_sql))
         .route("/query/build-create-database-sql", post(routes::query::build_create_database_sql))
         .route("/query/build-sqlite-attach-database-sql", post(routes::query::build_sqlite_attach_database_sql))
         .route("/query/build-drop-object-sql", post(routes::query::build_drop_object_sql))
@@ -522,6 +533,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         )
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
+        .route("/query/build-table-owner-change-sql", post(routes::query::build_table_owner_change_sql))
         .route(
             "/query/preview-sqlite-table-structure-change",
             post(routes::query::preview_sqlite_table_structure_change),
@@ -562,6 +574,10 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
             post(routes::query::build_data_grid_column_distinct_values_sql),
         )
         .route("/query/build-data-grid-count-sql", post(routes::query::build_data_grid_count_sql))
+        .route(
+            "/query/build-data-grid-conditional-update-sql",
+            post(routes::query::build_data_grid_conditional_update_sql),
+        )
         .route("/query/build-hive-table-properties-sql", post(routes::query::build_hive_table_properties_sql))
         .route("/query/build-export-insert-statements", post(routes::query::build_export_insert_statements))
         .route("/query/build-export-sql-insert", post(routes::query::build_export_sql_insert))
@@ -571,6 +587,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/data-compare/prepare-missing-target", post(routes::data_compare::prepare_data_compare_missing_target))
         .route("/data-compare/build-sync-plan", post(routes::data_compare::build_data_compare_sync_plan))
         .route("/query/cancel", post(routes::query::cancel_query))
+        .route("/query/cancel-conditional-update", post(routes::query::cancel_conditional_update))
         .route("/query/close-session", post(routes::query::close_query_session))
         .route("/query/close-client-session", post(routes::query::close_client_connection_session))
         .route("/export/query-result-json", post(routes::text_export::export_query_result_json))
@@ -592,6 +609,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/redis/rename-key", post(routes::redis::rename_key))
         .route("/redis/hash-set", post(routes::redis::hash_set))
         .route("/redis/hash-del", post(routes::redis::hash_del))
+        .route("/redis/hash-field-update", post(routes::redis::hash_field_update))
         .route("/redis/hash-field-set-ttl", post(routes::redis::hash_field_set_ttl))
         .route("/redis/hash-field-set-expire-at", post(routes::redis::hash_field_set_expire_at))
         .route("/redis/list-push", post(routes::redis::list_push))
@@ -754,6 +772,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/nacos/sidebar/snapshot", post(routes::nacos::sidebar_snapshot))
         .route("/nacos/namespaces/create", post(routes::nacos::create_namespace))
         .route("/nacos/namespaces/update", post(routes::nacos::update_namespace))
+        .route("/nacos/namespaces/delete", post(routes::nacos::delete_namespace))
         .route("/nacos/configs/list", post(routes::nacos::list_configs))
         .route("/nacos/configs/get", post(routes::nacos::get_config))
         .route("/nacos/configs/publish", post(routes::nacos::publish_config))
@@ -796,9 +815,11 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         // MongoDB
         .route("/mongo/list-databases", post(routes::mongo::list_databases))
         .route("/mongo/list-collections", post(routes::mongo::list_collections))
+        .route("/vector/collection-detail", post(routes::vector::collection_detail))
         .route("/mongo/vector-collection-detail", post(routes::vector::collection_detail))
         .route("/vector/drop-database", post(routes::vector::drop_database))
         .route("/vector/drop-collection", post(routes::vector::drop_collection))
+        .route("/vector/rename-collection", post(routes::vector::rename_collection))
         .route("/mongo/create-database", post(routes::mongo::create_database))
         .route("/mongo/drop-database", post(routes::mongo::drop_database))
         .route("/mongo/drop-collection", post(routes::mongo::drop_collection))
@@ -832,6 +853,19 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/document-store/meilisearch/stats", post(routes::document_store::meilisearch_get_stats))
         .route("/document-store/meilisearch/overview", post(routes::document_store::meilisearch_get_overview))
         .route("/document-store/meilisearch/index/delete", post(routes::document_store::meilisearch_delete_index))
+        .route(
+            "/document-store/meilisearch/system/overview",
+            post(routes::document_store::meilisearch_get_system_overview),
+        )
+        .route("/document-store/meilisearch/keys/list", post(routes::document_store::meilisearch_list_keys))
+        .route("/document-store/meilisearch/keys/get", post(routes::document_store::meilisearch_get_key))
+        .route("/document-store/meilisearch/keys/create", post(routes::document_store::meilisearch_create_key))
+        .route("/document-store/meilisearch/keys/update", post(routes::document_store::meilisearch_update_key))
+        .route("/document-store/meilisearch/keys/delete", post(routes::document_store::meilisearch_delete_key))
+        .route("/document-store/meilisearch/tasks/list", post(routes::document_store::meilisearch_get_tasks))
+        .route("/document-store/meilisearch/tasks/get", post(routes::document_store::meilisearch_get_task))
+        .route("/document-store/meilisearch/tasks/cancel", post(routes::document_store::meilisearch_cancel_tasks))
+        .route("/document-store/meilisearch/tasks/delete", post(routes::document_store::meilisearch_delete_tasks))
         .route(
             "/document-store/meilisearch/documents/delete-all",
             post(routes::document_store::meilisearch_delete_all_documents),
