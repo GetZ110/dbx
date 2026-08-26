@@ -149,8 +149,12 @@ pub enum DataGridContextFilterMode {
     NotEquals,
     IsNull,
     IsNotNull,
+    IsBlank,
+    IsNotBlank,
     Like,
     NotLike,
+    BeginsWith,
+    EndsWith,
     LessThan,
     LessThanOrEqual,
     GreaterThan,
@@ -546,6 +550,18 @@ pub fn build_data_grid_context_filter_condition(options: DataGridContextFilterCo
     match options.mode {
         DataGridContextFilterMode::IsNull => Some(format!("{column} IS NULL")),
         DataGridContextFilterMode::IsNotNull => Some(format!("{column} IS NOT NULL")),
+        DataGridContextFilterMode::IsBlank
+            if matches!(options.database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle)) =>
+        {
+            Some(format!("{column} IS NULL"))
+        }
+        DataGridContextFilterMode::IsNotBlank
+            if matches!(options.database_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle)) =>
+        {
+            Some(format!("{column} IS NOT NULL"))
+        }
+        DataGridContextFilterMode::IsBlank => Some(format!("({column} IS NULL OR {column} = '')")),
+        DataGridContextFilterMode::IsNotBlank => Some(format!("({column} IS NOT NULL AND {column} <> '')")),
         DataGridContextFilterMode::Equals if value.is_null() => Some(format!("{column} IS NULL")),
         DataGridContextFilterMode::NotEquals if value.is_null() => Some(format!("{column} IS NOT NULL")),
         DataGridContextFilterMode::Like => Some(format!(
@@ -560,6 +576,22 @@ pub fn build_data_grid_context_filter_condition(options: DataGridContextFilterCo
             "{like_column} NOT LIKE {}",
             format_grid_sql_literal(
                 &Value::String(format!("%{}%", value_to_filter_text(value))),
+                options.database_type,
+                None
+            )
+        )),
+        DataGridContextFilterMode::BeginsWith => Some(format!(
+            "{like_column} LIKE {}",
+            format_grid_sql_literal(
+                &Value::String(format!("{}%", value_to_filter_text(value))),
+                options.database_type,
+                None
+            )
+        )),
+        DataGridContextFilterMode::EndsWith => Some(format!(
+            "{like_column} LIKE {}",
+            format_grid_sql_literal(
+                &Value::String(format!("%{}", value_to_filter_text(value))),
                 options.database_type,
                 None
             )
@@ -4140,6 +4172,48 @@ mod tests {
             Some("\"created_at\"::text NOT LIKE '%2026%'")
         );
         assert_eq!(
+            build_data_grid_context_filter_condition(DataGridContextFilterConditionOptions {
+                database_type: Some(DatabaseType::Mysql),
+                identifier_quote: None,
+                column_name: "file_name".to_string(),
+                mode: DataGridContextFilterMode::BeginsWith,
+                value: json!("FN"),
+                values: Vec::new(),
+                end_value: None,
+                column_info: Some(column("file_name", "varchar", false, None)),
+            })
+            .as_deref(),
+            Some("`file_name` LIKE 'FN%'")
+        );
+        assert_eq!(
+            build_data_grid_context_filter_condition(DataGridContextFilterConditionOptions {
+                database_type: Some(DatabaseType::Mysql),
+                identifier_quote: None,
+                column_name: "file_name".to_string(),
+                mode: DataGridContextFilterMode::EndsWith,
+                value: json!(".sql"),
+                values: Vec::new(),
+                end_value: None,
+                column_info: Some(column("file_name", "varchar", false, None)),
+            })
+            .as_deref(),
+            Some("`file_name` LIKE '%.sql'")
+        );
+        assert_eq!(
+            build_data_grid_context_filter_condition(DataGridContextFilterConditionOptions {
+                database_type: Some(DatabaseType::Postgres),
+                identifier_quote: None,
+                column_name: "update_date".to_string(),
+                mode: DataGridContextFilterMode::BeginsWith,
+                value: json!("128"),
+                values: Vec::new(),
+                end_value: None,
+                column_info: Some(column("update_date", "bigint", false, None)),
+            })
+            .as_deref(),
+            Some("\"update_date\"::text LIKE '128%'")
+        );
+        assert_eq!(
             build_data_grid_column_value_filter_condition(DataGridColumnValueFilterConditionOptions {
                 database_type: Some(DatabaseType::SqlServer),
                 identifier_quote: None,
@@ -4150,6 +4224,73 @@ mod tests {
             .as_deref(),
             Some("[active] = 0")
         );
+    }
+
+    #[test]
+    fn builds_blank_and_nonblank_context_filter_conditions() {
+        let build = |database_type: DatabaseType,
+                     mode: DataGridContextFilterMode,
+                     identifier_quote: Option<&str>,
+                     column_name: &str| {
+            build_data_grid_context_filter_condition(DataGridContextFilterConditionOptions {
+                database_type: Some(database_type),
+                identifier_quote: identifier_quote.map(str::to_string),
+                column_name: column_name.to_string(),
+                mode,
+                value: Value::Null,
+                values: Vec::new(),
+                end_value: None,
+                column_info: Some(column(column_name, "varchar", true, None)),
+            })
+        };
+
+        assert_eq!(
+            build(DatabaseType::Mysql, DataGridContextFilterMode::IsBlank, None, "status"),
+            Some("(`status` IS NULL OR `status` = '')".to_string())
+        );
+        assert_eq!(
+            build(DatabaseType::Mysql, DataGridContextFilterMode::IsNotBlank, None, "status"),
+            Some("(`status` IS NOT NULL AND `status` <> '')".to_string())
+        );
+        assert_eq!(
+            build(DatabaseType::Mysql, DataGridContextFilterMode::IsNull, None, "status"),
+            Some("`status` IS NULL".to_string())
+        );
+        assert_eq!(
+            build(DatabaseType::Mysql, DataGridContextFilterMode::IsNotNull, None, "status"),
+            Some("`status` IS NOT NULL".to_string())
+        );
+        assert_eq!(
+            build(DatabaseType::Kingbase, DataGridContextFilterMode::IsBlank, Some("`"), "order detail"),
+            Some("(`order detail` IS NULL OR `order detail` = '')".to_string())
+        );
+
+        for database_type in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+            assert_eq!(
+                build(database_type, DataGridContextFilterMode::IsBlank, None, "STATUS"),
+                Some("\"STATUS\" IS NULL".to_string())
+            );
+            assert_eq!(
+                build(database_type, DataGridContextFilterMode::IsNotBlank, None, "STATUS"),
+                Some("\"STATUS\" IS NOT NULL".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_context_filter_mode_serialization_stable() {
+        assert_eq!(serde_json::to_string(&DataGridContextFilterMode::IsNull).unwrap(), "\"is-null\"");
+        assert_eq!(serde_json::to_string(&DataGridContextFilterMode::IsNotNull).unwrap(), "\"is-not-null\"");
+        assert!(matches!(
+            serde_json::from_str::<DataGridContextFilterMode>("\"is-null\"").unwrap(),
+            DataGridContextFilterMode::IsNull
+        ));
+        assert!(matches!(
+            serde_json::from_str::<DataGridContextFilterMode>("\"is-not-null\"").unwrap(),
+            DataGridContextFilterMode::IsNotNull
+        ));
+        assert_eq!(serde_json::to_string(&DataGridContextFilterMode::IsBlank).unwrap(), "\"is-blank\"");
+        assert_eq!(serde_json::to_string(&DataGridContextFilterMode::IsNotBlank).unwrap(), "\"is-not-blank\"");
     }
 
     #[test]
@@ -4405,6 +4546,8 @@ mod tests {
             DataGridContextFilterMode::Like,
             DataGridContextFilterMode::GreaterThan,
             DataGridContextFilterMode::IsNull,
+            DataGridContextFilterMode::IsBlank,
+            DataGridContextFilterMode::IsNotBlank,
             DataGridContextFilterMode::In,
             DataGridContextFilterMode::Between,
         ] {

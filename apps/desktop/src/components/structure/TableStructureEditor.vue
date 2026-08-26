@@ -32,6 +32,8 @@ import { invalidateObjectDdl, loadObjectDdl } from "@/lib/metadata/objectDdlCach
 import { invalidateObjectMetadataCache, loadObjectMetadataFacet, type ObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
 import { invalidateTableMetadataCache } from "@/lib/metadata/tableMetadataCache";
 import { type BuildTableStructureChangeSqlOptions, type EditableStructureColumn, type EditableStructureForeignKey, type EditableStructureIndex, type EditableStructureTrigger } from "@/lib/table/tableStructureEditorSql";
+import { buildMysqlAutoIncrementCounterStatement, canEditMysqlAutoIncrementCounter, refreshMysqlAutoIncrementCounterDraft } from "@/lib/table/mysqlAutoIncrementCounter";
+import { MYSQL_STORAGE_ENGINES_SQL, mysqlTableEngineSql, mysqlTableEngineSqlOption, parseMysqlTableEngineMetadata, refreshMysqlTableEngineDraft, supportsMysqlTableEngine } from "@/lib/table/mysqlTableEngine";
 import { PRESET_FIELDS_TEMPLATE_ID, createTableColumnTemplateDrafts } from "@/lib/table/tableColumnTemplates";
 import { getMysqlDataTypeHelp } from "@/lib/table/mysqlDataTypeHelp";
 import { getPostgresDataTypeHelp, gaussdbMTypeDisplayName } from "@/lib/table/postgresDataTypeHelp";
@@ -912,6 +914,15 @@ const canAddColumn = computed(() => canAddTableStructureColumn(databaseType.valu
 const newTableName = ref("");
 const tableComment = ref("");
 const originalTableComment = ref("");
+const mysqlAutoIncrementValue = ref<string>();
+const originalMysqlAutoIncrementValue = ref<string>();
+const mysqlAutoIncrementLoading = ref(false);
+const mysqlAutoIncrementLoadError = ref("");
+const mysqlTableEngine = ref("");
+const originalMysqlTableEngine = ref("");
+const mysqlTableEngineOptions = ref<string[]>([]);
+const mysqlTableEngineLoading = ref(false);
+const mysqlTableEngineLoadError = ref("");
 const tableOwner = ref("");
 const originalTableOwner = ref("");
 const tableOwnerLoading = ref(false);
@@ -920,6 +931,9 @@ const tableOwnerRoles = ref<string[]>([]);
 const tableOwnerRolesLoading = ref(false);
 const tableOwnerRolesLoadError = ref("");
 const supportsTableOwner = computed(() => !isCreateMode.value && databaseType.value === "postgres");
+const canEditMysqlAutoIncrement = computed(() => canEditMysqlAutoIncrementCounter(connection.value, isCreateMode.value, columns.value));
+const canBuildMysqlAutoIncrement = computed(() => canEditMysqlAutoIncrement.value && !mysqlAutoIncrementLoading.value && !mysqlAutoIncrementLoadError.value && originalMysqlAutoIncrementValue.value !== undefined);
+const supportsMysqlEngine = computed(() => supportsMysqlTableEngine(connection.value));
 const tableOwnerOptions = computed(() => {
   const owner = tableOwner.value;
   if (!owner || tableOwnerRoles.value.includes(owner)) return tableOwnerRoles.value;
@@ -942,6 +956,8 @@ let sqlPreviewRequestId = 0;
 let structureLoadRequestId = 0;
 let tableOwnerLoadRequestId = 0;
 let tableOwnerRolesLoadRequestId = 0;
+let mysqlAutoIncrementLoadRequestId = 0;
+let mysqlTableEngineLoadRequestId = 0;
 let dataTypeOptionsRequestId = 0;
 let sqlPreviewDebounceTimer: ReturnType<typeof setTimeout> | undefined;
 let deferredSqlPreviewRefresh = false;
@@ -1127,6 +1143,10 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     newTableName: newTableName.value,
     tableComment: tableComment.value,
     originalTableComment: originalTableComment.value,
+    mysqlAutoIncrementValue: mysqlAutoIncrementValue.value,
+    originalMysqlAutoIncrementValue: originalMysqlAutoIncrementValue.value,
+    mysqlTableEngine: mysqlTableEngine.value,
+    originalMysqlTableEngine: originalMysqlTableEngine.value,
     tableOwner: tableOwner.value,
     originalTableOwner: originalTableOwner.value,
     columns: cloneDraftValue(columns.value),
@@ -1157,6 +1177,10 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   newTableName.value = draft.newTableName || "";
   tableComment.value = draft.tableComment || "";
   originalTableComment.value = draft.originalTableComment || "";
+  mysqlAutoIncrementValue.value = draft.mysqlAutoIncrementValue;
+  originalMysqlAutoIncrementValue.value = draft.originalMysqlAutoIncrementValue;
+  mysqlTableEngine.value = draft.mysqlTableEngine || "";
+  originalMysqlTableEngine.value = draft.originalMysqlTableEngine || "";
   tableOwner.value = draft.tableOwner || "";
   originalTableOwner.value = draft.originalTableOwner || "";
   columns.value = cloneDraftValue(draft.columns || []);
@@ -1240,10 +1264,19 @@ function markDraftHydratedAndSync() {
 
 function hasPendingStructureChanges(): boolean {
   if (isCreateMode.value) {
-    return !!newTableName.value.trim() || !!tableComment.value.trim() || columns.value.length > 0 || indexes.value.length > 0 || foreignKeys.value.length > 0 || triggers.value.length > 0;
+    return !!newTableName.value.trim() || !!tableComment.value.trim() || mysqlTableEngine.value !== originalMysqlTableEngine.value || columns.value.length > 0 || indexes.value.length > 0 || foreignKeys.value.length > 0 || triggers.value.length > 0;
   }
   const scope = captureStructureRefreshScope();
-  return scope.columns || scope.indexes || scope.foreignKeys || scope.triggers || scope.tableComment || (supportsTableOwner.value && tableOwner.value.trim() !== originalTableOwner.value.trim());
+  return (
+    scope.columns ||
+    scope.indexes ||
+    scope.foreignKeys ||
+    scope.triggers ||
+    scope.tableComment ||
+    mysqlTableEngine.value.toLowerCase() !== originalMysqlTableEngine.value.toLowerCase() ||
+    (canBuildMysqlAutoIncrement.value && mysqlAutoIncrementValue.value !== originalMysqlAutoIncrementValue.value) ||
+    (supportsTableOwner.value && tableOwner.value.trim() !== originalTableOwner.value.trim())
+  );
 }
 
 function clearSqlPreviewState() {
@@ -1385,6 +1418,7 @@ function structureChangeOptions(): BuildTableStructureChangeSqlOptions {
     triggers: triggers.value,
     tableComment: tableComment.value,
     originalTableComment: isCreateMode.value ? undefined : originalTableComment.value,
+    mysqlEngine: mysqlTableEngineSqlOption({ value: mysqlTableEngine.value, originalValue: originalMysqlTableEngine.value }, isCreateMode.value, supportsMysqlEngine.value && !mysqlTableEngineLoading.value && !mysqlTableEngineLoadError.value),
     partitioned: isPartitionedParent.value,
     isGaussdbMMode: connection.value?.driver_profile?.toLowerCase() === "gaussdb-m",
   };
@@ -1426,18 +1460,30 @@ async function refreshSqlPreview() {
   sqlPreviewLoading.value = true;
   const options = structureChangeOptions();
   try {
-    const result = isCreateMode.value ? await api.buildCreateTableSql(options) : hasSqliteTypeChange.value ? await api.previewSqliteTableStructureChange(props.connectionId, props.database, options) : await api.buildTableStructureChangeSql(options);
-    const ownerResult = supportsTableOwner.value
-      ? await api.buildTableOwnerChangeSql({
-          databaseType: databaseType.value,
-          schema: metadataSchema.value,
-          tableName: props.tableName || "",
-          owner: tableOwner.value,
-          originalOwner: originalTableOwner.value,
-        })
-      : { statements: [], warnings: [] };
+    const [result, ownerResult, mysqlAutoIncrementStatement] = await Promise.all([
+      isCreateMode.value ? api.buildCreateTableSql(options) : hasSqliteTypeChange.value ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options) : api.buildTableStructureChangeSql(options),
+      supportsTableOwner.value
+        ? api.buildTableOwnerChangeSql({
+            databaseType: databaseType.value,
+            schema: metadataSchema.value,
+            tableName: props.tableName || "",
+            owner: tableOwner.value,
+            originalOwner: originalTableOwner.value,
+          })
+        : Promise.resolve({ statements: [], warnings: [] }),
+      buildMysqlAutoIncrementCounterStatement({
+        enabled: canBuildMysqlAutoIncrement.value,
+        originalValue: originalMysqlAutoIncrementValue.value,
+        value: mysqlAutoIncrementValue.value,
+        databaseType: databaseType.value,
+        driverProfile: connection.value?.driver_profile,
+        schema: props.schema || props.database,
+        tableName: props.tableName || "",
+        buildSql: api.buildMysqlAutoIncrementSql,
+      }),
+    ]);
     if (requestId !== sqlPreviewRequestId) return;
-    pendingStatements.value = [...result.statements, ...ownerResult.statements];
+    pendingStatements.value = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : [])];
     warnings.value = [...result.warnings, ...ownerResult.warnings];
     sqliteSchemaRevision.value = "schemaRevision" in result && typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;
   } catch (e: any) {
@@ -1459,6 +1505,7 @@ const canApply = computed(
     !saving.value &&
     !postSaveRefreshing.value &&
     !secondaryMetadataLoading.value &&
+    !mysqlTableEngineLoading.value &&
     !sqlPreviewLoading.value &&
     !sqlPreviewPending.value &&
     pendingStatements.value.length > 0 &&
@@ -1505,6 +1552,17 @@ function resetState() {
   newTableName.value = "";
   tableComment.value = "";
   originalTableComment.value = "";
+  mysqlAutoIncrementValue.value = undefined;
+  originalMysqlAutoIncrementValue.value = undefined;
+  mysqlAutoIncrementLoadRequestId += 1;
+  mysqlAutoIncrementLoading.value = false;
+  mysqlAutoIncrementLoadError.value = "";
+  mysqlTableEngine.value = "";
+  originalMysqlTableEngine.value = "";
+  mysqlTableEngineOptions.value = [];
+  mysqlTableEngineLoadRequestId += 1;
+  mysqlTableEngineLoading.value = false;
+  mysqlTableEngineLoadError.value = "";
   tableOwner.value = "";
   originalTableOwner.value = "";
   tableOwnerLoadRequestId += 1;
@@ -1541,9 +1599,9 @@ async function reloadStructureFromDatabase() {
   loadedMetadataFacets.clear();
   if (refreshDdl) {
     ddlFetched.value = false;
-    await Promise.all([fetchDdl(true), loadTableOwner(true), loadTableOwnerRoles()]);
+    await Promise.all([fetchDdl(true), loadTableOwner(true), loadTableOwnerRoles(), loadMysqlTableEngine(true)]);
   } else {
-    await Promise.all([loadStructure(false, visibleTableStructureRefreshScope(activeTab.value), true, { blockSecondaryMetadata: true, forceDdl: true, forceMetadata: true }), loadTableOwner(true), loadTableOwnerRoles()]);
+    await Promise.all([loadStructure(false, visibleTableStructureRefreshScope(activeTab.value), true, { blockSecondaryMetadata: true, forceDdl: true, forceMetadata: true }), loadTableOwner(true), loadTableOwnerRoles(), loadMysqlTableEngine(true)]);
   }
 }
 
@@ -1576,6 +1634,69 @@ async function fetchTableCommentValue(connectionId: string, database: string, sc
 
 function loadCachedTableComment(request: ReturnType<typeof ddlRequest>, force = false): Promise<{ value: string | undefined; cacheStatus: "memory" | "disk" | "remote" }> {
   return loadObjectMetadataFacet(request, "comment", () => fetchTableCommentValue(request.connectionId, request.database, request.schema, request.tableName, request.catalog), { force });
+}
+
+async function loadMysqlAutoIncrementCounter(preserveDraft = false) {
+  const requestId = ++mysqlAutoIncrementLoadRequestId;
+  if (!canEditMysqlAutoIncrement.value || !props.connectionId || !props.database || !props.tableName) {
+    mysqlAutoIncrementValue.value = undefined;
+    originalMysqlAutoIncrementValue.value = undefined;
+    mysqlAutoIncrementLoading.value = false;
+    mysqlAutoIncrementLoadError.value = "";
+    return;
+  }
+  mysqlAutoIncrementLoading.value = true;
+  mysqlAutoIncrementLoadError.value = "";
+  try {
+    await store.ensureConnected(props.connectionId);
+    const value = await api.getMysqlTableAutoIncrement(props.connectionId, props.database, props.tableName);
+    if (requestId !== mysqlAutoIncrementLoadRequestId) return;
+    const draft = refreshMysqlAutoIncrementCounterDraft(value, { value: mysqlAutoIncrementValue.value, originalValue: originalMysqlAutoIncrementValue.value }, preserveDraft);
+    originalMysqlAutoIncrementValue.value = draft.originalValue;
+    mysqlAutoIncrementValue.value = draft.value;
+  } catch (error: any) {
+    if (requestId !== mysqlAutoIncrementLoadRequestId) return;
+    mysqlAutoIncrementLoadError.value = error?.message || String(error);
+  } finally {
+    if (requestId === mysqlAutoIncrementLoadRequestId) mysqlAutoIncrementLoading.value = false;
+  }
+}
+
+async function loadMysqlTableEngine(preserveDraft = false) {
+  const requestId = ++mysqlTableEngineLoadRequestId;
+  const connectionId = props.connectionId;
+  const database = props.database;
+  if (!supportsMysqlEngine.value || !connectionId || !database) {
+    mysqlTableEngine.value = "";
+    originalMysqlTableEngine.value = "";
+    mysqlTableEngineOptions.value = [];
+    mysqlTableEngineLoading.value = false;
+    mysqlTableEngineLoadError.value = "";
+    return;
+  }
+
+  mysqlTableEngineLoading.value = true;
+  mysqlTableEngineLoadError.value = "";
+  try {
+    await store.ensureConnected(connectionId);
+    const [enginesResult, tableResult] = await Promise.all([
+      api.executeQuery(connectionId, database, MYSQL_STORAGE_ENGINES_SQL, undefined, undefined, { maxRows: 100 }),
+      isCreateMode.value || !props.tableName ? Promise.resolve(undefined) : api.executeQuery(connectionId, database, mysqlTableEngineSql(database, props.tableName), undefined, undefined, { maxRows: 1 }),
+    ]);
+    if (requestId !== mysqlTableEngineLoadRequestId) return;
+    const metadata = parseMysqlTableEngineMetadata(enginesResult, tableResult);
+    const draft = refreshMysqlTableEngineDraft(metadata, { value: mysqlTableEngine.value, originalValue: originalMysqlTableEngine.value }, isCreateMode.value, preserveDraft);
+    const options = [...metadata.engines];
+    if (draft.value && !options.some((option) => option.toLowerCase() === draft.value.toLowerCase())) options.unshift(draft.value);
+    mysqlTableEngineOptions.value = options;
+    mysqlTableEngine.value = draft.value;
+    originalMysqlTableEngine.value = draft.originalValue;
+  } catch (error: any) {
+    if (requestId !== mysqlTableEngineLoadRequestId) return;
+    mysqlTableEngineLoadError.value = error?.message || String(error);
+  } finally {
+    if (requestId === mysqlTableEngineLoadRequestId) mysqlTableEngineLoading.value = false;
+  }
 }
 
 async function loadTableOwner(force = false, preserveDraft = false) {
@@ -1712,6 +1833,8 @@ async function loadStructure(
       if (!options.preserveDraft) clearColumnSelection();
     }
 
+    await loadMysqlAutoIncrementCounter(options.preserveDraft === true);
+
     const nextTableComment = await tableCommentPromise;
     if (nextTableComment !== undefined) {
       originalTableComment.value = nextTableComment;
@@ -1787,11 +1910,12 @@ async function loadStructure(
 
 async function refreshStructureAfterSave(scope: TableStructureRefreshScope, characterLengthUnitsAfterSave: ReadonlyMap<string, string>) {
   try {
-    await Promise.all([loadStructure(true, scope, false, { blockSecondaryMetadata: true, characterLengthUnitsAfterSave }), loadTableOwner(true)]);
+    await Promise.all([loadStructure(true, scope, false, { blockSecondaryMetadata: true, characterLengthUnitsAfterSave }), loadTableOwner(true), loadMysqlTableEngine(false)]);
   } catch (e) {
     console.warn("[DBX][structure-editor:post-save-refresh-failed]", e);
   } finally {
     postSaveRefreshing.value = false;
+    if (mysqlAutoIncrementValue.value !== originalMysqlAutoIncrementValue.value) scheduleSqlPreviewRefresh();
     if (activeTab.value === "ddl") void fetchDdl(true);
   }
 }
@@ -3288,9 +3412,11 @@ onMounted(() => {
   observeStructureHorizontalScroller();
   void loadTableOwner(false, props.draft?.tableOwner !== undefined);
   void loadTableOwnerRoles();
+  void loadMysqlTableEngine(props.draft?.mysqlTableEngine !== undefined);
   if (props.draft?.initialized) {
     void hydrateRestoredDraftFromDatabase().then(() => {
       applyInitialStructureTarget();
+      void loadMysqlAutoIncrementCounter(true);
       void loadActiveTableStructureMetadataIfNeeded();
     });
   } else if (isCreateMode.value) {
@@ -3308,11 +3434,15 @@ onActivated(() => {
   void loadDynamicDataTypeOptions();
   if (supportsTableOwner.value && !loadedMetadataFacets.has("owner")) void loadTableOwner(false, props.draft?.tableOwner !== undefined);
   if (supportsTableOwner.value && !tableOwnerRolesLoading.value && tableOwnerRoles.value.length === 0 && !tableOwnerRolesLoadError.value) void loadTableOwnerRoles();
+  if (supportsMysqlEngine.value && !mysqlTableEngineLoading.value && mysqlTableEngineOptions.value.length === 0 && !mysqlTableEngineLoadError.value) {
+    void loadMysqlTableEngine(props.draft?.mysqlTableEngine !== undefined);
+  }
   if (props.draft?.initialized && !draftHydrated) {
     restoreDraft(props.draft);
     applyInitialStructureTarget();
     void hydrateRestoredDraftFromDatabase().then(() => {
       applyInitialStructureTarget();
+      void loadMysqlAutoIncrementCounter(true);
       void loadActiveTableStructureMetadataIfNeeded();
     });
   }
@@ -3422,7 +3552,29 @@ watch([() => props.connectionId, () => props.database, databaseType], () => {
 });
 
 watch(
-  [isCreateMode, () => props.connectionId, () => props.database, databaseType, () => props.schema, () => props.tableName, newTableName, tableComment, tableOwner, columns, indexes, foreignKeys, triggers],
+  [
+    isCreateMode,
+    () => props.connectionId,
+    () => props.database,
+    databaseType,
+    () => props.schema,
+    () => props.tableName,
+    newTableName,
+    tableComment,
+    mysqlAutoIncrementValue,
+    originalMysqlAutoIncrementValue,
+    mysqlAutoIncrementLoading,
+    mysqlAutoIncrementLoadError,
+    mysqlTableEngine,
+    originalMysqlTableEngine,
+    mysqlTableEngineLoading,
+    mysqlTableEngineLoadError,
+    tableOwner,
+    columns,
+    indexes,
+    foreignKeys,
+    triggers,
+  ],
   () => {
     scheduleSqlPreviewRefresh();
     syncDraftToParent();
@@ -3536,6 +3688,49 @@ watch([activeTab, ddlLoading], ([tab, loading]) => {
           <Info :class="[structureIconClass, 'shrink-0 text-muted-foreground']" />
         </TooltipTrigger>
         <TooltipContent>{{ t("structureEditor.tableCommentUnsupported") }}</TooltipContent>
+      </Tooltip>
+    </div>
+
+    <div v-if="supportsMysqlEngine" class="flex shrink-0 items-center gap-2">
+      <label class="shrink-0 font-medium text-muted-foreground">{{ t("structureEditor.mysqlTableEngine") }}</label>
+      <SearchableSelect
+        v-model="mysqlTableEngine"
+        :options="mysqlTableEngineOptions"
+        :placeholder="t('structureEditor.mysqlTableEnginePlaceholder')"
+        :search-placeholder="t('structureEditor.mysqlTableEngineSearchPlaceholder')"
+        :empty-text="t('structureEditor.mysqlTableEngineEmpty')"
+        :loading-text="t('common.loading')"
+        :loading="mysqlTableEngineLoading"
+        :disabled="mysqlTableEngineLoading || !!mysqlTableEngineLoadError || saving"
+        :trigger-class="[structureMonoControlClass, 'w-[220px] max-w-[220px]']"
+        data-mysql-table-engine-select
+      />
+      <Loader2 v-if="mysqlTableEngineLoading" :class="[structureIconClass, 'animate-spin text-muted-foreground']" />
+      <Tooltip v-else-if="mysqlTableEngineLoadError">
+        <TooltipTrigger as-child>
+          <AlertTriangle :class="[structureIconClass, 'shrink-0 text-destructive']" />
+        </TooltipTrigger>
+        <TooltipContent>{{ t("structureEditor.mysqlTableEngineLoadFailed", { message: mysqlTableEngineLoadError }) }}</TooltipContent>
+      </Tooltip>
+    </div>
+
+    <div v-if="canEditMysqlAutoIncrement" class="flex shrink-0 items-center gap-2">
+      <label class="shrink-0 font-medium text-muted-foreground">AUTO_INCREMENT</label>
+      <Input
+        v-model="mysqlAutoIncrementValue"
+        inputmode="numeric"
+        autocomplete="off"
+        data-mysql-auto-increment-counter
+        :placeholder="mysqlAutoIncrementLoading ? t('common.loading') : '—'"
+        :title="mysqlAutoIncrementLoadError || undefined"
+        :class="[structureMonoControlClass, 'max-w-[220px]']"
+        :disabled="mysqlAutoIncrementLoading || !!mysqlAutoIncrementLoadError || originalMysqlAutoIncrementValue === undefined || saving"
+      />
+      <Tooltip v-if="mysqlAutoIncrementLoadError">
+        <TooltipTrigger as-child>
+          <AlertTriangle :class="[structureIconClass, 'shrink-0 text-destructive']" />
+        </TooltipTrigger>
+        <TooltipContent>{{ mysqlAutoIncrementLoadError }}</TooltipContent>
       </Tooltip>
     </div>
 

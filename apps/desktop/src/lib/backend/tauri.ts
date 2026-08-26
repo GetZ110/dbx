@@ -447,6 +447,8 @@ export interface AiStreamChunk {
   delta: string;
   reasoning_delta?: string;
   done: boolean;
+  /** Web-only explicit terminal error; Tauri reports invoke failures directly. */
+  error?: string;
 }
 
 export async function aiStream(sessionId: string, request: AiCompletionRequest, onChunk: (chunk: AiStreamChunk) => void): Promise<void> {
@@ -904,6 +906,32 @@ export interface AiConversation {
   connectionName: string;
   database: string;
   messages: AiChatMessage[];
+  /** One editable "send later" input saved while an active run occupies the
+   *  conversation (parent PRD §5). Persisted with the conversation. */
+  queuedInput?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type AiRunStatus = "preparing" | "queued" | "running" | "awaiting_write_confirmation" | "completed" | "failed" | "cancelled" | "interrupted" | "pending_recoverable";
+
+export type AiRunFifoCategory = "normal_send" | "write_confirmation_resume";
+
+export interface AiRun {
+  runId: string;
+  conversationId: string;
+  sessionIds: string[];
+  status: AiRunStatus;
+  connectionId: string;
+  database: string;
+  schema?: string;
+  pendingConfirmation?: unknown;
+  fifoCategory?: AiRunFifoCategory;
+  pendingInput?: string;
+  /** Highest event seq assigned to this run across all its sessions (parent
+   *  PRD §8). Drives the unread baseline and the "updates while you were away"
+   *  separator anchor. */
+  maxSeq?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -918,6 +946,18 @@ export async function loadAiConversations(): Promise<AiConversation[]> {
 
 export async function deleteAiConversation(id: string): Promise<void> {
   return invoke("delete_ai_conversation", { id });
+}
+
+export async function saveAiRun(run: AiRun): Promise<void> {
+  return invoke("save_ai_run", { run });
+}
+
+export async function saveAiRunState(conversation: AiConversation, run: AiRun): Promise<void> {
+  return invoke("save_ai_run_state", { conversation, run });
+}
+
+export async function loadAiRuns(): Promise<AiRun[]> {
+  return invoke("load_ai_runs");
 }
 
 // --- Prompt Templates ---
@@ -1107,6 +1147,10 @@ export async function getTableComment(connectionId: string, database: string, sc
     table,
     catalog,
   });
+}
+
+export async function getMysqlTableAutoIncrement(connectionId: string, database: string, table: string): Promise<string | null> {
+  return invoke("get_mysql_table_auto_increment", { connectionId, database, table });
 }
 
 export async function listObjects(connectionId: string, database: string, schema: string, objectTypes?: (SidebarObjectKind | "EVENT")[], filter?: string, limit?: number, offset?: number, catalog?: string, tableNameFilter?: import("@/types/database").TableNameFilter): Promise<ObjectInfo[]> {
@@ -2544,6 +2588,17 @@ export async function redisHashSet(connectionId: string, db: number, keyRaw: str
 
 export async function redisHashDel(connectionId: string, db: number, keyRaw: string, field: string): Promise<void> {
   return invoke("redis_hash_del", { connectionId, db, keyRaw, field });
+}
+
+export async function redisHashFieldUpdate(connectionId: string, db: number, keyRaw: string, oldField: string, newField: string, value: string): Promise<void> {
+  return invoke("redis_hash_field_update", {
+    connectionId,
+    db,
+    keyRaw,
+    oldField,
+    newField,
+    value,
+  });
 }
 
 export async function redisHashFieldSetTtl(connectionId: string, db: number, keyRaw: string, field: string, ttl: number): Promise<void> {

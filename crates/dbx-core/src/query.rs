@@ -2625,10 +2625,12 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
         );
     }
 
-    let statements = db_type.map_or_else(
-        || split_sql_statements(sql),
-        |db_type| crate::sql::split_sql_statements_for_database(sql, db_type),
+    let execution_plan = db_type.map_or_else(
+        || crate::sql::SqlExecutionPlan { statements: split_sql_statements(sql), stop_on_error: false },
+        |db_type| crate::sql::sql_execution_plan_for_database(sql, db_type),
     );
+    let continue_on_error = options.continue_on_error && !execution_plan.stop_on_error;
+    let statements = execution_plan.statements;
     if statements.is_empty() {
         return Ok(vec![empty_query_result(0).into()]);
     }
@@ -2756,7 +2758,7 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
                     Some(statement_index),
                     backend_error,
                 ));
-                if !should_continue_batch_after_error(options.continue_on_error, action) {
+                if !should_continue_batch_after_error(continue_on_error, action) {
                     break;
                 }
             }
@@ -4753,6 +4755,20 @@ pub async fn stream_rows_in_manual_transaction<F>(
     txn_session_id: &str,
     sql: &str,
     batch_size: usize,
+    on_batch: F,
+) -> Result<u64, String>
+where
+    F: FnMut(Vec<Vec<serde_json::Value>>) -> Result<(), String> + Send,
+{
+    stream_rows_in_manual_transaction_with_cancel(state, txn_session_id, sql, batch_size, None, on_batch).await
+}
+
+pub(crate) async fn stream_rows_in_manual_transaction_with_cancel<F>(
+    state: &AppState,
+    txn_session_id: &str,
+    sql: &str,
+    batch_size: usize,
+    cancel_token: Option<CancellationToken>,
     mut on_batch: F,
 ) -> Result<u64, String>
 where
@@ -4782,30 +4798,46 @@ where
         return Err(MANUAL_TRANSACTION_IDLE_ROLLBACK_ERROR.to_string());
     }
 
-    let connection = {
+    let (connection, pool_key, connection_id) = {
         let sessions = state.transaction_sessions.read().await;
         sessions
             .get(txn_session_id)
-            .map(|session| Arc::clone(&session.connection))
+            .map(|session| (Arc::clone(&session.connection), session.pool_key.clone(), session.connection_id.clone()))
             .ok_or(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR)?
     };
+    let operation_budget = {
+        let configs = state.configs.read().await;
+        configs
+            .get(&connection_id)
+            .map(DbOperationBudget::from_connection_config)
+            .unwrap_or_else(DbOperationBudget::with_defaults)
+    };
+    let postgres_cancel_context = state.get_postgres_cancel_context(&pool_key).await;
     let batch_size = batch_size.max(1);
     let mut conn = connection.lock().await;
     let stream_result = match &mut *conn {
         TxnConnection::Postgres(conn) => {
             let mut batch = Vec::with_capacity(batch_size);
             let mut total_rows = 0_u64;
-            let result = db::postgres::stream_select_query_inner_unnamed(conn, sql, None, &mut |item| {
-                if let db::postgres::PostgresQueryStreamItem::Row(row) = item {
-                    batch.push(row);
-                    total_rows += 1;
-                    if batch.len() >= batch_size {
-                        on_batch(std::mem::take(&mut batch))?;
-                        batch = Vec::with_capacity(batch_size);
+            let result = db::postgres::stream_select_query_inner_unnamed_with_cancel(
+                conn,
+                sql,
+                None,
+                &mut |item| {
+                    if let db::postgres::PostgresQueryStreamItem::Row(row) = item {
+                        batch.push(row);
+                        total_rows += 1;
+                        if batch.len() >= batch_size {
+                            on_batch(std::mem::take(&mut batch))?;
+                            batch = Vec::with_capacity(batch_size);
+                        }
                     }
-                }
-                Ok(())
-            })
+                    Ok(())
+                },
+                cancel_token.as_ref(),
+                &operation_budget,
+                postgres_cancel_context.as_ref(),
+            )
             .await;
             match result {
                 Ok(_) if !batch.is_empty() => on_batch(batch).map(|_| total_rows),
@@ -4866,8 +4898,13 @@ where
             sessions.remove(txn_session_id)
         };
         if let Some(session) = removed {
-            let _ = rollback_manual_txn_connection(&mut conn).await;
+            let rollback_result =
+                rollback_manual_txn_connection_with_postgres_timeout(&mut conn, Some(operation_budget.cleanup_timeout))
+                    .await;
             release_manual_txn_session_pool(state, &session.connection_id, &mut conn).await;
+            if let Err(rollback_error) = rollback_result {
+                return Err(format!("{err}. Transaction cleanup failed: {rollback_error}"));
+            }
         }
         return Err(format!("{err}. Transaction was auto-rolled back."));
     }
@@ -4890,9 +4927,22 @@ where
 }
 
 async fn rollback_manual_txn_connection(conn: &mut TxnConnection) -> Result<(), String> {
+    rollback_manual_txn_connection_with_postgres_timeout(conn, None).await
+}
+
+async fn rollback_manual_txn_connection_with_postgres_timeout(
+    conn: &mut TxnConnection,
+    postgres_timeout: Option<Duration>,
+) -> Result<(), String> {
     match conn {
         TxnConnection::Postgres(conn) => {
-            conn.execute_typed("ROLLBACK", &[]).await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
+            if let Some(timeout) = postgres_timeout {
+                db::postgres::execute_postgres_infra_statement(conn, "ROLLBACK", timeout, "manual_txn.rollback")
+                    .await
+                    .map_err(|error| format!("ROLLBACK failed: {error}"))?;
+            } else {
+                conn.execute_typed("ROLLBACK", &[]).await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
+            }
         }
         TxnConnection::Mysql(conn) => {
             conn.query_drop("ROLLBACK").await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
@@ -5583,6 +5633,7 @@ for line in sys.stdin:
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -5610,6 +5661,7 @@ for line in sys.stdin:
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -6047,6 +6099,47 @@ for line in sys.stdin:
     #[tokio::test]
     async fn sqlite_batch_continues_when_a_middle_statement_fails_and_enabled() {
         assert_sqlite_batch_error_behavior(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn gaussdb_on_error_stop_overrides_continue_on_error() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-gaussdb-on-error-stop-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "gaussdb-on-error-stop";
+        let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
+        state.connections.write().await.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Gaussdb));
+
+        let results = execute_multi_core_with_options(
+            &state,
+            connection_id,
+            "",
+            "\\set ON_ERROR_STOP on\nINSERT INTO missing_table VALUES (1); CREATE TABLE must_not_run (id INTEGER);",
+            None,
+            None,
+            QueryExecutionOptions { continue_on_error: true, ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].columns, vec!["Error"]);
+        let table_check = execute_sql_statement(
+            &state,
+            connection_id,
+            "",
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'must_not_run'",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(table_check.rows.is_empty());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
@@ -7573,6 +7666,7 @@ for line in sys.stdin:
             database: None,
             default_schema: None,
             visible_databases: None,
+            visible_database_patterns: None,
             visible_schemas: None,
             show_system_schemas: false,
             attached_databases: Vec::new(),
@@ -7600,6 +7694,7 @@ for line in sys.stdin:
             redis_key_separator: default_redis_key_separator(),
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
+            redis_key_templates: Vec::new(),
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
