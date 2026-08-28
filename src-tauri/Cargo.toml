@@ -1,6 +1,6 @@
 [package]
 name = "dbx"
-version = "0.5.96"
+version = "0.5.98"
 description = "Open-source database management tool"
 authors = ["skyler"]
 license = "Apache-2.0"
@@ -20,6 +20,7 @@ dynamodb = ["dbx-core/dynamodb"]
 mq-admin = ["dbx-core/mq-admin"]
 sqlite-sqlcipher = ["dbx-core/sqlite-sqlcipher"]
 sqlite-multiple-ciphers = ["dbx-core/sqlite-multiple-ciphers"]
+sqlite-bundled = ["dbx-core/sqlite-bundled"]
 system-fonts = ["dbx-core/system-fonts"]
 
 [build-dependencies]
