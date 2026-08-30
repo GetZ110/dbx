@@ -59,7 +59,7 @@ export function useWindowControls() {
   const isMac = isMacOS();
   const isDesktop = isDesktopRuntime();
   const isHarmony = isHarmonyDesktopRuntime();
-  const showControls = shouldShowWindowControls(isMac, isDesktop);
+  const showControls = shouldShowWindowControls(isMac, isDesktop) && !isHarmony;
 
   let unlisten: (() => void) | null = null;
 
