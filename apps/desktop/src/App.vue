@@ -59,7 +59,7 @@ import { resolveHistorySqlRestoreTarget } from "@/lib/history/historyRestoreTarg
 import { resolveExecutableSql, resolveExecutableSqlWithBackend, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 import { uuid } from "@/lib/common/utils";
 import { isMacOS, isWindows } from "@/lib/backend/platform";
-import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isDesktopRuntime, isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { openQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { rememberExternalSqlFileTarget, resolveExternalSqlFileTarget, unassociatedExternalSqlFileTarget } from "@/lib/sql/externalSqlFileTarget";
 import { externalSqlFileOpenErrorMessage, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
@@ -215,7 +215,7 @@ const {
 });
 const { setupFileDrop } = useFileDrop();
 
-const isDesktop = isTauriRuntime();
+const isDesktop = isDesktopRuntime();
 const activeAiRunCount = computed(() => (isDesktop ? activeDesktopAiRuns().length : 0));
 /** Runs waiting for a write confirmation — the panel-entry badge shows these
  *  with a higher-priority indicator (parent PRD §4 line 71 / §9). */

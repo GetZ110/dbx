@@ -1,4 +1,4 @@
-import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isHarmonyDesktopRuntime, isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import type * as TauriModule from "@/lib/backend/tauri";
 import { appendDebugLog } from "@/lib/backend/debugLog";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -14,7 +14,10 @@ let _backend: Backend | null = null;
 
 async function getBackend(): Promise<Backend> {
   if (_backend) return _backend;
-  _backend = isTauriRuntime(globalThis) ? await import("@/lib/backend/tauri") : await import("@/lib/backend/http");
+  // HarmonyOS desktop mode keeps using the HTTP backend (dbx-web NAPI serves /api/*).
+  _backend = isHarmonyDesktopRuntime(globalThis)
+    ? await import("@/lib/backend/http")
+    : (isTauriRuntime(globalThis) ? await import("@/lib/backend/tauri") : await import("@/lib/backend/http"));
   return _backend;
 }
 

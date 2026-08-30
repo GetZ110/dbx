@@ -1,5 +1,5 @@
 import { ref, onMounted, onUnmounted } from "vue";
-import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isDesktopRuntime, isHarmonyDesktopRuntime, isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { isMacOS } from "@/lib/backend/platform";
 import * as api from "@/lib/backend/api";
 
@@ -41,17 +41,36 @@ export function shouldDrawDesktopWindowFrame(isMac: boolean, isDesktop = true, i
   return isDesktop && !isMac && !isWindows;
 }
 
+interface NativeWindowBridge {
+  minimize?: () => void;
+  toggleMaximize?: () => void;
+  close?: () => void;
+  startMove?: () => void;
+  isMaximized?: () => boolean;
+}
+
+function nativeWindow(): NativeWindowBridge | undefined {
+  return (globalThis as Record<string, unknown>).dbxNativeWindow as NativeWindowBridge | undefined;
+}
+
 export function useWindowControls() {
   const isMaximized = ref(false);
   const isFullscreen = ref(false);
   const isMac = isMacOS();
-  const isDesktop = isTauriRuntime();
+  const isDesktop = isDesktopRuntime();
+  const isHarmony = isHarmonyDesktopRuntime();
   const showControls = shouldShowWindowControls(isMac, isDesktop);
 
   let unlisten: (() => void) | null = null;
 
   async function updateWindowState() {
     if (!isDesktop) return;
+    if (isHarmony) {
+      const win = nativeWindow();
+      isMaximized.value = win?.isMaximized?.() ?? false;
+      isFullscreen.value = false;
+      return;
+    }
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const currentWindow = getCurrentWindow();
     const [maximized, fullscreen] = await Promise.all([currentWindow.isMaximized(), currentWindow.isFullscreen()]);
@@ -60,11 +79,20 @@ export function useWindowControls() {
   }
 
   async function minimize() {
+    if (isHarmony) {
+      nativeWindow()?.minimize?.();
+      return;
+    }
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     await getCurrentWindow().minimize();
   }
 
   async function toggleMaximize() {
+    if (isHarmony) {
+      nativeWindow()?.toggleMaximize?.();
+      setTimeout(updateWindowState, 50);
+      return;
+    }
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     await getCurrentWindow().toggleMaximize();
     setTimeout(updateWindowState, 50);
@@ -72,12 +100,18 @@ export function useWindowControls() {
 
   async function close() {
     if (!isDesktop) return;
+    if (isHarmony) {
+      nativeWindow()?.close?.();
+      return;
+    }
     await api.requestAppClose();
   }
 
   onMounted(async () => {
     if (!isDesktop) return;
     await updateWindowState();
+    if (isHarmony) return;
+    if (!isTauriRuntime()) return;
     const { getCurrentWindow } = await import("@tauri-apps/api/window");
     const unlistenFn = await getCurrentWindow().onResized(() => {
       void updateWindowState();

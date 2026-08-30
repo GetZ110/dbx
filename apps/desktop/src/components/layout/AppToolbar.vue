@@ -9,6 +9,7 @@ import LightDropdown from "@/components/ui/LightDropdown.vue";
 import WindowControls from "@/components/layout/WindowControls.vue";
 import ExportProgressPopover from "@/components/export/ExportProgressPopover.vue";
 import { MAC_TRAFFIC_LIGHT_X, macTrafficLightInsetPaddingForScale, shouldReserveMacTrafficLightInset, useWindowControls } from "@/composables/useWindowControls";
+import { isHarmonyDesktopRuntime } from "@/lib/backend/tauriRuntime";
 import { useToast } from "@/composables/useToast";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { isSystemAppThemeMode, type AppThemeMode } from "@/lib/app/appTheme";
@@ -130,6 +131,13 @@ function cycleThemeMode() {
 }
 
 function onToolbarDblClick(e: MouseEvent) {
+  if (isHarmonyDesktopRuntime()) {
+    const target = e.target as HTMLElement;
+    if (target.closest("button, [role='button'], a")) return;
+    const win = (globalThis as Record<string, unknown>).dbxNativeWindow as { toggleMaximize?: () => void } | undefined;
+    win?.toggleMaximize?.();
+    return;
+  }
   if (isDesktop) return;
   const target = e.target as HTMLElement;
   if (target.closest("button, [role='button'], a")) return;
