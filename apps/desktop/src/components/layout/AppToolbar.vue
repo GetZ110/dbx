@@ -132,10 +132,8 @@ function cycleThemeMode() {
 
 function onToolbarDblClick(e: MouseEvent) {
   if (isHarmonyDesktopRuntime()) {
-    const target = e.target as HTMLElement;
-    if (target.closest("button, [role='button'], a")) return;
-    const win = (globalThis as Record<string, unknown>).dbxNativeWindow as { toggleMaximize?: () => void } | undefined;
-    win?.toggleMaximize?.();
+    // HarmonyOS system window already handles double-click on the title bar
+    // area; calling the bridge again would toggle twice (maximize then restore).
     return;
   }
   if (isDesktop) return;
