@@ -4,17 +4,26 @@ import type { HTMLAttributes } from "vue";
 import { reactiveOmit } from "@vueuse/core";
 import { DialogOverlay } from "reka-ui";
 import { cn } from "@/lib/common/utils";
-import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isDesktopRuntime, isHarmonyDesktopRuntime } from "@/lib/backend/tauriRuntime";
 
 const props = defineProps<DialogOverlayProps & { class?: HTMLAttributes["class"] }>();
 
 const delegatedProps = reactiveOmit(props, "class");
-const isDesktop = isTauriRuntime();
+const isDesktop = isDesktopRuntime();
 
 async function startWindowDrag(event: PointerEvent) {
   if (!isDesktop || event.button !== 0) return;
   event.preventDefault();
   event.stopPropagation();
+  if (isHarmonyDesktopRuntime()) {
+    const win = (globalThis as Record<string, unknown>).dbxNativeWindow as { startMove?: () => void; toggleMaximize?: () => void } | undefined;
+    if (event.detail >= 2) {
+      win?.toggleMaximize?.();
+    } else {
+      win?.startMove?.();
+    }
+    return;
+  }
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
   const currentWindow = getCurrentWindow();
   if (event.detail >= 2) {
