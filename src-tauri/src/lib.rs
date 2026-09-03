@@ -115,6 +115,18 @@ fn should_hide_window_on_close(target_os: &str) -> bool {
     matches!(target_os, "macos" | "windows")
 }
 
+/// How long to keep the app off-screen after hiding it and before the process
+/// exits, so WindowServer has removed the window before WKWebView teardown.
+#[cfg(target_os = "macos")]
+pub(crate) const EXIT_HIDE_GRACE_MS: u64 = 250;
+
+/// On macOS, tearing down WKWebView while the window is still on screen can
+/// paint the window red for a frame before the process exits, so the app is
+/// hidden first. Windows and Linux keep their existing exit behavior.
+fn should_hide_window_before_exit(target_os: &str) -> bool {
+    target_os == "macos"
+}
+
 fn should_setup_desktop_tray(target_os: &str, show_tray_icon: bool, linux_appindicator_available: bool) -> bool {
     show_tray_icon
         && (matches!(target_os, "macos" | "windows") || (target_os == "linux" && linux_appindicator_available))
@@ -464,6 +476,10 @@ fn linux_webkit_environment_override<'a>(
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_appimage_requires_dmabuf_workaround(appimage: Option<&std::ffi::OsStr>) -> bool {
+    appimage.is_some_and(|value| !value.is_empty())
+}
+
 fn linux_appimage_wayland_backend_override(
     appimage: Option<&std::ffi::OsStr>,
     wayland_display: Option<&std::ffi::OsStr>,
@@ -506,6 +522,7 @@ fn linux_uses_native_wayland(
 #[cfg(target_os = "linux")]
 fn apply_linux_webkit_rendering_workarounds() {
     let render_devices = linux_drm_render_devices();
+    let appimage = std::env::var_os("APPIMAGE");
     let explicit_device_file = std::env::var_os("WEBKIT_WEB_RENDER_DEVICE_FILE")
         .filter(|path| !path.is_empty())
         .map(std::path::PathBuf::from)
@@ -520,11 +537,21 @@ fn apply_linux_webkit_rendering_workarounds() {
     let has_hardware_render_device =
         render_devices.iter().any(|device| !linux_drm_driver_is_software_only(device.driver.as_deref()));
     let uses_native_wayland = linux_uses_native_wayland(
-        std::env::var_os("APPIMAGE").as_deref(),
+        appimage.as_deref(),
         std::env::var_os("WAYLAND_DISPLAY").as_deref(),
         std::env::var_os("XDG_SESSION_TYPE").as_deref(),
         std::env::var_os("GDK_BACKEND").as_deref(),
     );
+    // AppImages bundle WebKitGTK/GTK but use the host EGL/GL stack. On some
+    // combinations, WebKit's DMABUF initialization aborts the WebProcess
+    // before it can fall back to software rendering. Keep this opt-out
+    // user-overridable and use the stable shared-memory renderer instead.
+    if linux_appimage_requires_dmabuf_workaround(appimage.as_deref())
+        && linux_webkit_environment_override(std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").as_deref(), "1")
+            .is_some()
+    {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
     for (key, value) in linux_webkit_rendering_workarounds(
         nvidia_driver,
         has_hardware_render_device,
@@ -536,7 +563,7 @@ fn apply_linux_webkit_rendering_workarounds() {
         }
     }
     if let Some(gdk_backend) = linux_appimage_wayland_backend_override(
-        std::env::var_os("APPIMAGE").as_deref(),
+        appimage.as_deref(),
         std::env::var_os("WAYLAND_DISPLAY").as_deref(),
         std::env::var_os("GDK_BACKEND").as_deref(),
     ) {
@@ -953,11 +980,12 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_wayland_backend_override,
-        linux_drm_driver_is_software_only, linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state,
-        linux_pci_id_from_sysfs_value, linux_selected_drm_render_device, linux_uses_native_wayland,
-        linux_webkit_environment_override, linux_webkit_rendering_workarounds, native_window_decorations_override,
-        should_confirm_app_exit_request, should_enable_single_instance, should_fallback_to_native_quit,
+        app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_requires_dmabuf_workaround,
+        linux_appimage_wayland_backend_override, linux_drm_driver_is_software_only,
+        linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state, linux_pci_id_from_sysfs_value,
+        linux_selected_drm_render_device, linux_uses_native_wayland, linux_webkit_environment_override,
+        linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
+        should_enable_single_instance, should_fallback_to_native_quit, should_hide_window_before_exit,
         should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
         should_show_main_window_before_setup_tasks, startup_data_dir_mode, tray_menu_labels_for_locale,
         uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
@@ -1009,6 +1037,13 @@ mod tests {
     #[test]
     fn does_not_hide_window_on_close_for_other_platforms() {
         assert!(!should_hide_window_on_close("linux"));
+    }
+
+    #[test]
+    fn hides_window_before_exit_only_on_macos() {
+        assert!(should_hide_window_before_exit("macos"));
+        assert!(!should_hide_window_before_exit("windows"));
+        assert!(!should_hide_window_before_exit("linux"));
     }
 
     #[test]
@@ -1264,6 +1299,13 @@ mod tests {
             linux_webkit_rendering_workarounds(LinuxNvidiaDriver::None, false, None, false),
             &[("WEBKIT_DISABLE_DMABUF_RENDERER", "1")]
         );
+    }
+
+    #[test]
+    fn enables_appimage_dmabuf_workaround_only_for_real_appimage_values() {
+        assert!(linux_appimage_requires_dmabuf_workaround(Some(OsStr::new("/opt/DBX.AppImage"))));
+        assert!(!linux_appimage_requires_dmabuf_workaround(Some(OsStr::new(""))));
+        assert!(!linux_appimage_requires_dmabuf_workaround(None));
     }
 
     #[test]
@@ -1582,6 +1624,7 @@ pub fn run() {
             } else {
                 AppState::new_with_plugin_dir_and_app_version(storage, plugin_dir, env!("CARGO_PKG_VERSION"))
             };
+            dbx_core::db::sqlite_worker::enable_sqlite_ssh_runtime(env!("CARGO_PKG_VERSION"));
             state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
             state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
             let oidc_app_handle = app.handle().clone();
@@ -1593,6 +1636,12 @@ pub fn run() {
             }));
             let state = Arc::new(state);
             app.manage(state.clone());
+            let mcp_http_server = Arc::new(commands::mcp_http_server::McpHttpServerState::new(data_dir.clone()));
+            app.manage(mcp_http_server.clone());
+            let mcp_http_state = state.clone();
+            tauri::async_runtime::spawn(async move {
+                commands::mcp_http_server::start_if_enabled(mcp_http_state, mcp_http_server).await;
+            });
             app.manage(commands::redis_pubsub_server::start_pubsub_server(state.clone()));
             app.manage(commands::saved_sql::SavedSqlStorageState { data_dir: data_dir.clone() });
             app.manage(commands::external_sql::ExternalSqlOpenState::default());
@@ -1648,7 +1697,24 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if let tauri::WindowEvent::Destroyed = event {
+                if let Some(tab_id) = window.label().strip_prefix("detached-tab-") {
+                    let _ = window.emit("dbx:detached-tab-lost", serde_json::json!({ "tabId": tab_id }));
+                }
+                return;
+            }
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if let Some(tab_id) = window.label().strip_prefix("detached-tab-") {
+                    if commands::app_settings::take_approved_detached_window_close(window.label()) {
+                        return;
+                    }
+                    api.prevent_close();
+                    // Broadcast with the tabId payload: JS listeners registered
+                    // with the default `listen()` target receive events emitted
+                    // to any window, so the frontend must filter by tabId.
+                    let _ = window.emit("dbx:detached-tab-close-requested", serde_json::json!({ "tabId": tab_id }));
+                    return;
+                }
                 if !should_hide_window_on_close(std::env::consts::OS) {
                     return;
                 }
@@ -1711,10 +1777,19 @@ pub fn run() {
             commands::app_settings::save_pinned_tree_node_ids,
             commands::app_settings::load_mcp_global_policy,
             commands::app_settings::save_mcp_global_policy,
+            commands::mcp_http_server::load_mcp_http_server_settings,
+            commands::mcp_http_server::save_mcp_http_server_settings,
+            commands::mcp_http_server::mcp_http_server_status,
+            commands::mcp_http_server::rotate_mcp_http_server_token,
             commands::app_settings::load_editor_settings,
             commands::app_settings::save_editor_settings,
             commands::app_settings::load_open_tabs_state,
             commands::app_settings::save_open_tabs_state,
+            commands::app_settings::save_detached_tab_handoff,
+            commands::app_settings::load_detached_tab_handoff,
+            commands::app_settings::list_detached_tab_handoffs,
+            commands::app_settings::delete_detached_tab_handoff,
+            commands::app_settings::approve_detached_window_close,
             commands::app_settings::load_saved_sql_editor_positions,
             commands::app_settings::save_saved_sql_editor_positions,
             commands::app_settings::load_transfer_task_library,
@@ -1741,6 +1816,7 @@ pub fn run() {
             commands::cloud_sync::snippet_sync_download,
             commands::connection::test_connection,
             commands::connection::test_connection_with_info,
+            commands::connection::test_ssh_tunnel,
             commands::connection::connect_db,
             commands::connection::connection_final_proxy_port,
             commands::connection::disconnect_db,
@@ -1778,6 +1854,7 @@ pub fn run() {
             commands::schema::list_databases,
             commands::schema::list_database_metadata,
             commands::schema::list_database_storage,
+            commands::schema::list_xugu_tablespaces,
             commands::schema::get_sqlserver_completion_context,
             commands::schema::list_doris_catalogs,
             commands::schema::list_doris_catalog_databases,
@@ -1894,6 +1971,7 @@ pub fn run() {
             commands::query::extract_data_grid_selection,
             commands::query::build_data_grid_copy_update_statements,
             commands::query::build_data_grid_copy_insert_statement,
+            commands::query::build_dml_change_preview_sql,
             commands::query::build_data_grid_context_filter_condition,
             commands::query::build_data_grid_column_value_filter_condition,
             commands::query::build_data_grid_column_values_filter_condition,
@@ -1918,6 +1996,9 @@ pub fn run() {
             commands::external_sql::write_external_sql_file,
             commands::external_sql::save_external_sql_file,
             commands::list_sql_files::list_sql_files_in_folder,
+            commands::list_sql_files::create_sql_file_in_folder,
+            commands::list_sql_files::rename_sql_file_in_folder,
+            commands::list_sql_files::delete_sql_file_in_folder,
             commands::external_db::pending_open_db_files,
             commands::keychain::read_keychain_password,
             commands::keychain::read_keychain_passwords,
@@ -2148,6 +2229,7 @@ pub fn run() {
             commands::fs_open::is_sqlite_database_file,
             commands::fs_open::delete_database_backup_files,
             commands::sqlite_backup::backup_sqlite_database,
+            commands::sqlite_backup::restore_sqlite_database,
             commands::mongo_cmd::mongo_list_databases,
             commands::mongo_cmd::mongo_list_collections,
             commands::vector_cmd::vector_collection_detail,
@@ -2170,6 +2252,8 @@ pub fn run() {
             commands::document_cmd::document_count_documents,
             commands::document_cmd::dynamodb_describe_table,
             commands::document_cmd::elasticsearch_count_documents,
+            commands::document_cmd::elasticsearch_get_index_metadata,
+            commands::document_cmd::elasticsearch_delete_all_documents,
             commands::document_cmd::document_list_gridfs_buckets,
             commands::document_cmd::document_create_gridfs_bucket,
             commands::document_cmd::document_delete_gridfs_bucket,
@@ -2418,6 +2502,7 @@ pub fn run() {
             commands::database_export::begin_database_backup_snapshot,
             commands::database_export::export_database_sql,
             commands::database_export::cancel_database_export,
+            commands::database_export::clear_database_export_cancellation,
             commands::database_export::record_database_export_destination,
             commands::table_export::start_table_export,
             commands::table_export::cancel_table_export,
@@ -2486,6 +2571,14 @@ pub fn run() {
                     api.prevent_exit();
                     request_app_close(app_handle, "quit");
                 } else {
+                    // Restart exits and the no-frontend native quit bypass
+                    // `complete_app_close`, so hide the window here too; the
+                    // shutdown below gives WindowServer time to remove it.
+                    if should_hide_window_before_exit(std::env::consts::OS) {
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            let _ = window.hide();
+                        }
+                    }
                     tauri::async_runtime::block_on(async {
                         if let Some(server) = app_handle.try_state::<commands::redis_pubsub_server::PubSubServerState>()
                         {

@@ -1196,6 +1196,7 @@ pub enum AgentMethod {
     ListTables,
     ListObjects,
     ListDataTypes,
+    ListXuguTablespaces,
     CompletionAssistantSearchV1,
     GetObjectSource,
     GetColumns,
@@ -1283,6 +1284,7 @@ impl AgentMethod {
             Self::ListTables => "list_tables",
             Self::ListObjects => "list_objects",
             Self::ListDataTypes => "list_data_types",
+            Self::ListXuguTablespaces => "list_xugu_tablespaces",
             Self::CompletionAssistantSearchV1 => "completion_assistant_search_v1",
             Self::GetObjectSource => "get_object_source",
             Self::GetTableDdl => "get_table_ddl",
@@ -2052,6 +2054,10 @@ impl AgentDriverClient {
         }
         if let Some(object_types) = object_types {
             params["object_types"] = serde_json::json!(object_types);
+            // Agent drivers (hive-go, oracle-go, etc.) read the object-type
+            // filter from a camelCase field; keep both spellings so existing
+            // agents don't need a coordinated rollout.
+            params["objectTypes"] = serde_json::json!(object_types);
         }
         self.call_method_with_timeout(AgentMethod::ListTables, params, timeout_duration).await
     }
@@ -2087,6 +2093,7 @@ impl AgentDriverClient {
         }
         if let Some(object_types) = object_types {
             params["object_types"] = serde_json::json!(object_types);
+            params["objectTypes"] = serde_json::json!(object_types);
         }
         self.call_method_with_timeout(AgentMethod::ListObjects, params, timeout_duration).await
     }
@@ -2102,6 +2109,18 @@ impl AgentDriverClient {
             timeout_duration,
         )
         .await
+    }
+
+    pub async fn list_xugu_tablespaces<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        database: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let params = database
+            .filter(|database| !database.trim().is_empty())
+            .map(|database| serde_json::json!({ "database": database }))
+            .unwrap_or_else(|| serde_json::json!({}));
+        self.call_method_with_timeout(AgentMethod::ListXuguTablespaces, params, timeout_duration).await
     }
 
     pub async fn completion_assistant_search<T: DeserializeOwned + Send + 'static>(
@@ -2476,6 +2495,22 @@ impl AgentDriverClient {
         self.call_method(AgentMethod::StartTableRead, serde_json::to_value(params).map_err(|e| e.to_string())?).await
     }
 
+    pub async fn start_table_read_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        params: AgentTableReadStartParams,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, String> {
+        self.invalidate_cached_query();
+        self.call_method_with_timeout_and_cancel(
+            AgentMethod::StartTableRead,
+            serde_json::to_value(params).map_err(|e| e.to_string())?,
+            timeout_duration,
+            cancel_token,
+        )
+        .await
+    }
+
     pub async fn fetch_table_read_page<T: DeserializeOwned + Send + 'static>(
         &mut self,
         session_id: &str,
@@ -2485,6 +2520,23 @@ impl AgentDriverClient {
             AgentMethod::FetchTableReadPage,
             serde_json::to_value(AgentTableReadPageParams { session_id: session_id.to_string(), page_size })
                 .map_err(|e| e.to_string())?,
+        )
+        .await
+    }
+
+    pub async fn fetch_table_read_page_with_timeout_and_cancel<T: DeserializeOwned + Send + 'static>(
+        &mut self,
+        session_id: &str,
+        page_size: usize,
+        timeout_duration: Option<Duration>,
+        cancel_token: Option<CancellationToken>,
+    ) -> Result<T, String> {
+        self.call_method_with_timeout_and_cancel(
+            AgentMethod::FetchTableReadPage,
+            serde_json::to_value(AgentTableReadPageParams { session_id: session_id.to_string(), page_size })
+                .map_err(|e| e.to_string())?,
+            timeout_duration,
+            cancel_token,
         )
         .await
     }
@@ -4160,7 +4212,7 @@ def respond(req):
 
     session_id = params.get('agentSessionId', '__legacy__')
     with session_lock(session_id):
-        if method == 'execute_query':
+        if method in ('execute_query', 'start_table_read'):
             sql = params.get('sql', '')
             with state_lock:
                 query_count += 1
@@ -4174,6 +4226,9 @@ def respond(req):
                     blocked.pop(session_id, None)
             if sql == 'error':
                 write_response(req, error='synthetic query error')
+                return
+            if method == 'start_table_read':
+                write_response(req, {'rows': [], 'session_id': None, 'has_more': False})
                 return
             write_response(req, {'sql': sql, 'count': current_count})
             return
@@ -4273,6 +4328,34 @@ for line in sys.stdin:
             .unwrap();
         assert!(started.elapsed() < Duration::from_millis(500));
         assert_eq!(runtime_counter(&runtime, "cancel_count").await, 2);
+
+        runtime.kill();
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[tokio::test]
+    async fn table_read_uses_the_supplied_rpc_timeout() {
+        let (runtime, script_path) = spawn_stateful_test_runtime("table-read-timeout-test").await;
+        let mut client = AgentDriverClient::shared_session(runtime.clone(), "table-read-session".to_string());
+        let params = AgentTableReadStartParams {
+            sql: "slow table export".to_string(),
+            database: Some("TEST".to_string()),
+            schema: Some("APP".to_string()),
+            page_size: 100,
+            max_rows: 100,
+            fetch_size: Some(100),
+            timeout_secs: Some(1),
+        };
+
+        let error = client
+            .start_table_read_with_timeout_and_cancel::<serde_json::Value>(
+                params,
+                Some(Duration::from_millis(75)),
+                Some(CancellationToken::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("Agent RPC call timed out"));
 
         runtime.kill();
         let _ = std::fs::remove_file(script_path);
@@ -4868,6 +4951,7 @@ for line in sys.stdin:
         assert_eq!(AgentMethod::ListTables.as_str(), "list_tables");
         assert_eq!(AgentMethod::ListObjects.as_str(), "list_objects");
         assert_eq!(AgentMethod::ListDataTypes.as_str(), "list_data_types");
+        assert_eq!(AgentMethod::ListXuguTablespaces.as_str(), "list_xugu_tablespaces");
         assert_eq!(AgentMethod::CompletionAssistantSearchV1.as_str(), "completion_assistant_search_v1");
         assert_eq!(AgentMethod::GetObjectSource.as_str(), "get_object_source");
         assert_eq!(AgentMethod::GetColumns.as_str(), "get_columns");
@@ -4996,7 +5080,11 @@ for line in sys.stdin:
     #[test]
     fn exposes_table_read_protocol_wrappers() {
         let _start_table_read = AgentDriverClient::start_table_read::<serde_json::Value>;
+        let _start_table_read_with_timeout_and_cancel =
+            AgentDriverClient::start_table_read_with_timeout_and_cancel::<serde_json::Value>;
         let _fetch_table_read_page = AgentDriverClient::fetch_table_read_page::<serde_json::Value>;
+        let _fetch_table_read_page_with_timeout_and_cancel =
+            AgentDriverClient::fetch_table_read_page_with_timeout_and_cancel::<serde_json::Value>;
         let _close_table_read_session = AgentDriverClient::close_table_read_session::<serde_json::Value>;
     }
 

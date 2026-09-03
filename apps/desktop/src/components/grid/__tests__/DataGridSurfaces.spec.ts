@@ -101,6 +101,7 @@ import DataGridQueryControls from "@/components/grid/DataGridQueryControls.vue";
 import DataGridSearchBar from "@/components/grid/DataGridSearchBar.vue";
 
 const dataGridSource = readFileSync("apps/desktop/src/components/grid/DataGrid.vue", "utf8");
+const globalsCss = readFileSync("apps/desktop/src/styles/globals.css", "utf8");
 
 function detail(patch: Partial<DataGridCellDetail> = {}): DataGridCellDetail {
   return {
@@ -134,6 +135,19 @@ beforeEach(() => {
   localStorage.removeItem("dbx-filter-builder-value-shortcut-hint-days");
 });
 describe("DataGrid canvas surfaces", () => {
+  it("asks before an expensive Elasticsearch cursor jump", () => {
+    expect(dataGridSource).toContain("requestCount >= ELASTICSEARCH_PAGE_JUMP_WARNING_REQUESTS");
+    expect(dataGridSource).toContain('t("grid.esDeepPageJumpConfirmMessage"');
+    expect(dataGridSource).toContain('@click="confirmEsDeepPageJump"');
+  });
+
+  it("shows stable request progress while an Elasticsearch page jump is running", () => {
+    expect(dataGridSource).toContain('t("grid.pageJumpLoading", { page: pageJumpProgress.targetPage })');
+    expect(dataGridSource).toContain('t("grid.pageJumpProgress", { current: pageJumpProgress.completedRequests, total: pageJumpProgress.totalRequests })');
+    expect(dataGridSource).toContain('role="progressbar"');
+    expect(dataGridSource).toContain(':style="{ width: `${pageJumpProgressPercent}%` }"');
+  });
+
   it("uses the stable overlay for viewport and device-pixel measurement", () => {
     expect(dataGridSource).toContain("function canvasMeasurementSurface(): HTMLElement | null");
     expect(dataGridSource).toContain("return canvasOverlayRef.value ?? null;");
@@ -399,6 +413,28 @@ describe("DataGridPagination", () => {
 });
 
 describe("DataGridColumnHeader", () => {
+  it("uses a compact formatter marker with an accessible explanation", () => {
+    const mounted = mountComponent(DataGridColumnHeader, {
+      name: "created_at",
+      actualColumnIndex: 0,
+      visibleColumnIndex: 0,
+      formatterActive: true,
+      formatterLabel: "Formatted display is active",
+      copyColumnNameLabel: "copy",
+      columnNameLabel: "name",
+      columnTypeLabel: "type",
+      columnCommentLabel: "comment",
+    });
+    const indicator = findOne(mounted.root, (node) => node.props["data-column-formatter-indicator"] === "");
+    const trigger = findOne(mounted.root, (node) => node.props["data-column-tooltip-trigger"] === "");
+
+    expect(hostText(indicator)).toBe("F");
+    expect(String(indicator.props.class)).toContain("h-4 w-4");
+    expect(indicator.props.title).toBe("Formatted display is active");
+    expect(indicator.props["aria-label"]).toBe("Formatted display is active");
+    expect(indicator.parent).not.toBe(trigger);
+  });
+
   it("limits the metadata tooltip trigger to the column text block", () => {
     const mounted = mountComponent(DataGridColumnHeader, {
       name: "status",
@@ -417,6 +453,32 @@ describe("DataGridColumnHeader", () => {
     expect(trigger.parent).toBe(tooltip);
     expect(actions.parent).not.toBe(tooltip);
     expect(resizeHandle.parent).not.toBe(tooltip);
+  });
+
+  it("renders the metadata tooltip type value with the softened type palette", () => {
+    const mounted = mountComponent(DataGridColumnHeader, {
+      name: "title",
+      actualColumnIndex: 0,
+      visibleColumnIndex: 0,
+      showTypeLine: true,
+      columnType: "varchar(255)",
+      typeClass: "data-grid-type-string",
+      copyColumnNameLabel: "copy",
+      columnNameLabel: "name",
+      columnTypeLabel: "type",
+      columnCommentLabel: "comment",
+    });
+    // The vivid 300-level dark-mode type palette is tuned for grid cells and
+    // glares on the popover surface. The tooltip container re-defines the type
+    // CSS variables with softer 400-level values while keeping the per-kind hue.
+    const tooltipContent = findOne(mounted.root, (node) => String(node.props?.class ?? "").includes("dbx-column-info-tooltip"));
+    expect(tooltipContent).toBeDefined();
+    const tooltipType = findOne(mounted.root, (node) => hostText(node) === "varchar(255)" && node.props["data-grid-header-type-line"] === undefined);
+    expect(String(tooltipType.props.class ?? "")).toContain("data-grid-type-string");
+    const headerTypeLine = findOne(mounted.root, (node) => hostText(node) === "varchar(255)" && node.props["data-grid-header-type-line"] === "");
+    expect(String(headerTypeLine.props.class)).toContain("data-grid-type-string");
+    // Softer dark-mode palette override for the tooltip container.
+    expect(globalsCss).toMatch(/\.dark \.dbx-column-info-tooltip \{[^}]*--data-grid-type-string-fg: #4ade80/);
   });
 
   it("cancels resize-handle clicks without leaking header click events", () => {
@@ -623,6 +685,7 @@ describe("DataGridFilterBuilder", () => {
     const filterBuilder = findOne(mounted.root, (node) => String(node.props.class).includes("w-fit max-w-full"));
     const ruleGrid = findOne(mounted.root, (node) => String(node.props.class).includes("grid-cols-[18px_var(--filter-builder-column-width)_92px_var(--filter-builder-value-width)_auto]"));
     const searchInput = findOne(mounted.root, (node) => node.type === "input" && node.props.placeholder === "grid.filterBuilderSearchColumns");
+    const columnSearch = findOne(mounted.root, (node) => node.props["data-filter-column-search"] === "");
     const valueEditor = findOne(mounted.root, (node) => node.props["data-filter-value-editor"] === "");
 
     expect(selects).toHaveLength(2);
@@ -634,6 +697,8 @@ describe("DataGridFilterBuilder", () => {
     expect(items).toHaveLength(2);
     expect(items.every((item) => String(item.props.class).includes("rounded-none"))).toBe(true);
     expect(searchInput.props.placeholder).toBe("grid.filterBuilderSearchColumns");
+    expect(searchInput.props["aria-label"]).toBe("grid.filterBuilderSearchColumns");
+    expect(String(columnSearch.props.class)).toContain("border-b");
     expect(valueEditor.props.placeholder).toBe("grid.filterBuilderValue");
     expect(filterBuilder.props.style).toEqual({ "--filter-builder-column-width": "178px", "--filter-builder-value-width": "178px" });
     expect(String(ruleGrid.props.class)).toContain("grid-cols-[18px_var(--filter-builder-column-width)_92px_var(--filter-builder-value-width)_auto]");
@@ -1079,7 +1144,9 @@ describe("DataGridQueryControls", () => {
     expect(applyFilters).toHaveBeenCalledOnce();
   });
 
-  it("keeps view selection out of the data grid controls", async () => {
+  it("keeps the filter toggle available when switching filter views", async () => {
+    const updateFilterBuilderOpen = vi.fn();
+    const ensureRule = vi.fn();
     const mounted = mountComponent(DataGridQueryControls, {
       whereInput: "",
       orderByInput: "",
@@ -1103,16 +1170,26 @@ describe("DataGridQueryControls", () => {
       applyWhere: vi.fn(),
       applyOrderBy: vi.fn(),
       clearOrderBy: vi.fn(),
+      "onUpdate:filterBuilderOpen": updateFilterBuilderOpen,
+      onEnsureRule: ensureRule,
     });
 
     expect(hostText(mounted.root)).not.toContain("grid.filterQuickView");
     expect(hostText(mounted.root)).not.toContain("grid.filterConditionView");
-    expect(findAll(mounted.root, (node) => node.type === "button" && String(node.props.class).includes("-translate-x-1"))).toHaveLength(1);
+    const quickFilterButtons = findAll(mounted.root, (node) => node.type === "button" && String(node.props.class).includes("-translate-x-1"));
+    expect(quickFilterButtons).toHaveLength(1);
+    expect(quickFilterButtons[0].props["aria-label"]).toBe("grid.filter");
 
     await mounted.setProps({ filterEditorView: "conditions", filterBuilderOpen: false });
     await nextTick();
     expect(findOne(mounted.root, (node) => node.type === "textarea" && node.props.placeholder === "WHERE")).toBeTruthy();
-    expect(findAll(mounted.root, (node) => node.type === "button" && String(node.props.class).includes("-translate-x-1"))).toHaveLength(0);
+    const filterButtons = findAll(mounted.root, (node) => node.type === "button" && String(node.props.class).includes("-translate-x-1"));
+    expect(filterButtons).toHaveLength(1);
+    expect(filterButtons[0].props["aria-label"]).toBe("grid.filter");
+    expect(filterButtons[0].props["aria-expanded"]).toBe(false);
+    dispatch(filterButtons[0], "click");
+    expect(updateFilterBuilderOpen).toHaveBeenCalledWith(true);
+    expect(ensureRule).toHaveBeenCalledOnce();
   });
 });
 

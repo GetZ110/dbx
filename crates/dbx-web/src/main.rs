@@ -1,8 +1,288 @@
-use dbx_web::run_server;
+mod auth;
+mod error;
+mod routes;
+mod sse;
+mod ssh_prompt;
+mod state;
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use argon2::password_hash::rand_core::OsRng;
+use argon2::password_hash::SaltString;
+use argon2::{Argon2, PasswordHasher};
+use axum::extract::DefaultBodyLimit;
+use axum::http::Uri;
+use axum::middleware;
+use axum::response::Redirect;
+use axum::routing::{delete, get, post};
+use axum::Router;
+use dbx_core::connection::AppState;
+use dbx_core::sql_dialect::dialect_loader::{register_core_dialects, DialectPluginLoader, DialectRegistry};
+use dbx_core::sql_dialect::hot_reload::DialectHotReload;
+use dbx_core::storage::Storage;
+use dbx_mcp::{streamable_http_router, DbxBackend, HttpAuth, LocalBackend};
+use state::WebState;
+use tokio::sync::RwLock;
+use tower_http::compression::predicate::{DefaultPredicate, NotForContentType, Predicate};
+use tower_http::compression::CompressionLayer;
+use utoipa::OpenApi;
+
+const XLSX_CONTENT_TYPE: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const DATA_GRID_EXTRACTOR_BODY_LIMIT_BYTES: usize = 96 * 1024 * 1024;
+
+#[derive(OpenApi)]
+#[openapi(
+    info(title = "DBX Data Grid Extractor API", description = "HTTP contract for data-grid clipboard extraction."),
+    paths(routes::query::extract_data_grid_selection),
+    tags((name = "data-grid", description = "Data grid extraction and clipboard formats"))
+)]
+struct ApiDoc;
+
+async fn openapi_json() -> axum::Json<utoipa::openapi::OpenApi> {
+    axum::Json(ApiDoc::openapi())
+}
+
+#[cfg(test)]
+mod data_grid_extractor_openapi_tests {
+    use super::*;
+
+    #[test]
+    fn extractor_openapi_contains_the_versioned_request_and_error_responses() {
+        let document = serde_json::to_value(ApiDoc::openapi()).expect("serialize extractor OpenAPI document");
+        let operation = &document["paths"]["/api/query/extract-data-grid-selection"]["post"];
+
+        assert_eq!(operation["requestBody"]["required"], true);
+        assert!(operation["responses"].get("200").is_some());
+        assert!(operation["responses"].get("400").is_some());
+        assert!(operation["responses"].get("413").is_some());
+        assert!(operation["responses"].get("422").is_some());
+        assert!(operation["responses"].get("500").is_some());
+    }
+}
+
+fn web_compression_predicate() -> impl Predicate {
+    // XLSX exports are already compressed ZIP archives, so gzip would only add CPU overhead.
+    DefaultPredicate::new().and(NotForContentType::const_new(XLSX_CONTENT_TYPE))
+}
+
+fn web_body_limit_bytes() -> usize {
+    let value = std::env::var("DBX_MAX_UPLOAD_MB").ok();
+    web_body_limit_bytes_from_value(value.as_deref())
+}
+
+fn web_body_limit_bytes_from_value(value: Option<&str>) -> usize {
+    const DEFAULT_MB: usize = 1024;
+    let mb = value.and_then(|value| value.parse::<usize>().ok()).filter(|value| *value > 0).unwrap_or(DEFAULT_MB);
+    mb.saturating_mul(1024 * 1024)
+}
+
+fn web_agent_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+    web_agent_dir_from_env(data_dir, std::env::var("DBX_AGENT_DIR").ok())
+}
+
+fn web_agent_dir_from_env(data_dir: &std::path::Path, agent_dir: Option<String>) -> std::path::PathBuf {
+    agent_dir.map(std::path::PathBuf::from).unwrap_or_else(|| data_dir.join("agents"))
+}
+
+fn normalize_public_base_path(value: Option<String>) -> String {
+    let trimmed = value
+        .unwrap_or_else(|| "/".to_string())
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/")
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    if trimmed.chars().any(|ch| ch.is_ascii_control() || ch.is_ascii_whitespace() || matches!(ch, ';' | ',')) {
+        panic!("DBX_PUBLIC_BASE_PATH contains invalid characters");
+    }
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn add_public_base_path_redirect<S>(app: Router<S>, public_base_path: &str) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if public_base_path == "/" {
+        return app;
+    }
+
+    // Derive the target from the configured base path so single- and multi-segment prefixes both work.
+    let redirect_target = format!("{public_base_path}/");
+    app.route(
+        public_base_path,
+        get(move |uri: Uri| {
+            let redirect_target = redirect_target.clone();
+            async move {
+                let location = uri.query().map(|query| format!("{redirect_target}?{query}")).unwrap_or(redirect_target);
+                Redirect::permanent(&location)
+            }
+        }),
+    )
+}
+
+fn mount_public_base_path(mut app: Router, public_base_path: &str, static_dir: Option<&std::path::Path>) -> Router {
+    if let Some(static_dir) = static_dir {
+        use tower_http::services::{ServeDir, ServeFile};
+        let index_path = static_dir.join("index.html");
+        let serve_dir = ServeDir::new(static_dir).not_found_service(ServeFile::new(index_path));
+        app = app.fallback_service(serve_dir);
+    }
+
+    if public_base_path == "/" {
+        return app;
+    }
+
+    app = Router::new().nest(public_base_path, app);
+    app = add_public_base_path_redirect(app, public_base_path);
+    if let Some(static_dir) = static_dir {
+        use tower_http::services::ServeFile;
+        app = app.route_service(&format!("{public_base_path}/"), ServeFile::new(static_dir.join("index.html")));
+    }
+    app
+}
+
+/// Builds the native Web MCP endpoint. It is intentionally opt-in: exposing a
+/// token-bearing MCP server on a Web listener must never happen merely because
+/// DBX Web itself was started.
+fn web_mcp_router(web_state: &Arc<WebState>) -> Result<Option<Router>, String> {
+    let token = web_mcp_token()?;
+    let Some(token) = token else {
+        return Ok(None);
+    };
+
+    let allowed_hosts = comma_separated_env("DBX_WEB_MCP_ALLOWED_HOSTS");
+    if allowed_hosts.is_empty() {
+        return Err("DBX_WEB_MCP_ALLOWED_HOSTS is required when DBX Web MCP is enabled".into());
+    }
+
+    let allowed_origins = comma_separated_env("DBX_WEB_MCP_ALLOWED_ORIGINS");
+    let auth = HttpAuth::new(token, allowed_origins, false)?;
+    let backend: Arc<dyn DbxBackend> =
+        Arc::new(LocalBackend::from_app_state(web_state.app.clone(), web_state.data_dir.clone()));
+
+    Ok(Some(streamable_http_router(backend, "/mcp", auth, allowed_hosts, true)))
+}
+
+fn web_mcp_token() -> Result<Option<String>, String> {
+    let inline_token = std::env::var("DBX_WEB_MCP_TOKEN").ok();
+    let token_file = std::env::var("DBX_WEB_MCP_TOKEN_FILE").ok();
+    match (inline_token, token_file) {
+        (Some(_), Some(_)) => Err("set only one of DBX_WEB_MCP_TOKEN or DBX_WEB_MCP_TOKEN_FILE".into()),
+        (Some(token), None) if !token.trim().is_empty() => Ok(Some(token)),
+        (Some(_), None) => Err("DBX_WEB_MCP_TOKEN must not be empty".into()),
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .map_err(|error| format!("failed to read DBX_WEB_MCP_TOKEN_FILE: {error}"))
+            .map(|token| token.trim_end_matches(['\r', '\n']).to_owned())
+            .and_then(|token| {
+                (!token.is_empty()).then_some(token).ok_or_else(|| "DBX_WEB_MCP_TOKEN_FILE is empty".into())
+            })
+            .map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+fn comma_separated_env(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .ok()
+        .into_iter()
+        .flat_map(|value| {
+            value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+#[cfg(feature = "mq-admin")]
+fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
+    router
+        .route("/mq/test-connection", post(routes::mq::test_connection))
+        .route("/mq/tenants/list", post(routes::mq::list_tenants))
+        .route("/mq/tenants/get", post(routes::mq::get_tenant))
+        .route("/mq/tenants/create", post(routes::mq::create_tenant))
+        .route("/mq/tenants/update", post(routes::mq::update_tenant))
+        .route("/mq/tenants/delete", post(routes::mq::delete_tenant))
+        .route("/mq/namespaces/list", post(routes::mq::list_namespaces))
+        .route("/mq/namespaces/create", post(routes::mq::create_namespace))
+        .route("/mq/namespaces/delete", post(routes::mq::delete_namespace))
+        .route("/mq/namespaces/policies", post(routes::mq::get_namespace_policies))
+        .route("/mq/topics/list", post(routes::mq::list_topics))
+        .route("/mq/topics/create", post(routes::mq::create_topic))
+        .route("/mq/topics/delete", post(routes::mq::delete_topic))
+        .route("/mq/topics/update-partitions", post(routes::mq::update_partitions))
+        .route("/mq/topics/stats", post(routes::mq::get_topic_stats))
+        .route("/mq/topics/internal-stats", post(routes::mq::get_topic_internal_stats))
+        .route("/mq/topics/route", post(routes::mq::get_topic_route))
+        .route("/mq/topics/alter-config", post(routes::mq::alter_topic_config))
+        .route("/mq/topics/skip-accumulation", post(routes::mq::skip_topic_accumulation))
+        .route("/mq/exchanges/list", post(routes::mq::list_exchanges))
+        .route("/mq/exchanges/create", post(routes::mq::create_exchange))
+        .route("/mq/exchanges/delete", post(routes::mq::delete_exchange))
+        .route("/mq/bindings/list", post(routes::mq::list_bindings))
+        .route("/mq/bindings/bind", post(routes::mq::bind_queue))
+        .route("/mq/bindings/unbind", post(routes::mq::unbind_queue))
+        .route("/mq/messages/view", post(routes::mq::view_message))
+        .route("/mq/messages/query-by-key", post(routes::mq::query_messages_by_key))
+        .route("/mq/messages/query-by-topic", post(routes::mq::query_messages_by_topic))
+        .route("/mq/messages/trace", post(routes::mq::query_message_trace))
+        .route("/mq/subscriptions/list", post(routes::mq::list_subscriptions))
+        .route("/mq/subscriptions/enrich", post(routes::mq::enrich_subscriptions))
+        .route("/mq/kafka/consumer-groups", post(routes::mq::get_kafka_consumer_group_snapshot))
+        .route("/mq/subscriptions/create", post(routes::mq::create_subscription))
+        .route("/mq/subscriptions/delete", post(routes::mq::delete_subscription))
+        .route("/mq/subscriptions/skip-messages", post(routes::mq::skip_messages))
+        .route("/mq/subscriptions/reset-cursor", post(routes::mq::reset_cursor))
+        .route("/mq/subscriptions/clear-backlog", post(routes::mq::clear_backlog))
+        .route("/mq/consumers/group-config/get", post(routes::mq::get_consumer_group_config))
+        .route("/mq/consumers/group-config/alter", post(routes::mq::alter_consumer_group_config))
+        .route("/mq/subscriptions/peek-messages", post(routes::mq::peek_messages))
+        .route("/mq/subscriptions/expire-messages", post(routes::mq::expire_messages))
+        .route("/mq/producers/list", post(routes::mq::list_producers))
+        .route("/mq/consumers/list", post(routes::mq::list_consumers))
+        .route("/mq/topics/unload", post(routes::mq::unload_topic))
+        .route("/mq/client-connections/list", post(routes::mq::list_client_connections))
+        .route("/mq/client-connections/close", post(routes::mq::close_client_connection))
+        .route("/mq/channels/list", post(routes::mq::list_client_channels))
+        .route("/mq/policies/publish-rate", post(routes::mq::set_publish_rate))
+        .route("/mq/policies/dispatch-rate", post(routes::mq::set_dispatch_rate))
+        .route("/mq/policies/subscribe-rate", post(routes::mq::set_subscribe_rate))
+        .route("/mq/policies/backlog-quota", post(routes::mq::set_backlog_quota))
+        .route("/mq/policies/retention", post(routes::mq::set_retention))
+        .route("/mq/policies/effective", post(routes::mq::get_effective_policies))
+        .route("/mq/policies/list", post(routes::mq::list_policies))
+        .route("/mq/policies/set", post(routes::mq::set_policy))
+        .route("/mq/policies/delete", post(routes::mq::delete_policy))
+        .route("/mq/permissions/grant", post(routes::mq::grant_permission))
+        .route("/mq/permissions/revoke", post(routes::mq::revoke_permission))
+        .route("/mq/permissions/list", post(routes::mq::list_permissions))
+        .route("/mq/users/list", post(routes::mq::list_users))
+        .route("/mq/users/create", post(routes::mq::create_user))
+        .route("/mq/users/delete", post(routes::mq::delete_user))
+        .route("/mq/user-permissions/list", post(routes::mq::list_user_permissions))
+        .route("/mq/user-permissions/grant", post(routes::mq::grant_user_permission))
+        .route("/mq/user-permissions/revoke", post(routes::mq::revoke_user_permission))
+        .route("/mq/tokens/issue", post(routes::mq::issue_token))
+        .route("/mq/tokens/list", post(routes::mq::list_token_records))
+        .route("/mq/monitoring/backlog", post(routes::mq::get_backlog))
+        .route("/mq/monitoring/cluster-info", post(routes::mq::get_cluster_info))
+        .route("/mq/overview", post(routes::mq::get_overview))
+        .route("/mq/nodes", post(routes::mq::list_nodes))
+        .route("/mq/raw", post(routes::mq::raw_request))
+        .route("/mq/send-message", post(routes::mq::send_message))
+}
+
+#[cfg(not(feature = "mq-admin"))]
+fn add_mq_routes(router: Router<Arc<WebState>>) -> Router<Arc<WebState>> {
+    router
+}
 
 #[tokio::main]
 async fn main() {
-
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -10,7 +290,7 @@ async fn main() {
         )
         .init();
 
-    rustls::crypto::ring::default_provider().install_default().expect("Failed to install rustls crypto provider");
+    rustls::crypto::aws_lc_rs::default_provider().install_default().expect("Failed to install rustls crypto provider");
 
     // Data directory
     let data_dir = std::env::var("DBX_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| {
@@ -99,6 +379,7 @@ async fn main() {
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))
+        .route("/connection/test-ssh-tunnel", post(routes::connection::test_ssh_tunnel))
         .route("/connection/connect", post(routes::connection::connect_db))
         .route("/connection/database-info", post(routes::connection::connected_database_info))
         .route("/connection/database-info/save", post(routes::connection::save_connection_database_info))
@@ -177,6 +458,7 @@ async fn main() {
         .route("/schema/databases", get(routes::schema::list_databases))
         .route("/schema/database-metadata", get(routes::schema::list_database_metadata))
         .route("/schema/database-storage", post(routes::schema::list_database_storage))
+        .route("/schema/xugu/tablespaces", get(routes::schema::list_xugu_tablespaces))
         .route("/schema/sqlserver/completion-context", get(routes::schema::get_sqlserver_completion_context))
         .route("/schema/doris/catalogs", get(routes::schema::list_doris_catalogs))
         .route("/schema/doris/catalog-databases", get(routes::schema::list_doris_catalog_databases))
@@ -312,6 +594,7 @@ async fn main() {
             "/query/build-data-grid-copy-insert-statement",
             post(routes::query::build_data_grid_copy_insert_statement),
         )
+        .route("/query/build-dml-change-preview-sql", post(routes::query::build_dml_change_preview_sql))
         .route(
             "/query/build-data-grid-context-filter-condition",
             post(routes::query::build_data_grid_context_filter_condition),
@@ -589,6 +872,14 @@ async fn main() {
             "/document-store/elasticsearch-count-documents",
             post(routes::document_store::elasticsearch_count_documents),
         )
+        .route(
+            "/document-store/elasticsearch/index-metadata",
+            post(routes::document_store::elasticsearch_get_index_metadata),
+        )
+        .route(
+            "/document-store/elasticsearch/documents/delete-all",
+            post(routes::document_store::elasticsearch_delete_all_documents),
+        )
         .route("/document-store/list-gridfs-buckets", post(routes::document_store::list_gridfs_buckets))
         .route("/document-store/create-gridfs-bucket", post(routes::document_store::create_gridfs_bucket))
         .route("/document-store/delete-gridfs-bucket", post(routes::document_store::delete_gridfs_bucket))
@@ -757,6 +1048,7 @@ async fn main() {
             "/app-settings/mcp-policy",
             get(routes::app_settings::load_mcp_global_policy).put(routes::app_settings::save_mcp_global_policy),
         )
+        .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
         .route(
             "/app-settings/max-agent-turns",
             get(routes::app_settings::load_max_agent_turns).put(routes::app_settings::save_max_agent_turns),
@@ -807,6 +1099,11 @@ async fn main() {
         .layer(DefaultBodyLimit::max(web_body_limit_bytes()))
         .layer(CompressionLayer::new().compress_when(web_compression_predicate()))
         .layer(tower_http::trace::TraceLayer::new_for_http());
+
+    if let Some(mcp_router) = web_mcp_router(&web_state).expect("Invalid DBX Web MCP configuration") {
+        app = app.merge(mcp_router);
+        tracing::info!("DBX Web MCP is enabled at /mcp");
+    }
 
     let static_dir = std::env::var_os("DBX_STATIC_DIR").map(std::path::PathBuf::from);
     app = mount_public_base_path(app, &public_base_path, static_dir.as_deref());
@@ -1059,5 +1356,4 @@ mod tests {
         server.abort();
         std::fs::remove_dir_all(static_dir).expect("remove static directory");
     }
-
 }

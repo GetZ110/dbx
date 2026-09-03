@@ -397,6 +397,21 @@ struct ServerLargeValueMarkerValue {
     original_bytes: Option<usize>,
 }
 
+/// Some PostgreSQL-compatible servers (for example KingbaseES instances with
+/// case-insensitive identifiers) fold even quoted column aliases, so the
+/// internal preview marker prefix must be matched ASCII case-insensitively.
+fn strip_large_value_marker_prefix(column: &str) -> Option<&str> {
+    let prefix = crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX;
+    if column.len() < prefix.len() {
+        return None;
+    }
+    let head = column.get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    column.get(prefix.len()..)
+}
+
 fn server_large_value_alias(
     suffix: &str,
 ) -> Option<(usize, Option<ServerLargeValuePreviewKind>, Option<&'static str>)> {
@@ -406,16 +421,16 @@ fn server_large_value_alias(
     let (kind, source_index) = suffix.split_once('_')?;
     let source_index = source_index.parse::<usize>().ok()?;
     let (preview_kind, source_type) = match kind {
-        "T" => (ServerLargeValuePreviewKind::Text, None),
-        "B" => (ServerLargeValuePreviewKind::Binary, None),
-        "V" => (ServerLargeValuePreviewKind::Vector, Some("vector")),
-        "J" => (ServerLargeValuePreviewKind::Text, Some("json")),
-        "K" => (ServerLargeValuePreviewKind::Text, Some("jsonb")),
-        "S" => (ServerLargeValuePreviewKind::Text, Some("tsvector")),
-        "C" => (ServerLargeValuePreviewKind::Deferred, Some("clob")),
-        "N" => (ServerLargeValuePreviewKind::Deferred, Some("nclob")),
-        "L" => (ServerLargeValuePreviewKind::Deferred, Some("blob")),
-        "F" => (ServerLargeValuePreviewKind::Deferred, Some("bfile")),
+        "T" | "t" => (ServerLargeValuePreviewKind::Text, None),
+        "B" | "b" => (ServerLargeValuePreviewKind::Binary, None),
+        "V" | "v" => (ServerLargeValuePreviewKind::Vector, Some("vector")),
+        "J" | "j" => (ServerLargeValuePreviewKind::Text, Some("json")),
+        "K" | "k" => (ServerLargeValuePreviewKind::Text, Some("jsonb")),
+        "S" | "s" => (ServerLargeValuePreviewKind::Text, Some("tsvector")),
+        "C" | "c" => (ServerLargeValuePreviewKind::Deferred, Some("clob")),
+        "N" | "n" => (ServerLargeValuePreviewKind::Deferred, Some("nclob")),
+        "L" | "l" => (ServerLargeValuePreviewKind::Deferred, Some("blob")),
+        "F" | "f" => (ServerLargeValuePreviewKind::Deferred, Some("bfile")),
         _ => return None,
     };
     Some((source_index, Some(preview_kind), source_type))
@@ -483,9 +498,8 @@ fn truncate_server_large_value_preview(
 fn server_large_value_markers(result: &db::QueryResult) -> Vec<ServerLargeValueMarker> {
     let mut markers = Vec::new();
     for (result_index, column) in result.columns.iter().enumerate() {
-        let Some((source_index, preview_kind, source_type)) = column
-            .strip_prefix(crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX)
-            .and_then(server_large_value_alias)
+        let Some((source_index, preview_kind, source_type)) =
+            strip_large_value_marker_prefix(column).and_then(server_large_value_alias)
         else {
             continue;
         };
@@ -1277,7 +1291,9 @@ fn options_for_sequential_statements(
     db_type: Option<DatabaseType>,
 ) -> QueryExecutionOptions {
     let mut statement_options = options.clone();
-    if statement_count <= 1 || db_type != Some(DatabaseType::Kingbase) || statement_options.result_session_id.is_some()
+    if statement_count <= 1
+        || !matches!(db_type, Some(DatabaseType::Kingbase | DatabaseType::Vastbase))
+        || statement_options.result_session_id.is_some()
     {
         return statement_options;
     }
@@ -1319,6 +1335,7 @@ fn should_discard_pool_after_query_timeout(db_type: Option<DatabaseType>) -> boo
                 | DatabaseType::Weaviate
                 | DatabaseType::ChromaDb
                 | DatabaseType::InfluxDb
+                | DatabaseType::InfluxDb3
                 | DatabaseType::VictoriaMetrics
         )
 }
@@ -1657,8 +1674,7 @@ async fn sqlserver_pool_is_current(
     pool_key: &str,
     client: &Arc<tokio::sync::Mutex<db::sqlserver::SqlServerClient>>,
 ) -> bool {
-    let connections = state.connections.read().await;
-    matches!(connections.get(pool_key), Some(PoolKind::SqlServer(current)) if Arc::ptr_eq(current, client))
+    matches!(state.pool_handle(pool_key).await, Some(PoolKind::SqlServer(current)) if Arc::ptr_eq(&current, client))
 }
 
 pub fn query_timeout_duration(timeout_secs: Option<u64>) -> Option<Duration> {
@@ -1752,13 +1768,12 @@ async fn do_execute_typed(
     let operation_budget = operation_budget_for_pool_key(state, pool_key, query_timeout).await;
     let pool_db_type = connection_database_type_for_pool_key(state, pool_key).await;
     let mysql_catalog_dialect = connection_mysql_catalog_dialect_for_pool_key(state, pool_key).await;
-    let connections = state.connections.read().await;
-    let pool = connections.get(pool_key).ok_or("Connection not found")?;
+    let pool = state.pool_handle(pool_key).await.ok_or("Connection not found")?;
 
     let mut typed_agent_error = None;
     #[cfg(feature = "duckdb-sidecar")]
     let mut typed_duckdb_error = None;
-    let result: Result<db::QueryResult, String> = match pool {
+    let result: Result<db::QueryResult, String> = match &pool {
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
             let client = client.clone();
@@ -1776,7 +1791,6 @@ async fn do_execute_typed(
             let sql = sql.to_string();
             let database = database.map(str::to_string);
             let max_rows = options.max_rows;
-            drop(connections);
             match client.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
                 Ok(result) => Ok(result),
                 Err(error) => {
@@ -1798,7 +1812,6 @@ async fn do_execute_typed(
             let bare = *mode == crate::connection::MysqlMode::Bare;
             let max_rows = options.max_rows;
             let max_result_bytes = options.max_result_bytes.filter(|value| *value > 0);
-            drop(connections);
             let mut conn = match db::mysql::get_conn_with_health_check_with_cancel(
                 &p,
                 operation_budget.checkout_timeout,
@@ -1863,7 +1876,6 @@ async fn do_execute_typed(
             let prefer_text_protocol = postgres_prefers_text_protocol(pool_db_type);
             let execution_mode = options.execution_mode;
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
-            drop(connections);
             if execution_mode == QueryExecutionMode::PostgresReadOnlyTransaction {
                 db::postgres::execute_query_in_read_only_transaction_with_rollback(
                     &p,
@@ -1903,14 +1915,12 @@ async fn do_execute_typed(
         PoolKind::Sqlite(p) => {
             let p = p.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             wait_for_query_opt(cancel_token, query_timeout, db::sqlite::execute_query_with_max_rows(&p, sql, max_rows))
                 .await
         }
         PoolKind::Rqlite(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1921,7 +1931,6 @@ async fn do_execute_typed(
         PoolKind::Turso(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1932,7 +1941,6 @@ async fn do_execute_typed(
         PoolKind::CloudflareD1(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1944,7 +1952,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -1961,7 +1968,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let max_rows = options.max_rows;
             let execution_mode = options.execution_mode;
-            drop(connections);
             let (mut client, lock_wait_ms) =
                 match lock_shared_client_with_wait(&client, cancel_token.clone(), None).await {
                     Ok(value) => value,
@@ -1993,11 +1999,14 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
-                db::elasticsearch_driver::execute_rest_query(&client, &sql),
+                db::elasticsearch_driver::execute_rest_query_with_cursor(
+                    &client,
+                    &sql,
+                    options.result_session_id.as_deref(),
+                ),
             )
             .await
             .map(|result| truncate_result_with_max_rows(result, max_rows));
@@ -2010,11 +2019,14 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
-                db::easysearch_driver::execute_rest_query(&client, &sql),
+                db::easysearch_driver::execute_rest_query_with_cursor(
+                    &client,
+                    &sql,
+                    options.result_session_id.as_deref(),
+                ),
             )
             .await
             .map(|result| truncate_result_with_max_rows(result, max_rows));
@@ -2027,7 +2039,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -2044,7 +2055,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result =
                 wait_for_query_opt(cancel_token, query_timeout, db::vector_driver::execute_rest_query(&client, &sql))
                     .await
@@ -2064,7 +2074,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -2077,10 +2086,25 @@ async fn do_execute_typed(
             }
             result
         }
+        PoolKind::InfluxDb3(client) => {
+            let client = client.clone();
+            let database = pool_key.split(':').nth(1).unwrap_or("default").to_string();
+            let max_rows = options.max_rows;
+            let result = wait_for_query_opt(
+                cancel_token,
+                query_timeout,
+                db::influxdb3_driver::execute_query(&client, &database, sql, max_rows),
+            )
+            .await
+            .map(|result| truncate_result_with_max_rows(result, max_rows));
+            if matches!(result.as_ref(), Err(err) if should_discard_pool_after_error(pool_db_type, err)) {
+                state.remove_pool_by_key(pool_key).await;
+            }
+            result
+        }
         PoolKind::VictoriaMetrics(client) => {
             let client = client.clone();
             let max_rows = options.max_rows;
-            drop(connections);
             let result = wait_for_query_opt(
                 cancel_token,
                 query_timeout,
@@ -2102,7 +2126,6 @@ async fn do_execute_typed(
             let schema = schema_for_execution_context(pool_db_type, schema).map(|s| s.to_string());
             let max_rows = options.max_rows;
             let rpc_timeout = query_timeout;
-            drop(connections);
             if is_canceled(&cancel_token) {
                 return Err(canceled_error().into());
             }
@@ -2161,7 +2184,6 @@ async fn do_execute_typed(
             let database = database.unwrap_or_else(|| config.effective_database().unwrap_or("")).to_string();
             let max_rows = options.max_rows;
             let plugin_timeout = query_timeout;
-            drop(connections);
             wait_for_query_opt(cancel_token, query_timeout, async move {
                 if let Some(session_id) = options.result_session_id.as_deref() {
                     let params = external_driver_fetch_query_page_params(
@@ -2191,7 +2213,6 @@ async fn do_execute_typed(
             let client = client.clone();
             let sql = sql.to_string();
             let max_rows = options.max_rows.unwrap_or(MAX_ROWS);
-            drop(connections);
             // Keep the AWS SDK cold-path future off this already-large query dispatcher stack.
             let execution = Box::pin(db::dynamodb_driver::execute_statement(&client, &sql, max_rows));
             wait_for_query_opt(cancel_token, query_timeout, execution).await
@@ -2494,7 +2515,7 @@ fn is_external_driver_method_unsupported(error: &str, method: &str) -> bool {
             || normalized.contains("method not found"))
 }
 
-fn external_driver_query_params(
+pub(crate) fn external_driver_query_params(
     config: &crate::models::connection::ConnectionConfig,
     sql: &str,
     database: &str,
@@ -2684,8 +2705,8 @@ async fn execute_postgres_drop_database(
 
     check_read_only_for_connection(state, &pool_key, sql).await?;
     let pool = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Postgres(pool)) => pool.clone(),
             Some(_) => return Err("DROP DATABASE reconnect did not create a PostgreSQL connection".to_string()),
             None => return Err("Connection not found".to_string()),
@@ -2744,24 +2765,32 @@ pub async fn close_query_session(
     let pool_database = query_pool_database(database, catalog);
     let pool_key = state.get_or_create_pool_for_session(connection_id, pool_database, client_session_id).await?;
 
-    let connections = state.connections.read().await;
-    let pool = connections.get(&pool_key).ok_or("Connection not found")?;
+    let pool_handle = state.pool_handle(&pool_key).await;
+    let pool = pool_handle.as_ref().ok_or("Connection not found")?;
     match pool {
         PoolKind::Agent(client) => {
             let client = client.clone();
-            drop(connections);
             let mut client = client.lock().await;
             client.close_query_session(session_id).await
         }
         PoolKind::ExternalDriver { config, session, .. } => {
             let config = config.clone();
             let session = session.clone();
-            drop(connections);
             let params = external_driver_fetch_query_page_params(config.as_ref(), session_id, 1);
             session
                 .invoke::<serde_json::Value>("closeQuerySession", params)
                 .await
                 .map(|value| value.get("ok").and_then(|ok| ok.as_bool()).unwrap_or(false))
+        }
+        PoolKind::Elasticsearch(client) => {
+            let client = client.clone();
+            db::elasticsearch_driver::close_cursor(&client, session_id).await?;
+            Ok(true)
+        }
+        PoolKind::Easysearch(client) => {
+            let client = client.clone();
+            db::easysearch_driver::close_cursor(&client, session_id).await?;
+            Ok(true)
         }
         _ => Ok(false),
     }
@@ -2900,9 +2929,12 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     state.touch_pool_activity(&pool_key).await;
     let _activity_touch = state.pool_activity_touch(pool_key.as_str());
 
-    let is_sqlserver = {
-        let connections = state.connections.read().await;
-        matches!(connections.get(&pool_key), Some(PoolKind::SqlServer(_)))
+    let (is_sqlserver, is_sqlserver_agent) = {
+        match state.pool_handle(&pool_key).await {
+            Some(PoolKind::SqlServer(_)) => (true, false),
+            Some(PoolKind::Agent(_)) if db_type == Some(DatabaseType::SqlServer) => (false, true),
+            _ => (false, false),
+        }
     };
 
     if is_sqlserver {
@@ -2935,10 +2967,7 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
         );
     }
 
-    let execution_plan = db_type.map_or_else(
-        || crate::sql::SqlExecutionPlan { statements: split_sql_statements(sql), stop_on_error: false },
-        |db_type| crate::sql::sql_execution_plan_for_database(sql, db_type),
-    );
+    let execution_plan = query_execution_plan(sql, db_type, is_sqlserver_agent);
     let continue_on_error = options.continue_on_error && !execution_plan.stop_on_error;
     let statements = execution_plan.statements;
     if statements.is_empty() {
@@ -2961,8 +2990,8 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     }
 
     let mysql_pool = {
-        let connections = state.connections.read().await;
-        match connections.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Mysql(pool, mode)) => Some((pool.clone(), *mode)),
             _ => None,
         }
@@ -3016,10 +3045,9 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
         .map_err(Into::into);
     }
 
-    // Kingbase Go keeps one physical connection per Agent session, so an open
-    // result cursor prevents the next statement from acquiring that connection.
-    // Multi-result execution therefore reads a bounded first page for each
-    // Kingbase statement without retaining cursors.
+    // Some Agent drivers cannot execute another statement while a paged result
+    // cursor remains open on the same physical connection. Multi-result execution
+    // therefore reads a bounded first page without retaining those cursors.
     let statement_options = options_for_sequential_statements(&options, statements.len(), db_type);
     let mut results = Vec::with_capacity(statements.len());
     for (statement_index, stmt) in statements.iter().enumerate() {
@@ -3076,6 +3104,21 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     }
 
     Ok(results)
+}
+
+fn query_execution_plan(
+    sql: &str,
+    db_type: Option<DatabaseType>,
+    preserve_sqlserver_batches: bool,
+) -> crate::sql::SqlExecutionPlan {
+    if preserve_sqlserver_batches && db_type == Some(DatabaseType::SqlServer) {
+        return crate::sql::SqlExecutionPlan { statements: split_sql_batches(sql), stop_on_error: false };
+    }
+
+    db_type.map_or_else(
+        || crate::sql::SqlExecutionPlan { statements: split_sql_statements(sql), stop_on_error: false },
+        |db_type| crate::sql::sql_execution_plan_for_database(sql, db_type),
+    )
 }
 
 fn single_statement_multi_result(
@@ -3542,13 +3585,12 @@ async fn execute_multi_sqlserver(
             break;
         }
 
-        let connections = state.connections.read().await;
-        let pool = connections.get(pool_key).ok_or("Connection not found")?;
+        let pool_handle = state.pool_handle(pool_key).await;
+        let pool = pool_handle.as_ref().ok_or("Connection not found")?;
         let client = match pool {
             PoolKind::SqlServer(c) => c.clone(),
             _ => return Err("Expected SQL Server connection".to_string()),
         };
-        drop(connections);
 
         let (mut client_guard, lock_wait_ms) =
             match lock_shared_client_with_wait(&client, cancel_token.clone(), query_timeout).await {
@@ -3645,8 +3687,8 @@ pub async fn execute_statements(
     let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
 
     let agent_client = {
-        let conns = state.connections.read().await;
-        match conns.get(&pool_key) {
+        let pool_handle = state.pool_handle(&pool_key).await;
+        match pool_handle.as_ref() {
             Some(PoolKind::Agent(client)) => Some(client.clone()),
             _ => None,
         }
@@ -3889,6 +3931,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::Meilisearch(_)
         | PoolKind::VectorDb(_)
         | PoolKind::InfluxDb(_)
+        | PoolKind::InfluxDb3(_)
         | PoolKind::VictoriaMetrics(_)
         | PoolKind::ExternalDriver { .. } => false,
         #[cfg(feature = "mq-admin")]
@@ -3993,10 +4036,8 @@ pub async fn execute_schema_diff_deploy(
             }
         }
     };
-    let has_transactional_path = {
-        let conns = state.connections.read().await;
-        conns.get(&pool_key).is_some_and(pool_kind_has_transactional_path)
-    };
+    let has_transactional_path =
+        { state.pool_handle(&pool_key).await.as_ref().is_some_and(pool_kind_has_transactional_path) };
     let atomicity = classify_schema_diff_atomicity(db_type, &parsed, has_transactional_path);
 
     match execute_statements_in_transaction_on_pool(state, &pool_key, connection_id, database, &parsed, schema, None)
@@ -4136,8 +4177,7 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
 
     // Clone the pool handle within the lock, then drop it before any async work.
     let path = {
-        let conns = state.connections.read().await;
-        conns.get(pool_key).map(|p| match p {
+        state.pool_handle(pool_key).await.as_ref().map(|p| match p {
             PoolKind::Postgres(pg) => TxPath::Pg(pg.clone()),
             PoolKind::Mysql(mp, _mode) => TxPath::Mysql(mp.clone(), false),
             PoolKind::Sqlite(sq) => TxPath::Sqlite(sq.clone()),
@@ -4158,6 +4198,7 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
             | PoolKind::Meilisearch(_)
             | PoolKind::VectorDb(_)
             | PoolKind::InfluxDb(_)
+            | PoolKind::InfluxDb3(_)
             | PoolKind::VictoriaMetrics(_)
             | PoolKind::ExternalDriver { .. } => TxPath::None,
         })
@@ -4681,8 +4722,8 @@ async fn begin_transaction_session(
         ExternalDriver,
     }
     let pool_handle = {
-        let connections = state.connections.read().await;
-        match connections.get(&probe_pool_key).ok_or("Connection not found")? {
+        let pool = state.pool_handle(&probe_pool_key).await.ok_or("Connection not found")?;
+        match &pool {
             PoolKind::Postgres(pg) => TxnPoolHandle::Postgres(pg.clone()),
             PoolKind::Mysql(mp, _) => TxnPoolHandle::Mysql(mp.clone()),
             PoolKind::Agent(_) if !consistent_snapshot => TxnPoolHandle::Agent,
@@ -4730,15 +4771,15 @@ async fn begin_transaction_session(
             if !syntax_errors.is_empty() {
                 return Err(format!("START TRANSACTION failed for all compatible forms: {}", syntax_errors.join("; ")));
             }
-            (TxnConnection::Mysql(conn), probe_pool_key.clone())
+            (TxnConnection::Mysql(Some(conn)), probe_pool_key.clone())
         }
         TxnPoolHandle::Agent => {
             let client_session_id = format!("manual-txn-{}", uuid::Uuid::new_v4());
             let agent_pool_key =
                 state.get_or_create_pool_for_session(connection_id, pool_database, Some(&client_session_id)).await?;
             let client = {
-                let connections = state.connections.read().await;
-                match connections.get(&agent_pool_key) {
+                let pool_handle = state.pool_handle(&agent_pool_key).await;
+                match pool_handle.as_ref() {
                     Some(PoolKind::Agent(client)) => client.clone(),
                     _ => {
                         let _ = state.close_client_session_pool(connection_id, pool_database, &client_session_id).await;
@@ -4775,8 +4816,8 @@ async fn begin_transaction_session(
             let external_pool_key =
                 state.get_or_create_pool_for_session(connection_id, pool_database, Some(&client_session_id)).await?;
             let (config, session) = {
-                let connections = state.connections.read().await;
-                match connections.get(&external_pool_key) {
+                let pool_handle = state.pool_handle(&external_pool_key).await;
+                match pool_handle.as_ref() {
                     Some(PoolKind::ExternalDriver { config, session, .. }) => (config.clone(), session.clone()),
                     _ => {
                         let _ = state.close_client_session_pool(connection_id, pool_database, &client_session_id).await;
@@ -5052,7 +5093,14 @@ pub async fn execute_in_manual_transaction_with_options(
             TxnConnection::Postgres(conn) => {
                 execute_manual_txn_postgres_statement(conn.as_ref(), statement, row_limit).await
             }
-            TxnConnection::Mysql(conn) => execute_manual_txn_mysql_statement(conn, statement, row_limit).await,
+            TxnConnection::Mysql(conn) => {
+                execute_manual_txn_mysql_statement(
+                    conn.as_mut().ok_or_else(|| MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR.to_string())?,
+                    statement,
+                    row_limit,
+                )
+                .await
+            }
             TxnConnection::Agent { client, .. } => {
                 execute_manual_txn_agent_statement(
                     client,
@@ -5215,45 +5263,85 @@ where
                 Err(error) => Err(error),
             }
         }
-        TxnConnection::Mysql(conn) => match conn.query_iter(sql).await {
-            Ok(mut result) => match result.stream::<mysql_async::Row>().await {
-                Ok(Some(mut stream)) => {
-                    let mut batch = Vec::with_capacity(batch_size);
-                    let mut total_rows = 0_u64;
-                    let mut error = None;
-                    while let Some(row_result) = stream.next().await {
-                        match row_result {
-                            Ok(row) => {
-                                batch.push(
-                                    (0..row.len()).map(|index| db::mysql::mysql_value_to_json(&row, index)).collect(),
-                                );
-                                total_rows += 1;
-                                if batch.len() >= batch_size {
-                                    if let Err(err) = on_batch(std::mem::take(&mut batch)) {
-                                        error = Some(err);
+        TxnConnection::Mysql(Some(conn)) => {
+            let query_result = match cancel_token.as_ref() {
+                Some(cancel_token) => {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => Err(QUERY_CANCELED.to_string()),
+                        result = conn.query_iter(sql) => result.map_err(|error| format!("Query failed: {error}")),
+                    }
+                }
+                None => conn.query_iter(sql).await.map_err(|error| format!("Query failed: {error}")),
+            };
+            match query_result {
+                Ok(mut result) => {
+                    let stream_result = match cancel_token.as_ref() {
+                        Some(cancel_token) => {
+                            tokio::select! {
+                                _ = cancel_token.cancelled() => Err(QUERY_CANCELED.to_string()),
+                                stream = result.stream::<mysql_async::Row>() => stream.map_err(|error| format!("Query failed: {error}")),
+                            }
+                        }
+                        None => {
+                            result.stream::<mysql_async::Row>().await.map_err(|error| format!("Query failed: {error}"))
+                        }
+                    };
+                    match stream_result {
+                        Ok(Some(mut stream)) => {
+                            let mut batch = Vec::with_capacity(batch_size);
+                            let mut total_rows = 0_u64;
+                            let mut error = None;
+                            loop {
+                                let next_row = match cancel_token.as_ref() {
+                                    Some(cancel_token) => {
+                                        tokio::select! {
+                                            _ = cancel_token.cancelled() => {
+                                                error = Some(QUERY_CANCELED.to_string());
+                                                break;
+                                            }
+                                            row = stream.next() => row,
+                                        }
+                                    }
+                                    None => stream.next().await,
+                                };
+                                let Some(row_result) = next_row else { break };
+                                match row_result {
+                                    Ok(row) => {
+                                        batch.push(
+                                            (0..row.len())
+                                                .map(|index| db::mysql::mysql_value_to_json(&row, index))
+                                                .collect(),
+                                        );
+                                        total_rows += 1;
+                                        if batch.len() >= batch_size {
+                                            if let Err(err) = on_batch(std::mem::take(&mut batch)) {
+                                                error = Some(err);
+                                                break;
+                                            }
+                                            batch = Vec::with_capacity(batch_size);
+                                        }
+                                    }
+                                    Err(err) => {
+                                        error = Some(format!("Query failed: {err}"));
                                         break;
                                     }
-                                    batch = Vec::with_capacity(batch_size);
                                 }
                             }
-                            Err(err) => {
-                                error = Some(format!("Query failed: {err}"));
-                                break;
+                            if error.is_none() && !batch.is_empty() {
+                                if let Err(err) = on_batch(batch) {
+                                    error = Some(err);
+                                }
                             }
+                            error.map_or(Ok(total_rows), Err)
                         }
+                        Ok(None) => Err("Empty result set stream".to_string()),
+                        Err(error) => Err(error),
                     }
-                    if error.is_none() && !batch.is_empty() {
-                        if let Err(err) = on_batch(batch) {
-                            error = Some(err);
-                        }
-                    }
-                    error.map_or(Ok(total_rows), Err)
                 }
-                Ok(None) => Err("Empty result set stream".to_string()),
-                Err(err) => Err(format!("Query failed: {err}")),
-            },
-            Err(err) => Err(format!("Query failed: {err}")),
-        },
+                Err(error) => Err(error),
+            }
+        }
+        TxnConnection::Mysql(None) => Err(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR.to_string()),
         TxnConnection::Agent { .. } => {
             Err("Streaming rows inside an agent manual transaction is not supported".to_string())
         }
@@ -5268,9 +5356,12 @@ where
             sessions.remove(txn_session_id)
         };
         if let Some(session) = removed {
-            let rollback_result =
+            let rollback_result = if err == QUERY_CANCELED {
+                discard_mysql_manual_txn_connection(&mut conn, operation_budget.cleanup_timeout).await
+            } else {
                 rollback_manual_txn_connection_with_postgres_timeout(&mut conn, Some(operation_budget.cleanup_timeout))
-                    .await;
+                    .await
+            };
             release_manual_txn_session_pool(state, &session.connection_id, &mut conn).await;
             if let Err(rollback_error) = rollback_result {
                 return Err(format!("{err}. Transaction cleanup failed: {rollback_error}"));
@@ -5314,9 +5405,10 @@ async fn rollback_manual_txn_connection_with_postgres_timeout(
                 conn.execute_typed("ROLLBACK", &[]).await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
             }
         }
-        TxnConnection::Mysql(conn) => {
+        TxnConnection::Mysql(Some(conn)) => {
             conn.query_drop("ROLLBACK").await.map_err(|e| format!("ROLLBACK failed: {e}"))?;
         }
+        TxnConnection::Mysql(None) => return Ok(()),
         TxnConnection::Agent { client, .. } => {
             let mut locked = client.lock().await;
             match locked.rollback_manual_transaction::<serde_json::Value>().await {
@@ -5344,6 +5436,24 @@ async fn rollback_manual_txn_connection_with_postgres_timeout(
         }
     }
     Ok(())
+}
+
+/// A cancelled MySQL row stream may still have unread result packets.  Do not
+/// send ROLLBACK on that connection: mysql_async only consumes a dropped stream
+/// when the next result set is requested.  Discarding the dedicated connection
+/// makes MySQL roll the transaction back and prevents protocol desynchronization.
+async fn discard_mysql_manual_txn_connection(conn: &mut TxnConnection, timeout: Duration) -> Result<(), String> {
+    let TxnConnection::Mysql(conn) = conn else {
+        return rollback_manual_txn_connection_with_postgres_timeout(conn, Some(timeout)).await;
+    };
+    let Some(conn) = conn.take() else {
+        return Ok(());
+    };
+    match tokio::time::timeout(timeout, conn.disconnect()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(format!("Failed to discard cancelled MySQL connection: {error}")),
+        Err(_) => Err(format!("Discarding cancelled MySQL connection timed out after {} seconds", timeout.as_secs())),
+    }
 }
 
 async fn release_manual_txn_session_pool(state: &AppState, connection_id: &str, conn: &mut TxnConnection) {
@@ -5608,9 +5718,10 @@ pub async fn commit_manual_transaction(state: &AppState, txn_session_id: &str) -
         TxnConnection::Postgres(conn) => {
             conn.execute_typed("COMMIT", &[]).await.map_err(|e| format!("COMMIT failed: {e}"))?;
         }
-        TxnConnection::Mysql(conn) => {
+        TxnConnection::Mysql(Some(conn)) => {
             conn.query_drop("COMMIT").await.map_err(|e| format!("COMMIT failed: {e}"))?;
         }
+        TxnConnection::Mysql(None) => return Err(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR.to_string()),
         TxnConnection::Agent { client, .. } => {
             let mut locked = client.lock().await;
             locked
@@ -6090,7 +6201,11 @@ for line in sys.stdin:
         let client = db::dynamodb_driver::connect(&config, host, config.port).unwrap();
         db::dynamodb_driver::test_connection(&client, Duration::from_secs(5)).await.unwrap();
         state.configs.write().await.insert(config.id.clone(), config.clone());
-        state.connections.write().await.insert(config.id.clone(), PoolKind::DynamoDb(client));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(config.id.clone(), PoolKind::DynamoDb(client));
+            })
+            .await;
 
         let results = execute_multi_core_with_options_for_client_and_progress_typed(
             &state,
@@ -6110,6 +6225,88 @@ for line in sys.stdin:
         let serialized = serde_json::to_string(&results).unwrap();
         assert!(!serialized.is_empty());
 
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    async fn sqlserver_agent_echo_state(
+    ) -> (AppState, std::path::PathBuf, std::sync::Arc<crate::db::agent_driver::AgentRuntimeClient>) {
+        let dir = std::env::temp_dir().join(format!("dbx-query-sqlserver-agent-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script_path = dir.join("agent.py");
+        std::fs::write(
+            &script_path,
+            r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    if req['method'] == 'handshake':
+        result = {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session']}
+    elif req['method'] == 'execute_query':
+        result = {
+            'columns': ['sql'], 'column_types': ['nvarchar'], 'column_sortables': [],
+            'rows': [[req['params']['sql']]], 'affected_rows': 0, 'execution_time_ms': 1,
+            'truncated': False, 'session_id': None, 'has_more': False
+        }
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+"#,
+        )
+        .unwrap();
+
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let runtime = crate::db::agent_driver::AgentRuntimeClient::spawn(
+            crate::db::agent_driver::AgentLaunchSpec::new(python)
+                .with_args([script_path.to_string_lossy().to_string()]),
+            "test",
+        )
+        .await
+        .unwrap();
+        runtime.increment_session_count();
+
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        state.configs.write().await.insert("conn-1".to_string(), test_connection_config(DatabaseType::SqlServer));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "conn-1".to_string(),
+                    PoolKind::agent(crate::db::agent_driver::AgentDriverClient::shared_session(
+                        runtime.clone(),
+                        "session-1".to_string(),
+                    )),
+                );
+            })
+            .await;
+
+        (state, dir, runtime)
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_multi_execution_sends_table_variable_script_as_one_batch() {
+        let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+        let sql = "DECLARE @TargetTables TABLE (TableName NVARCHAR(128));\n\
+                   INSERT INTO @TargetTables VALUES ('Bill_Record');\n\
+                   SELECT TableName FROM @TargetTables;";
+
+        let results = execute_multi_core_with_options_for_client_and_progress_typed(
+            &state,
+            "conn-1",
+            "",
+            sql,
+            None,
+            None,
+            QueryExecutionOptions::default(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].result.rows, vec![vec![serde_json::Value::String(sql.to_string())]]);
+
+        runtime.kill();
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6169,13 +6366,17 @@ for line in sys.stdin:
         let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
         let state = AppState::new(storage);
         state.configs.write().await.insert("conn-1".to_string(), test_connection_config(DatabaseType::Dameng));
-        state.connections.write().await.insert(
-            "conn-1".to_string(),
-            PoolKind::agent(crate::db::agent_driver::AgentDriverClient::shared_session(
-                runtime.clone(),
-                "session-1".to_string(),
-            )),
-        );
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "conn-1".to_string(),
+                    PoolKind::agent(crate::db::agent_driver::AgentDriverClient::shared_session(
+                        runtime.clone(),
+                        "session-1".to_string(),
+                    )),
+                );
+            })
+            .await;
 
         (state, dir, runtime)
     }
@@ -6187,7 +6388,7 @@ for line in sys.stdin:
         let error = execute_sql_statement(&state, "conn-1", "", "SELECT 1", None, None).await.unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.connections.read().await.contains_key("conn-1"));
+        assert!(!state.pool_handle("conn-1").await.is_some());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -6225,7 +6426,11 @@ for line in sys.stdin:
         let state = AppState::new(storage);
         let connection_id = "sqlite-cancel";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
-        state.connections.write().await.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
         state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Sqlite));
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
@@ -6309,7 +6514,7 @@ for line in sys.stdin:
         .unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.connections.read().await.contains_key("conn-1"));
+        assert!(!state.pool_handle("conn-1").await.is_some());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -6326,7 +6531,7 @@ for line in sys.stdin:
                 .unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.connections.read().await.contains_key("conn-1"));
+        assert!(!state.pool_handle("conn-1").await.is_some());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -6340,7 +6545,7 @@ for line in sys.stdin:
         let error = execute_sql_statement(&state, "conn-1", "", "SELECT 1", None, None).await.unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.connections.read().await.contains_key("conn-1"));
+        assert!(!state.pool_handle("conn-1").await.is_some());
         assert!(!runtime.is_failed());
 
         runtime.kill();
@@ -6401,7 +6606,11 @@ for line in sys.stdin:
         let state = AppState::new(storage);
         let connection_id = "sqlite-batch";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
-        state.connections.write().await.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
         state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Sqlite));
 
         let sql = if failure_first {
@@ -6497,7 +6706,11 @@ for line in sys.stdin:
         let state = AppState::new(storage);
         let connection_id = "gaussdb-on-error-stop";
         let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
-        state.connections.write().await.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
         state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Gaussdb));
 
         let results = execute_multi_core_with_options(
@@ -7199,6 +7412,33 @@ for line in sys.stdin:
         assert_eq!(serialized.get("server_message"), Some(&serde_json::Value::Bool(true)));
     }
 
+    #[test]
+    fn sqlserver_agent_execution_plan_preserves_table_variable_batch() {
+        let sql = "DECLARE @TargetTables TABLE (TableName NVARCHAR(128));\n\
+                   INSERT INTO @TargetTables VALUES ('Bill_Record');\n\
+                   SELECT TableName FROM @TargetTables;";
+
+        let plan = query_execution_plan(sql, Some(DatabaseType::SqlServer), true);
+
+        assert_eq!(plan.statements, vec![sql]);
+    }
+
+    #[test]
+    fn sqlserver_agent_execution_plan_splits_only_on_go() {
+        let sql = "DECLARE @x TABLE (id INT);\nINSERT INTO @x VALUES (1);\nGO\nSELECT 2;";
+
+        let plan = query_execution_plan(sql, Some(DatabaseType::SqlServer), true);
+
+        assert_eq!(plan.statements, vec!["DECLARE @x TABLE (id INT);\nINSERT INTO @x VALUES (1);", "SELECT 2;"]);
+    }
+
+    #[test]
+    fn ordinary_agent_execution_plan_still_splits_semicolon_statements() {
+        let plan = query_execution_plan("SELECT 1; SELECT 2;", Some(DatabaseType::Dameng), false);
+
+        assert_eq!(plan.statements, vec!["SELECT 1", "SELECT 2"]);
+    }
+
     // Regression test for #6097: SQL Server queries share a single mutex-guarded
     // connection (see PoolKind::SqlServer), so a fast query can queue for seconds
     // behind another operation (e.g. autocomplete/schema metadata) holding that
@@ -7641,14 +7881,18 @@ for line in sys.stdin:
         let client_session_id = "manual-txn-test";
         let pool_key = "jdbc-conn:session:manual-txn-test";
         let config = Arc::new(config);
-        state.connections.write().await.insert(
-            pool_key.to_string(),
-            PoolKind::ExternalDriver {
-                driver_id: "jdbc".to_string(),
-                config: config.clone(),
-                session: session.clone(),
-            },
-        );
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    pool_key.to_string(),
+                    PoolKind::ExternalDriver {
+                        driver_id: "jdbc".to_string(),
+                        config: config.clone(),
+                        session: session.clone(),
+                    },
+                );
+            })
+            .await;
         let cleanup_guard =
             state.workload_session_pool_cleanup_guard("jdbc-conn", Some("dbx_test"), client_session_id).await.unwrap();
         state.transaction_sessions.write().await.insert(
@@ -7674,7 +7918,7 @@ for line in sys.stdin:
             execute_in_manual_transaction(&state, "txn-test", "SELECT 42", "dbx_test", None, Some(10)).await.unwrap();
         assert_eq!(results[0].rows, vec![vec![serde_json::json!(42)]]);
         commit_manual_transaction(&state, "txn-test").await.unwrap();
-        assert!(!state.connections.read().await.contains_key(pool_key));
+        assert!(!state.pool_handle(pool_key).await.is_some());
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
             "beginManualTransaction\nexecuteInManualTransaction\ncommitManualTransaction\n"
@@ -8713,12 +8957,14 @@ for line in sys.stdin:
             ..Default::default()
         };
 
-        let adjusted = options_for_sequential_statements(&options, 2, Some(DatabaseType::Kingbase));
+        for db_type in [DatabaseType::Kingbase, DatabaseType::Vastbase] {
+            let adjusted = options_for_sequential_statements(&options, 2, Some(db_type));
 
-        assert_eq!(adjusted.page_size, None);
-        assert_eq!(adjusted.max_rows, Some(100));
-        assert_eq!(adjusted.fetch_size, Some(100));
-        assert_eq!(adjusted.timeout_secs, Some(30));
+            assert_eq!(adjusted.page_size, None);
+            assert_eq!(adjusted.max_rows, Some(100));
+            assert_eq!(adjusted.fetch_size, Some(100));
+            assert_eq!(adjusted.timeout_secs, Some(30));
+        }
     }
 
     #[test]
@@ -8875,6 +9121,72 @@ for line in sys.stdin:
                 column_index: 1,
                 original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_lowercased_server_large_value_markers_from_case_folding_servers() {
+        // KingbaseES instances with case-insensitive identifiers return even
+        // quoted marker aliases folded to lowercase; the markers must still be
+        // consumed and stripped instead of leaking into the data grid.
+        let mut result = db::QueryResult {
+            columns: vec![
+                "id".to_string(),
+                "payload".to_string(),
+                "__dbx_large_value_bytes_t_1".to_string(),
+                "note".to_string(),
+                "__dbx_large_value_bytes_t_2".to_string(),
+            ],
+            column_types: vec![
+                "integer".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+                "text".to_string(),
+            ],
+            column_sortables: vec![true; 5],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![
+                vec![
+                    serde_json::json!(1),
+                    serde_json::json!("长文本预览内容"),
+                    serde_json::json!("T:4"),
+                    serde_json::json!("abcdefgh"),
+                    serde_json::json!("T:4"),
+                ],
+                vec![
+                    serde_json::json!(2),
+                    serde_json::json!("短值"),
+                    serde_json::json!("T:4"),
+                    serde_json::json!("b"),
+                    serde_json::json!("T:4"),
+                ],
+            ],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
+        };
+
+        let cells = extract_server_large_value_markers(&mut result);
+
+        assert_eq!(result.columns, vec!["id", "payload", "note"]);
+        assert_eq!(result.column_types, vec!["integer", "text", "text"]);
+        assert_eq!(
+            result.rows[0],
+            vec![serde_json::json!(1), serde_json::json!("长文本预..."), serde_json::json!("abcd...")]
+        );
+        assert_eq!(result.rows[1], vec![serde_json::json!(2), serde_json::json!("短值"), serde_json::json!("b")]);
+        assert_eq!(
+            cells,
+            vec![
+                db::LargeValueCell { row_index: 0, column_index: 1, original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES },
+                db::LargeValueCell { row_index: 0, column_index: 2, original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES },
+            ]
         );
     }
 

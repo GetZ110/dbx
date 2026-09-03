@@ -103,6 +103,8 @@ export interface UseDataGridEditorOptions {
   canEditExistingRows?: ComputedRef<boolean>;
   onExecuteSql: ComputedRef<((sql: string) => Promise<void>) | undefined>;
   customSaveHandler?: ComputedRef<CustomSaveHandler | undefined>;
+  manualTransactionSessionId?: ComputedRef<string | undefined>;
+  onManualTransactionMutation?: () => void;
   sql: ComputedRef<string | undefined>;
   searchText: Ref<string>;
   whereFilterInput: Ref<string>;
@@ -219,6 +221,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     canEditExistingRows = computed(() => true),
     onExecuteSql,
     customSaveHandler,
+    manualTransactionSessionId = computed(() => undefined),
     sql,
     searchText,
     orderByInput,
@@ -272,7 +275,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
         if (value !== baseline[column]) edited.add(column);
       });
     }
-    return allocateNewRowMeta(null, sourceIndex, [...edited]);
+    const placement = item.isNew && item.newIndex !== undefined ? (inherited ? { anchorId: -inherited.token, position: "below" as const } : null) : sourceIndex === undefined ? null : { anchorId: sourceIndex, position: "below" as const };
+    return allocateNewRowMeta(placement, sourceIndex, [...edited]);
   }
   // Restore a metadata snapshot and resume token allocation past its maximum so
   // newly created rows never collide with tokens held by restored rows (a fresh
@@ -1218,7 +1222,8 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     pushUndoSnapshot();
     rowStatusFilter.value = rowStatusFilterAfterAddingRow(rowStatusFilter.value);
     newRows.value.push(clonedData);
-    newRowMeta.value.push(clonedRowMeta(item, clonedData));
+    const clonedMeta = clonedRowMeta(item, clonedData);
+    newRowMeta.value.push(clonedMeta);
     newRows.value = [...newRows.value];
     newRowMeta.value = [...newRowMeta.value];
     touchPendingChanges();
@@ -1228,7 +1233,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     const newRowId = -newRows.value.length;
     nextTick(() => {
       const el = getScrollerElement();
-      if (el) el.scrollTop = el.scrollHeight;
+      if (clonedMeta.placement === null && el) el.scrollTop = el.scrollHeight;
       startEdit(newRowId, initialEditColumn?.value ?? 0);
     });
   }
@@ -1816,8 +1821,19 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
       statements: stmts,
       rollbackStatements: rollbackStmts,
     });
-
-    if (useTransaction.value && stmts.length > 1 && hasBackendSaveTarget.value) {
+    if (manualTransactionSessionId.value && hasBackendSaveTarget.value) {
+      options.onManualTransactionMutation?.();
+      try {
+        const results = await api.executeInManualTransaction(manualTransactionSessionId.value, stmts.join(";\n"), database.value ?? "", preparedSave?.executionSchema);
+        apiResult = {
+          affected_rows: results.reduce((total, result) => total + (result.affected_rows ?? 0), 0),
+        };
+      } catch (e: any) {
+        saveError.value = await recordFailedDataGridHistory(stmts, rollbackStmts, start, snapshot, e);
+        await finishInterruptedSaveChanges(snapshot);
+        return;
+      }
+    } else if (useTransaction.value && stmts.length > 1 && hasBackendSaveTarget.value) {
       try {
         apiResult = await api.executeInTransaction(connectionId.value!, database.value ?? "", stmts, preparedSave?.executionSchema);
       } catch (e: any) {
@@ -1852,7 +1868,7 @@ export function useDataGridEditor(options: UseDataGridEditorOptions) {
     applyDirtyRowsToResult(snapshot);
     options.onResultPayloadMutated?.();
     let savedRowsRefreshed = false;
-    if (!shouldReloadAfterSave && snapshot.dirtyRows.size > 0 && options.refreshSavedRows) {
+    if (!manualTransactionSessionId.value && !shouldReloadAfterSave && snapshot.dirtyRows.size > 0 && options.refreshSavedRows) {
       try {
         savedRowsRefreshed = await options.refreshSavedRows({
           dirtyRows: snapshot.dirtyRows,

@@ -1,4 +1,4 @@
-import { computed, ref, type Ref } from "vue";
+import { computed, nextTick, ref, type Ref } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { clearDataGridPendingSnapshot, DATA_GRID_QUICK_ENTRY_DRAFT_ROW_ID, useDataGridEditor } from "@/composables/useDataGridEditor";
 import type { CellValue } from "@/lib/dataGrid/cellValue";
@@ -10,6 +10,7 @@ const mocks = vi.hoisted(() => ({
   executeConditionalUpdate: vi.fn(),
   cancelConditionalUpdate: vi.fn(),
   executeInTransaction: vi.fn(),
+  executeInManualTransaction: vi.fn(),
   addHistory: vi.fn(),
 }));
 
@@ -19,6 +20,7 @@ vi.mock("@/lib/backend/api", () => ({
   executeConditionalUpdate: mocks.executeConditionalUpdate,
   cancelConditionalUpdate: mocks.cancelConditionalUpdate,
   executeInTransaction: mocks.executeInTransaction,
+  executeInManualTransaction: mocks.executeInManualTransaction,
   unlockConnectionWrites: vi.fn(),
   lockConnectionWrites: vi.fn(),
   connectionWriteUnlockState: vi.fn().mockResolvedValue(0),
@@ -514,6 +516,69 @@ describe("useDataGridEditor appendPastedRowsToNewRow", () => {
 
     expect(editor.newRows.value[1]).toEqual(["Ada", "full payload", "Lovelace"]);
   });
+
+  it("places a cloned source row below its source row", () => {
+    const editor = createEditor(undefined, true, undefined, undefined, [
+      ["Ada", null, "Lovelace"],
+      ["Grace", null, "Hopper"],
+    ]);
+    editor.newRows.value = [];
+    editor.newRowMeta.value = [];
+
+    editor.cloneRow(1);
+
+    expect(editor.newRowMeta.value[0]?.placement).toEqual({ anchorId: 1, position: "below" });
+  });
+
+  it("keeps the scroll position when the cloned row anchors below its source row", async () => {
+    class ScrollerStub {
+      scrollTop = 0;
+      scrollHeight = 4_000;
+    }
+    vi.stubGlobal("HTMLElement", ScrollerStub);
+    const editor = createEditor(undefined, true, undefined, undefined, [
+      ["Ada", null, "Lovelace"],
+      ["Grace", null, "Hopper"],
+    ]);
+    editor.newRows.value = [];
+    editor.newRowMeta.value = [];
+    const scroller = new ScrollerStub();
+    editor.scrollerRef.value = scroller as unknown as NonNullable<typeof editor.scrollerRef.value>;
+
+    editor.cloneRow(1);
+    await nextTick();
+    vi.unstubAllGlobals();
+
+    expect(editor.newRowMeta.value[0]?.placement).toEqual({ anchorId: 1, position: "below" });
+    expect(scroller.scrollTop).toBe(0);
+  });
+
+  it("places a cloned pending row below the pending source row", () => {
+    const editor = createEditor();
+    editor.newRows.value = [];
+    editor.newRowMeta.value = [];
+    editor.addRows(1);
+
+    editor.cloneRow(-1);
+
+    expect(editor.newRowMeta.value[1]?.placement).toEqual({ anchorId: -1, position: "below" });
+  });
+
+  it("places each multi-row clone below its corresponding source row", () => {
+    const editor = createEditor(undefined, true, undefined, undefined, [
+      ["Ada", null, "Lovelace"],
+      ["Grace", null, "Hopper"],
+    ]);
+    editor.newRows.value = [];
+    editor.newRowMeta.value = [];
+
+    editor.cloneRows([1, 0]);
+
+    expect(editor.newRowMeta.value.map((meta) => meta.placement)).toEqual([
+      { anchorId: 1, position: "below" },
+      { anchorId: 0, position: "below" },
+    ]);
+  });
 });
 
 describe("useDataGridEditor saveChanges reload", () => {
@@ -523,11 +588,21 @@ describe("useDataGridEditor saveChanges reload", () => {
     mocks.executeConditionalUpdate.mockReset();
     mocks.cancelConditionalUpdate.mockReset();
     mocks.executeInTransaction.mockReset();
+    mocks.executeInManualTransaction.mockReset();
     mocks.addHistory.mockReset();
     mocks.getConfig.mockReset();
   });
 
-  function createSaveTestEditor(options: { currentPage?: Ref<number>; prepareFullReload?: () => void; customSaveHandler?: { save: ReturnType<typeof vi.fn> } } = {}) {
+  function createSaveTestEditor(
+    options: {
+      currentPage?: Ref<number>;
+      prepareFullReload?: () => void;
+      customSaveHandler?: { save: ReturnType<typeof vi.fn> };
+      manualTransactionSessionId?: string;
+      refreshSavedRows?: ReturnType<typeof vi.fn>;
+      onManualTransactionMutation?: ReturnType<typeof vi.fn>;
+    } = {},
+  ) {
     const emit = vi.fn();
     const currentPage = options.currentPage ?? ref(1);
     const result = ref<{ columns: string[]; rows: CellValue[][] }>({
@@ -554,6 +629,8 @@ describe("useDataGridEditor saveChanges reload", () => {
       sourceColumns: computed(() => undefined),
       onExecuteSql: computed(() => undefined),
       customSaveHandler: computed(() => options.customSaveHandler),
+      manualTransactionSessionId: computed(() => options.manualTransactionSessionId),
+      onManualTransactionMutation: options.onManualTransactionMutation,
       sql: computed(() => undefined),
       searchText: ref(""),
       whereFilterInput: ref(""),
@@ -566,6 +643,7 @@ describe("useDataGridEditor saveChanges reload", () => {
       cacheKey: computed(() => undefined),
       getRowItem: () => undefined,
       prepareFullReload: options.prepareFullReload,
+      refreshSavedRows: options.refreshSavedRows,
       emit,
     });
     return { editor, emit, currentPage };
@@ -582,6 +660,39 @@ describe("useDataGridEditor saveChanges reload", () => {
 
     expect(mocks.executeBatch).toHaveBeenCalledTimes(1);
     expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+  });
+
+  it("saves query-result edits through the active manual transaction session", async () => {
+    const statement = "UPDATE orders_test SET status='shipped' WHERE id=1";
+    const refreshSavedRows = vi.fn().mockResolvedValue(true);
+    const onManualTransactionMutation = vi.fn();
+    mocks.prepareDataGridSave.mockResolvedValue({ statements: [statement], rollbackStatements: [] });
+    mocks.executeInManualTransaction.mockResolvedValue([{ affected_rows: 1 }]);
+
+    const { editor, emit } = createSaveTestEditor({ manualTransactionSessionId: "txn-session-1", refreshSavedRows, onManualTransactionMutation });
+    editor.dirtyRows.value.set(0, new Map([[1, "shipped"]]));
+
+    await editor.saveChanges();
+
+    expect(mocks.executeInManualTransaction).toHaveBeenCalledWith("txn-session-1", statement, "app", undefined);
+    expect(onManualTransactionMutation).toHaveBeenCalledTimes(1);
+    expect(mocks.executeBatch).not.toHaveBeenCalled();
+    expect(refreshSavedRows).not.toHaveBeenCalled();
+    expect(emit).toHaveBeenCalledWith("reload", undefined, "", undefined, undefined, 100, 0);
+  });
+
+  it("marks the manual transaction dirty before a result-grid mutation can fail", async () => {
+    const onManualTransactionMutation = vi.fn();
+    mocks.prepareDataGridSave.mockResolvedValue({ statements: ["UPDATE orders_test SET status='shipped' WHERE id=1"], rollbackStatements: [] });
+    mocks.executeInManualTransaction.mockRejectedValue(new Error("Query timed out"));
+
+    const { editor } = createSaveTestEditor({ manualTransactionSessionId: "txn-session-1", onManualTransactionMutation });
+    editor.dirtyRows.value.set(0, new Map([[1, "shipped"]]));
+
+    await editor.saveChanges();
+
+    expect(onManualTransactionMutation).toHaveBeenCalledTimes(1);
+    expect(editor.saveError.value).toContain("Query timed out");
   });
 
   it("executes a conditional update immediately, records affected rows, and reloads", async () => {

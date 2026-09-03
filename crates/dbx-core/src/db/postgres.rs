@@ -3,7 +3,6 @@ use deadpool_postgres::{ManagerConfig, Pool, PoolError, RecyclingMethod, Runtime
 use futures::{SinkExt, StreamExt};
 use openssl::ssl::{SslConnector, SslFiletype, SslMethod, SslVerifyMode};
 use percent_encoding::percent_decode_str;
-use rust_decimal::Decimal;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::verify_server_cert_signed_by_trust_anchor;
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
@@ -13,6 +12,7 @@ use sqlparser::ast::{SetExpr, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
 use std::fs::File;
 use std::future::Future;
 use std::io::BufReader;
@@ -165,6 +165,77 @@ impl<'a> FromSql<'a> for PgAnyString {
     fn accepts(_: &Type) -> bool {
         true
     }
+}
+
+struct PgNumeric(String);
+
+impl<'a> FromSql<'a> for PgNumeric {
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        decode_pg_numeric_bytes(raw).map(Self).ok_or_else(|| "invalid PostgreSQL numeric binary value".into())
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::NUMERIC
+    }
+}
+
+fn decode_pg_numeric_bytes(raw: &[u8]) -> Option<String> {
+    const POSITIVE: u16 = 0x0000;
+    const NEGATIVE: u16 = 0x4000;
+    const NAN: u16 = 0xC000;
+    const POSITIVE_INFINITY: u16 = 0xD000;
+    const NEGATIVE_INFINITY: u16 = 0xF000;
+
+    let digit_count = usize::from(u16::from_be_bytes(raw.get(0..2)?.try_into().ok()?));
+    let weight = i16::from_be_bytes(raw.get(2..4)?.try_into().ok()?);
+    let sign = u16::from_be_bytes(raw.get(4..6)?.try_into().ok()?);
+    let scale = usize::from(u16::from_be_bytes(raw.get(6..8)?.try_into().ok()?));
+    let expected_len = digit_count.checked_mul(2)?.checked_add(8)?;
+    if raw.len() != expected_len {
+        return None;
+    }
+    match sign {
+        NAN => return Some("NaN".to_string()),
+        POSITIVE_INFINITY => return Some("Infinity".to_string()),
+        NEGATIVE_INFINITY => return Some("-Infinity".to_string()),
+        POSITIVE | NEGATIVE => {}
+        _ => return None,
+    }
+
+    let digits = raw[8..].chunks_exact(2).map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]])).collect::<Vec<_>>();
+    if digits.iter().any(|digit| *digit > 9999) {
+        return None;
+    }
+
+    let integer_groups = if weight >= 0 { usize::try_from(weight).ok()?.checked_add(1)? } else { 0 };
+    let fractional_groups = scale.checked_add(3)? / 4;
+    let mut text = String::with_capacity(integer_groups.saturating_mul(4).max(1).saturating_add(scale + 2));
+    if sign == NEGATIVE && digits.iter().any(|digit| *digit != 0) {
+        text.push('-');
+    }
+    if integer_groups == 0 {
+        text.push('0');
+    } else {
+        for group_index in 0..integer_groups {
+            let digit = digits.get(group_index).copied().unwrap_or(0);
+            if group_index == 0 {
+                write!(&mut text, "{digit}").ok()?;
+            } else {
+                write!(&mut text, "{digit:04}").ok()?;
+            }
+        }
+    }
+    if scale > 0 {
+        text.push('.');
+        let fractional_start = text.len();
+        for group_index in 0..fractional_groups {
+            let digit_index = i32::from(weight) + 1 + i32::try_from(group_index).ok()?;
+            let digit = usize::try_from(digit_index).ok().and_then(|index| digits.get(index)).copied().unwrap_or(0);
+            write!(&mut text, "{digit:04}").ok()?;
+        }
+        text.truncate(fractional_start + scale);
+    }
+    Some(text)
 }
 
 /// PostgreSQL `money` is sent in the binary protocol as a signed 64-bit
@@ -555,8 +626,8 @@ fn pg_array_to_json_value(row: &Row, idx: usize) -> Option<serde_json::Value> {
     if let Ok(values) = row.try_get::<_, Vec<Option<bool>>>(idx) {
         return Some(pg_optional_array_to_json(values, serde_json::Value::Bool));
     }
-    if let Ok(values) = row.try_get::<_, Vec<Option<Decimal>>>(idx) {
-        return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.to_string())));
+    if let Ok(values) = row.try_get::<_, Vec<Option<PgNumeric>>>(idx) {
+        return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.0)));
     }
     if let Ok(values) = row.try_get::<_, Vec<Option<uuid::Uuid>>>(idx) {
         return Some(pg_optional_array_to_json(values, |v| serde_json::Value::String(v.to_string())));
@@ -818,10 +889,9 @@ pub(crate) fn pg_value_to_json_classified(row: &Row, idx: usize, col_type: PgCol
                 PgTemporalFallback::Probe => pg_fallback_value_to_json(row, idx),
             }
         }
-        PgColType::Numeric => row
-            .try_get::<_, Decimal>(idx)
-            .map(|v: Decimal| serde_json::Value::String(v.to_string()))
-            .unwrap_or(serde_json::Value::Null),
+        PgColType::Numeric => {
+            row.try_get::<_, PgNumeric>(idx).map(|v| serde_json::Value::String(v.0)).unwrap_or(serde_json::Value::Null)
+        }
         PgColType::Money => row
             .try_get::<_, PgMoney>(idx)
             .map(|v| serde_json::Value::String(format_pg_money(v.0)))
@@ -1343,12 +1413,34 @@ fn postgres_select_stream_outcome(stream: tokio_postgres::RowStream) -> Postgres
     PostgresSelectStreamOutcome::Binary { stream, metadata }
 }
 
+async fn prepare_unnamed_select_metadata(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+) -> Result<PreparedSelectMetadata, tokio_postgres::Error> {
+    // query_typed_raw sends Describe and Execute together. If its result has an
+    // unknown user-defined type, tokio-postgres then resolves that type with a
+    // second query on the same connection before returning the RowStream. A
+    // large result can fill the connection buffers and block that type lookup.
+    // Describe once without executing so custom types are cached before the
+    // actual unnamed stream starts. The stream remains unnamed to tolerate
+    // server-side prepared statement loss in snapshot/proxy environments.
+    let stmt = client.prepare(sql).await?;
+    Ok(prepared_select_metadata(stmt.columns()))
+}
+
 async fn start_postgres_select_stream(
     client: &deadpool_postgres::Client,
     sql: &str,
     force_unnamed: bool,
 ) -> Result<PostgresSelectStreamOutcome, tokio_postgres::Error> {
     if force_unnamed || postgres_client_uses_unnamed_statements(client) {
+        let metadata = prepare_unnamed_select_metadata(client, sql).await?;
+        if let Some(unsupported_type) = metadata.unsupported_type {
+            return Ok(PostgresSelectStreamOutcome::TextFallback {
+                column_types: metadata.column_types,
+                unsupported_type,
+            });
+        }
         return postgres_query_unnamed(client, sql).await.map(postgres_select_stream_outcome);
     }
 
@@ -3788,8 +3880,7 @@ fn postgres_indexes_for_relations_compat_sql() -> &'static str {
              ORDER BY t.oid, i.relname"
 }
 
-/// Batched sibling of `list_foreign_keys`, keyed by `(schema, table)` since
-/// this query is `information_schema`-based rather than oid-based.
+/// Batched sibling of `list_foreign_keys`, keyed by `(schema, table)`.
 pub async fn list_foreign_keys_for_relations(
     pool: &Pool,
     relations: &[(String, String)],
@@ -3820,8 +3911,8 @@ async fn list_foreign_keys_for_relations_with_sql(
             ref_schema: Some(pg_row_try_string(row, 4)),
             ref_table: pg_row_try_string(row, 5),
             ref_column: pg_row_try_string(row, 6),
-            on_update: postgres_foreign_key_action(pg_row_try_string(row, 7)),
-            on_delete: postgres_foreign_key_action(pg_row_try_string(row, 8)),
+            on_update: postgres_fk_action_label(pg_row_try_optional_text(row, 7)),
+            on_delete: postgres_fk_action_label(pg_row_try_optional_text(row, 8)),
         });
     }
     Ok(result)
@@ -3833,56 +3924,56 @@ fn postgres_foreign_keys_for_relations_query_tiers() -> [&'static str; 2] {
 
 fn postgres_foreign_keys_for_relations_sql() -> &'static str {
     "SELECT rel.rel_schema, rel.rel_table, \
-     fk.constraint_name, fk.column_name, \
-     pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column, \
-     rc.update_rule AS on_update, rc.delete_rule AS on_delete \
+     con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
      FROM unnest($1::text[], $2::text[]) AS rel(rel_schema, rel_table) \
-     JOIN information_schema.table_constraints tc \
-       ON tc.table_schema = rel.rel_schema AND tc.table_name = rel.rel_table \
-     JOIN information_schema.key_column_usage fk \
-       ON fk.constraint_name = tc.constraint_name \
-       AND fk.constraint_schema = tc.constraint_schema \
-       AND fk.table_schema = tc.table_schema \
-       AND fk.table_name = tc.table_name \
-     JOIN information_schema.referential_constraints rc \
-       ON rc.constraint_name = tc.constraint_name \
-       AND rc.constraint_schema = tc.constraint_schema \
-     JOIN information_schema.key_column_usage pk \
-       ON pk.constraint_name = rc.unique_constraint_name \
-       AND pk.constraint_schema = rc.unique_constraint_schema \
-       AND pk.ordinal_position = fk.position_in_unique_constraint \
-     WHERE tc.constraint_type = 'FOREIGN KEY' \
-     ORDER BY rel.rel_schema, rel.rel_table, fk.constraint_name, fk.ordinal_position"
+     JOIN pg_catalog.pg_constraint con ON true \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS fk(attnum, ord) ON true \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = fk.attnum AND NOT a.attisdropped \
+     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS pk(attnum, ord) ON pk.ord = fk.ord \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = pk.attnum AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = rel.rel_schema AND c.relname = rel.rel_table \
+     ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"
 }
 
 // PostgreSQL 9.3 and older only accept one array argument to unnest(). Pair
 // the schema/table arrays through their shared subscript so the fallback stays
 // one bounded query and preserves each relation tuple's position.
+// WITH ORDINALITY is equally unavailable before 9.4, so pair conkey/confkey
+// positions with generate_series over the array length plus plain subscripts —
+// the same pre-9.4 technique the index compat SQL relies on.
 fn postgres_foreign_keys_for_relations_compat_sql() -> &'static str {
     "SELECT rel.rel_schema, rel.rel_table, \
-     fk.constraint_name, fk.column_name, \
-     pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column, \
-     rc.update_rule AS on_update, rc.delete_rule AS on_delete \
+     con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
      FROM ( \
        SELECT ($1::text[])[rel.i] AS rel_schema, ($2::text[])[rel.i] AS rel_table \
        FROM generate_subscripts($1::text[], 1) AS rel(i) \
      ) AS rel \
-     JOIN information_schema.table_constraints tc \
-       ON tc.table_schema = rel.rel_schema AND tc.table_name = rel.rel_table \
-     JOIN information_schema.key_column_usage fk \
-       ON fk.constraint_name = tc.constraint_name \
-       AND fk.constraint_schema = tc.constraint_schema \
-       AND fk.table_schema = tc.table_schema \
-       AND fk.table_name = tc.table_name \
-     JOIN information_schema.referential_constraints rc \
-       ON rc.constraint_name = tc.constraint_name \
-       AND rc.constraint_schema = tc.constraint_schema \
-     JOIN information_schema.key_column_usage pk \
-       ON pk.constraint_name = rc.unique_constraint_name \
-       AND pk.constraint_schema = rc.unique_constraint_schema \
-       AND pk.ordinal_position = fk.position_in_unique_constraint \
-     WHERE tc.constraint_type = 'FOREIGN KEY' \
-     ORDER BY rel.rel_schema, rel.rel_table, fk.constraint_name, fk.ordinal_position"
+     JOIN pg_catalog.pg_constraint con ON true \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     CROSS JOIN generate_series(1, array_length(con.conkey, 1)) AS fk(ord) \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = (con.conkey)[fk.ord] AND NOT a.attisdropped \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = (con.confkey)[fk.ord] AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = rel.rel_schema AND c.relname = rel.rel_table \
+     ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"
 }
 
 /// Batched sibling of `get_table_comment`.
@@ -4358,7 +4449,7 @@ fn postgres_constraint_type_label(contype: &str) -> String {
 }
 
 /// Normalize a `confupdtype`/`confdeltype` letter to an `information_schema`
-/// style referential-action label, mirroring `postgres_foreign_key_action`.
+/// style referential-action label.
 fn postgres_fk_action_label(action: Option<String>) -> Option<String> {
     action
         .as_deref()
@@ -7407,42 +7498,56 @@ pub async fn list_invalid_indexes(pool: &Pool, schema: &str, table: &str) -> Res
 }
 
 fn postgres_foreign_keys_sql() -> &'static str {
-    "SELECT fk.constraint_name, fk.column_name, \
-     pk.table_schema AS ref_schema, pk.table_name AS ref_table, pk.column_name AS ref_column, \
-     rc.update_rule AS on_update, rc.delete_rule AS on_delete \
-     FROM information_schema.table_constraints tc \
-     JOIN information_schema.key_column_usage fk \
-       ON fk.constraint_name = tc.constraint_name \
-       AND fk.constraint_schema = tc.constraint_schema \
-       AND fk.table_schema = tc.table_schema \
-       AND fk.table_name = tc.table_name \
-     JOIN information_schema.referential_constraints rc \
-       ON rc.constraint_name = tc.constraint_name \
-       AND rc.constraint_schema = tc.constraint_schema \
-     JOIN information_schema.key_column_usage pk \
-       ON pk.constraint_name = rc.unique_constraint_name \
-       AND pk.constraint_schema = rc.unique_constraint_schema \
-       AND pk.ordinal_position = fk.position_in_unique_constraint \
-     WHERE tc.constraint_type = 'FOREIGN KEY' \
-       AND fk.table_schema = $1 AND fk.table_name = $2 \
-     ORDER BY fk.constraint_name, fk.ordinal_position"
+    "SELECT con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS fk(attnum, ord) ON true \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = fk.attnum AND NOT a.attisdropped \
+     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS pk(attnum, ord) ON pk.ord = fk.ord \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = pk.attnum AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname, fk.ord"
 }
 
-fn postgres_foreign_key_action(value: String) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+// Pre-9.4 sibling of `postgres_foreign_keys_sql`: WITH ORDINALITY requires
+// PostgreSQL 9.4, so pair conkey/confkey positions with generate_series over
+// the array length plus plain subscripts.
+fn postgres_foreign_keys_compat_sql() -> &'static str {
+    "SELECT con.conname AS constraint_name, \
+     a.attname AS column_name, \
+     ref_n.nspname AS ref_schema, \
+     ref_c.relname AS ref_table, \
+     ref_a.attname AS ref_column, \
+     con.confupdtype::text AS on_update_raw, \
+     con.confdeltype::text AS on_delete_raw \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     CROSS JOIN generate_series(1, array_length(con.conkey, 1)) AS fk(ord) \
+     JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = (con.conkey)[fk.ord] AND NOT a.attisdropped \
+     JOIN pg_catalog.pg_attribute ref_a ON ref_a.attrelid = ref_c.oid AND ref_a.attnum = (con.confkey)[fk.ord] AND NOT ref_a.attisdropped \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname, fk.ord"
 }
 
-pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
-    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
-    let rows = postgres_query_cached(&client, postgres_foreign_keys_sql(), &[&schema, &table])
-        .await
-        .map_err(|e| e.to_string())?;
-
+async fn list_foreign_keys_with_sql(
+    client: &deadpool_postgres::Client,
+    sql: &'static str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, tokio_postgres::Error> {
+    let rows = postgres_query_cached(client, sql, &[&schema, &table]).await?;
     Ok(rows
         .iter()
         .map(|row| ForeignKeyInfo {
@@ -7451,10 +7556,92 @@ pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result
             ref_schema: Some(pg_row_try_string(row, 2)),
             ref_table: pg_row_try_string(row, 3),
             ref_column: pg_row_try_string(row, 4),
-            on_update: postgres_foreign_key_action(pg_row_try_string(row, 5)),
-            on_delete: postgres_foreign_key_action(pg_row_try_string(row, 6)),
+            on_update: postgres_fk_action_label(pg_row_try_optional_text(row, 5)),
+            on_delete: postgres_fk_action_label(pg_row_try_optional_text(row, 6)),
         })
         .collect())
+}
+
+pub async fn list_foreign_keys(pool: &Pool, schema: &str, table: &str) -> Result<Vec<ForeignKeyInfo>, String> {
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let tiers = [postgres_foreign_keys_sql(), postgres_foreign_keys_compat_sql()];
+    query_with_compat_fallback("list_foreign_keys", &tiers, |sql| {
+        list_foreign_keys_with_sql(&client, sql, schema, table)
+    })
+    .await
+}
+
+/// OpenGauss-safe foreign key metadata. Mirrors `list_opengauss_constraints`:
+/// older OpenGauss releases may reject WITH ORDINALITY or decode catalog arrays
+/// differently on the wire, so read conkey/confkey as text and resolve the
+/// attribute numbers in Rust.
+pub async fn list_opengauss_foreign_keys(
+    pool: &Pool,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<ForeignKeyInfo>, String> {
+    let schema = if schema.is_empty() { "public" } else { schema };
+    let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
+    let rows = postgres_query_cached(&client, opengauss_foreign_keys_sql(), &[&schema, &table])
+        .await
+        .map_err(|e| e.to_string())?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let local_relation_oid =
+        pg_row_try_u32(&rows[0], 7).ok_or("OpenGauss foreign key metadata did not return a local relation OID")?;
+    let local_attributes = opengauss_relation_attributes(&client, local_relation_oid).await?;
+    let mut referenced_attributes: HashMap<u32, HashMap<i16, String>> = HashMap::new();
+    let mut result = Vec::new();
+
+    for row in &rows {
+        let name = pg_row_try_string(row, 0);
+        let column_numbers = parse_opengauss_attribute_numbers(&pg_row_try_string(row, 3))
+            .map_err(|error| format!("failed to parse OpenGauss foreign key {name} columns: {error}"))?;
+        let ref_column_numbers = parse_opengauss_attribute_numbers(&pg_row_try_string(row, 4))
+            .map_err(|error| format!("failed to parse OpenGauss foreign key {name} referenced columns: {error}"))?;
+        let ref_schema = pg_row_try_string(row, 1);
+        let ref_table = pg_row_try_string(row, 2);
+        let on_update = postgres_fk_action_label(pg_row_try_optional_text(row, 5));
+        let on_delete = postgres_fk_action_label(pg_row_try_optional_text(row, 6));
+        let Some(referenced_relation_oid) = pg_row_try_u32(row, 8).filter(|oid| *oid != 0) else {
+            continue;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) = referenced_attributes.entry(referenced_relation_oid) {
+            entry.insert(opengauss_relation_attributes(&client, referenced_relation_oid).await?);
+        }
+        let ref_attributes = referenced_attributes.get(&referenced_relation_oid).unwrap();
+        for (fk_number, pk_number) in column_numbers.iter().zip(ref_column_numbers.iter()) {
+            let Some(column) = local_attributes.get(fk_number) else { continue };
+            let Some(ref_column) = ref_attributes.get(pk_number) else { continue };
+            result.push(ForeignKeyInfo {
+                name: name.clone(),
+                column: column.clone(),
+                ref_schema: Some(ref_schema.clone()),
+                ref_table: ref_table.clone(),
+                ref_column: ref_column.clone(),
+                on_update: on_update.clone(),
+                on_delete: on_delete.clone(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn opengauss_foreign_keys_sql() -> &'static str {
+    "SELECT con.conname, \
+            ref_n.nspname, ref_c.relname, \
+            COALESCE(con.conkey::text, ''), COALESCE(con.confkey::text, ''), \
+            con.confupdtype::text, con.confdeltype::text, \
+            con.conrelid::oid, con.confrelid::oid \
+     FROM pg_catalog.pg_constraint con \
+     JOIN pg_catalog.pg_class c ON c.oid = con.conrelid \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     JOIN pg_catalog.pg_class ref_c ON ref_c.oid = con.confrelid \
+     JOIN pg_catalog.pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace \
+     WHERE con.contype = 'f' AND n.nspname = $1 AND c.relname = $2 \
+     ORDER BY con.conname"
 }
 
 fn postgres_table_dependencies_sql() -> &'static str {
@@ -8058,6 +8245,92 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio_postgres::types::FromSql;
+
+    fn postgres_numeric_binary(weight: i16, sign: u16, scale: u16, digits: &[u16]) -> Vec<u8> {
+        let mut raw = Vec::with_capacity(8 + digits.len() * 2);
+        raw.extend_from_slice(&u16::try_from(digits.len()).unwrap().to_be_bytes());
+        raw.extend_from_slice(&weight.to_be_bytes());
+        raw.extend_from_slice(&sign.to_be_bytes());
+        raw.extend_from_slice(&scale.to_be_bytes());
+        for digit in digits {
+            raw.extend_from_slice(&digit.to_be_bytes());
+        }
+        raw
+    }
+
+    fn postgres_numeric_array_binary(values: &[Option<Vec<u8>>]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&1_i32.to_be_bytes());
+        raw.extend_from_slice(&i32::from(values.iter().any(Option::is_none)).to_be_bytes());
+        raw.extend_from_slice(&Type::NUMERIC.oid().to_be_bytes());
+        raw.extend_from_slice(&i32::try_from(values.len()).unwrap().to_be_bytes());
+        raw.extend_from_slice(&1_i32.to_be_bytes());
+        for value in values {
+            if let Some(value) = value {
+                raw.extend_from_slice(&i32::try_from(value.len()).unwrap().to_be_bytes());
+                raw.extend_from_slice(value);
+            } else {
+                raw.extend_from_slice(&(-1_i32).to_be_bytes());
+            }
+        }
+        raw
+    }
+
+    #[test]
+    fn postgres_numeric_binary_values_preserve_arbitrary_precision() {
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0x0000, 0, &[])).as_deref(), Some("0"));
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0x0000, 2, &[])).as_deref(), Some("0.00"));
+        assert_eq!(
+            decode_pg_numeric_bytes(&postgres_numeric_binary(1, 0x0000, 4, &[1, 2345, 6789])).as_deref(),
+            Some("12345.6789")
+        );
+        assert_eq!(
+            decode_pg_numeric_bytes(&postgres_numeric_binary(-1, 0x4000, 7, &[12, 3000])).as_deref(),
+            Some("-0.0012300")
+        );
+
+        let tiny = decode_pg_numeric_bytes(&postgres_numeric_binary(-77, 0x0000, 307, &[10])).unwrap();
+        assert_eq!(tiny, format!("0.{}1", "0".repeat(306)));
+        assert_eq!(tiny.len(), 309);
+
+        let mut huge_digits = vec![9];
+        huge_digits.extend(std::iter::repeat_n(9999, 77));
+        let huge = "9".repeat(309);
+        assert_eq!(
+            decode_pg_numeric_bytes(&postgres_numeric_binary(77, 0x0000, 0, &huge_digits)).as_deref(),
+            Some(huge.as_str())
+        );
+
+        let decoded = PgNumeric::from_sql(&Type::NUMERIC, &postgres_numeric_binary(-77, 0x0000, 307, &[10])).unwrap();
+        assert_eq!(decoded.0, tiny);
+        assert!(PgNumeric::accepts(&Type::NUMERIC));
+        assert!(!PgNumeric::accepts(&Type::INT8));
+
+        let array_raw = postgres_numeric_array_binary(&[
+            Some(postgres_numeric_binary(-77, 0x0000, 307, &[10])),
+            None,
+            Some(postgres_numeric_binary(77, 0x0000, 0, &huge_digits)),
+        ]);
+        let array = Vec::<Option<PgNumeric>>::from_sql(&Type::NUMERIC_ARRAY, &array_raw).unwrap();
+        assert_eq!(
+            array.into_iter().map(|value| value.map(|value| value.0)).collect::<Vec<_>>(),
+            vec![Some(tiny), None, Some(huge)]
+        );
+    }
+
+    #[test]
+    fn postgres_numeric_binary_values_preserve_special_values_and_reject_malformed_payloads() {
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0xC000, 0, &[])).as_deref(), Some("NaN"));
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0xD000, 0, &[])).as_deref(), Some("Infinity"));
+        assert_eq!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0xF000, 0, &[])).as_deref(), Some("-Infinity"));
+        assert!(decode_pg_numeric_bytes(&[]).is_none());
+        assert!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0x8000, 0, &[])).is_none());
+        assert!(decode_pg_numeric_bytes(&postgres_numeric_binary(0, 0x0000, 0, &[10_000])).is_none());
+
+        let mut trailing_bytes = postgres_numeric_binary(0, 0x0000, 0, &[1]);
+        trailing_bytes.push(0);
+        assert!(decode_pg_numeric_bytes(&trailing_bytes).is_none());
+    }
 
     #[test]
     fn postgres_money_binary_values_are_decoded_with_two_decimal_places() {
@@ -9807,9 +10080,40 @@ mod tests {
     fn postgres_foreign_keys_sql_selects_referential_actions() {
         let sql = postgres_foreign_keys_sql();
 
-        assert!(sql.contains("rc.update_rule AS on_update"));
-        assert!(sql.contains("rc.delete_rule AS on_delete"));
-        assert!(sql.contains("information_schema.referential_constraints rc"));
+        assert!(sql.contains("pg_catalog.pg_constraint"));
+        assert!(sql.contains("con.confupdtype::text AS on_update_raw"));
+        assert!(sql.contains("con.confdeltype::text AS on_delete_raw"));
+        assert!(sql.contains("confdeltype"));
+        assert!(sql.contains("ref_n.nspname"));
+        assert!(sql.contains("unnest(con.conkey) WITH ORDINALITY"));
+        assert!(sql.contains("n.nspname = $1 AND c.relname = $2"));
+        assert!(sql.contains("con.contype = 'f'"));
+        assert!(sql.contains("NOT a.attisdropped"));
+        assert!(sql.contains("JOIN LATERAL"));
+        assert!(!sql.contains("information_schema"));
+    }
+
+    #[test]
+    fn postgres_foreign_key_metadata_has_legacy_catalog_fallback() {
+        // The compat tiers exist for pre-9.4 servers, so they must avoid WITH
+        // ORDINALITY (a 9.4 feature) and pair conkey/confkey positions through
+        // generate_series + plain array subscripts instead, mirroring the index
+        // compat invariant.
+        for compat_sql in [postgres_foreign_keys_compat_sql(), postgres_foreign_keys_for_relations_compat_sql()] {
+            assert!(!compat_sql.contains("WITH ORDINALITY"));
+            assert!(compat_sql.contains("generate_series"));
+            assert!(compat_sql.contains("array_length(con.conkey, 1)"));
+            assert!(compat_sql.contains("con.contype = 'f'"));
+            assert!(compat_sql.contains("NOT a.attisdropped"));
+            assert!(!compat_sql.contains("information_schema"));
+        }
+        // OpenGauss resolves attribute numbers in Rust, so its SQL must not
+        // expand catalog arrays at all.
+        let opengauss_sql = opengauss_foreign_keys_sql();
+        assert!(!opengauss_sql.contains("WITH ORDINALITY"));
+        assert!(!opengauss_sql.contains("unnest"));
+        assert!(opengauss_sql.contains("con.conkey::text"));
+        assert!(opengauss_sql.contains("con.confkey::text"));
     }
 
     #[test]
@@ -9830,14 +10134,6 @@ mod tests {
         assert!(compat_sql.contains("pg_catalog.pg_inherits"));
         assert!(compat_sql.contains("con.contype = 'f'"));
         assert!(compat_sql.contains("ORDER BY table_name, ref_table"));
-    }
-
-    #[test]
-    fn postgres_foreign_key_action_keeps_non_empty_action() {
-        assert_eq!(postgres_foreign_key_action("CASCADE".to_string()), Some("CASCADE".to_string()));
-        assert_eq!(postgres_foreign_key_action(" SET NULL ".to_string()), Some("SET NULL".to_string()));
-        assert_eq!(postgres_foreign_key_action("".to_string()), None);
-        assert_eq!(postgres_foreign_key_action("  ".to_string()), None);
     }
 
     #[test]
@@ -10857,14 +11153,24 @@ mod tests {
         assert_eq!(modern_sql, postgres_foreign_keys_for_relations_sql());
         assert!(modern_sql.contains("unnest($1::text[], $2::text[])"));
         assert!(!modern_sql.contains("generate_subscripts"));
+        assert!(modern_sql.contains("pg_catalog.pg_constraint"));
+        assert!(!modern_sql.contains("information_schema"));
+        assert!(modern_sql.contains("con.confupdtype::text"));
+        assert!(modern_sql.contains("confdeltype"));
+        assert!(modern_sql.contains("con.contype = 'f'"));
+        assert!(modern_sql.contains("ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"));
 
         let compat_sql = tiers[1];
         assert_eq!(compat_sql, postgres_foreign_keys_for_relations_compat_sql());
-        assert!(!compat_sql.contains("unnest("));
+        assert!(!compat_sql.contains("unnest($1::text[]"));
         assert!(compat_sql.contains("generate_subscripts($1::text[], 1)"));
         assert!(compat_sql.contains("($1::text[])[rel.i] AS rel_schema"));
         assert!(compat_sql.contains("($2::text[])[rel.i] AS rel_table"));
-        assert!(compat_sql.contains("ORDER BY rel.rel_schema, rel.rel_table, fk.constraint_name, fk.ordinal_position"));
+        assert!(compat_sql.contains("pg_catalog.pg_constraint"));
+        assert!(!compat_sql.contains("information_schema"));
+        assert!(compat_sql.contains("confdeltype"));
+        assert!(compat_sql.contains("con.contype = 'f'"));
+        assert!(compat_sql.contains("ORDER BY rel.rel_schema, rel.rel_table, con.conname, fk.ord"));
     }
 
     #[test]
@@ -12961,6 +13267,12 @@ mod tests {
         .expect("stream unnamed query inside backup snapshot");
         assert_eq!(columns, vec!["value"]);
         assert_eq!(rows[0][0], serde_json::json!(45));
+        let prepared_count = client
+            .query_typed_one("SELECT count(*)::int8 FROM pg_prepared_statements", &[])
+            .await
+            .expect("count server-side prepared statements")
+            .get::<_, i64>(0);
+        assert_eq!(prepared_count, 0, "snapshot stream metadata preparation must not retain a named statement");
         client.execute_typed("SELECT 1", &[]).await.expect("snapshot remains usable");
         client.execute_typed("ROLLBACK", &[]).await.expect("rollback backup snapshot");
     }

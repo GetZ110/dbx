@@ -356,6 +356,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/connection/write-unlock/lock", post(routes::connection::lock_connection_writes))
         .route("/connection/write-unlock/state", post(routes::connection::connection_write_unlock_state))
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
+        .route("/connection/test-ssh-tunnel", post(routes::connection::test_ssh_tunnel))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
         .route("/connection/session-credential-status", post(routes::connection::session_credential_status))
@@ -436,6 +437,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/schema/sqlserver/linked-server-tables", get(routes::schema::list_sqlserver_linked_server_tables))
         .route("/schema/sqlserver/column-metadata", get(routes::schema::get_sqlserver_column_metadata))
         .route("/schema/mysql/auto-increment", get(routes::schema::get_mysql_table_auto_increment))
+        .route("/schema/xugu/tablespaces", get(routes::schema::list_xugu_tablespaces))
         .route("/schema/schemas", get(routes::schema::list_schemas))
         .route("/schema/tables", get(routes::schema::list_tables))
         .route("/schema/objects", get(routes::schema::list_objects))
@@ -503,6 +505,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/query/build-sorted-sql", post(routes::query::build_sorted_query_sql))
         .route("/query/build-explain-sql", post(routes::query::build_explain_sql))
         .route("/query/build-dropped-file-preview-sql", post(routes::query::build_dropped_file_preview_sql))
+        .route("/query/build-dml-change-preview-sql", post(routes::query::build_dml_change_preview_sql))
         .route("/query/get-explain-info", post(routes::query::get_explain_info))
         .route("/query/build-create-user-sql", post(routes::query::build_create_user_sql))
         .route("/query/build-table-select-sql", post(routes::query::build_table_select_sql))
@@ -839,6 +842,14 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
             "/document-store/elasticsearch-count-documents",
             post(routes::document_store::elasticsearch_count_documents),
         )
+        .route(
+            "/document-store/elasticsearch/index-metadata",
+            post(routes::document_store::elasticsearch_get_index_metadata),
+        )
+        .route(
+            "/document-store/elasticsearch/documents/delete-all",
+            post(routes::document_store::elasticsearch_delete_all_documents),
+        )
         .route("/document-store/list-gridfs-buckets", post(routes::document_store::list_gridfs_buckets))
         .route("/document-store/create-gridfs-bucket", post(routes::document_store::create_gridfs_bucket))
         .route("/document-store/delete-gridfs-bucket", post(routes::document_store::delete_gridfs_bucket))
@@ -1016,6 +1027,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
             get(routes::app_settings::load_max_retries).put(routes::app_settings::save_max_retries),
         )
         .route("/app-settings/config/decrypt", post(routes::app_settings::decrypt_config))
+        .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
         // Cloud sync
         .route("/cloud-sync/webdav/test", post(routes::cloud_sync::webdav_sync_test))
         .route("/cloud-sync/webdav/password-status", post(routes::cloud_sync::webdav_password_status))
