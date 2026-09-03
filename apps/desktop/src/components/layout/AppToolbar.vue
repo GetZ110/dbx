@@ -75,6 +75,9 @@ const settingsStore = useSettingsStore();
 const toolbarItems = computed(() => settingsStore.editorSettings.toolbarItems);
 const { isMac, isDesktop, showControls, isMaximized, isFullscreen, minimize, toggleMaximize, close } = useWindowControls();
 const checkingUpdates = computed(() => props.checkingUpdates);
+// HarmonyOS HAP cannot custom-install/download updates, so the toolbar
+// "check updates" button is hidden in that runtime.
+const hideUpdateCheck = isHarmonyDesktopRuntime();
 const updateTooltip = computed(() => {
   if (props.isDownloadingUpdate) return t("updates.downloading", { progress: props.downloadProgress ?? 0 });
   if (props.updateReady) return t("updates.restartRequiredTooltip");
@@ -197,7 +200,7 @@ const collapsibleRightItemDefs = computed(() => {
     disabled: boolean;
   }
   const items: ItemDef[] = [];
-  if (toolbarItems.value.checkUpdates) {
+  if (toolbarItems.value.checkUpdates && !hideUpdateCheck) {
     items.push({
       key: "checkUpdates",
       label: t("updates.check"),
@@ -600,7 +603,7 @@ const toolbarStyle = computed(() => {
 
     <!-- Right-side items wrapped in overflow-aware container -->
     <div ref="rightWrapper" class="flex min-w-0 items-center gap-1 overflow-hidden">
-      <template v-if="toolbarItems.checkUpdates">
+      <template v-if="toolbarItems.checkUpdates && !hideUpdateCheck">
         <Tooltip>
           <TooltipTrigger as-child>
             <Button v-show="isRightItemVisible('checkUpdates')" data-toolbar-update-trigger variant="ghost" size="icon" class="toolbar-action-button relative h-8 w-8 shrink-0" :disabled="checkingUpdates" @click="emit('check-updates')">

@@ -60,7 +60,7 @@ import { resolveHistorySqlRestoreTarget } from "@/lib/history/historyRestoreTarg
 import { resolveExecutableSql, resolveExecutableSqlWithBackend, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
 import { uuid } from "@/lib/common/utils";
 import { isMacOS, isWindows } from "@/lib/backend/platform";
-import { isDesktopRuntime, isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { isDesktopRuntime, isHarmonyDesktopRuntime, isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { openQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { rememberExternalSqlFileTarget, resolveExternalSqlFileTarget, unassociatedExternalSqlFileTarget } from "@/lib/sql/externalSqlFileTarget";
 import { externalSqlFileOpenErrorMessage, isSqlFilePath, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
@@ -2499,7 +2499,15 @@ function changeActiveSchema(schema: string | undefined) {
 }
 
 function openGitHub() {
-  openUrl("https://github.com/t8y2/dbx");
+  const url = "https://github.com/GetZ110/dbx-ohos";
+  if (isHarmonyDesktopRuntime()) {
+    const bridge = (globalThis as Record<string, unknown>).dbxNativeWindow as
+      | { openExternal?: (url: string) => void }
+      | undefined;
+    bridge?.openExternal?.(url);
+    return;
+  }
+  openUrl(url);
 }
 function openMcpGuide() {
   openUrl("https://dbxio.com/cn/docs/mcp");
