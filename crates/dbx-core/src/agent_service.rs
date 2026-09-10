@@ -3149,7 +3149,19 @@ fn extract_jre_tar<R: Read>(mut archive: tar::Archive<R>, dest: &Path) -> Result
         .prefix(".jre-extract-")
         .tempdir_in(parent)
         .map_err(|e| format!("Failed to create JRE extraction directory: {e}"))?;
-    archive.unpack(staging.path()).map_err(|e| format!("Failed to extract JRE archive: {e}"))?;
+    // Unpack entry-by-entry instead of `archive.unpack(...)`. DBX JRE archives
+    // contain symlinks under `legal/` (for example `ASSEMBLY_EXCEPTION`), and
+    // HarmonyOS app sandboxes reject symlink creation with EPERM. These legal
+    // links are documentation-only and are not required to run the JRE, so we
+    // skip symlink entries while extracting the real files/directories.
+    let entries = archive.entries().map_err(|e| format!("Failed to iterate JRE archive: {e}"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("Failed to read JRE archive entry: {e}"))?;
+        if entry.header().entry_type().is_symlink() {
+            continue;
+        }
+        entry.unpack_in(staging.path()).map_err(|e| format!("Failed to extract JRE archive: {e}"))?;
+    }
 
     let mut roots = std::fs::read_dir(staging.path())
         .map_err(|e| format!("Failed to inspect extracted JRE archive: {e}"))?
