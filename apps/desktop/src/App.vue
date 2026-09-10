@@ -648,7 +648,12 @@ async function initDetachedWindow() {
 }
 
 async function setupDetachedWindowEvents() {
-  if (!isDesktop) return;
+  // Detached tab windows are created and coordinated through the Tauri webview
+  // API (see openDetachedTabWindow), which the HarmonyOS runtime does not
+  // provide: listen() rejects on transformCallback and surfaces as an unhandled
+  // rejection at startup. isDesktop alone is not enough here because the
+  // HarmonyOS runtime is desktop-like but not Tauri.
+  if (!isDesktop || !isTauriRuntime()) return;
   const { listen } = await import("@tauri-apps/api/event");
   const events: Array<[string, (payload: unknown) => Promise<void>]> = isDetachedWindowContext
     ? [
