@@ -1,5 +1,6 @@
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
+import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import type { NavigationTarget } from "@/composables/useNavigationTargets";
 import type { QueryResult } from "@/types/database";
 
@@ -23,6 +24,11 @@ export function useTauriEvents(deps: {
   }
 
   function setupTauriListeners() {
+    // These listeners bridge native (Tauri) app events such as mcp-open-table.
+    // The HarmonyOS runtime has no __TAURI_INTERNALS__, so listen() would reject
+    // on every registration and surface as unhandled rejections at startup;
+    // MCP traffic reaches the HAP over HTTP instead.
+    if (!isTauriRuntime()) return;
     import("@tauri-apps/api/event")
       .then(({ listen }) => {
         listen<{ connection_id: string; database: string; schema?: string; table: string }>("mcp-open-table", async (event) => {

@@ -247,7 +247,14 @@ const detachedContextTabId = windowContext.kind === "detached-tab" ? windowConte
 let updateWindowReady = false;
 let updatePreparation: Awaited<ReturnType<typeof setupUpdatePreparation>> | undefined;
 async function initializeUpdatePreparation() {
-  if (!isDesktop || updatePreparation) return;
+  // Update preparation is a Tauri-only feature: it dynamically imports
+  // @tauri-apps/api/event and @tauri-apps/api/webviewWindow and drives the
+  // webview/window registry to ACK every live window before an install.
+  // The HarmonyOS desktop runtime sets __HARMONY_DESKTOP__ (so isDesktop is
+  // true) but intentionally never sets __TAURI_INTERNALS__, so those calls
+  // throw ("... reading 'metadata'" / "... reading 'transformCallback'") and
+  // abort startup. The HAP cannot self-install updates anyway, so skip it.
+  if (!isDesktop || !isTauriRuntime() || updatePreparation) return;
   updatePreparation = await setupUpdatePreparation({
     translate: (key) => t(key),
     assertSafe() {
