@@ -11,7 +11,7 @@ use std::future::Future;
 use std::ops::ControlFlow;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Condvar, Mutex,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -832,7 +832,9 @@ async fn connection_database_type_for_pool_key(state: &AppState, pool_key: &str)
 }
 
 fn schema_for_execution_context(db_type: Option<DatabaseType>, schema: Option<&str>) -> Option<&str> {
-    if matches!(db_type, Some(DatabaseType::Iris)) {
+    // SQL Server has no session-level schema switch. Data-grid DML already uses
+    // qualified names, while legacy jTDS can mis-handle schema as catalog.
+    if matches!(db_type, Some(DatabaseType::Iris | DatabaseType::SqlServer)) {
         None
     } else {
         schema
@@ -1233,7 +1235,7 @@ pub fn is_connection_error(err: &str) -> bool {
         || is_os_connection_error(&lower)
 }
 
-fn is_dbx_query_timeout_error(lower: &str) -> bool {
+pub(crate) fn is_dbx_query_timeout_error(lower: &str) -> bool {
     lower.starts_with("query timed out after ")
 }
 
@@ -1292,7 +1294,7 @@ fn options_for_sequential_statements(
 ) -> QueryExecutionOptions {
     let mut statement_options = options.clone();
     if statement_count <= 1
-        || !matches!(db_type, Some(DatabaseType::Kingbase | DatabaseType::Vastbase))
+        || !matches!(db_type, Some(DatabaseType::Kingbase | DatabaseType::Vastbase | DatabaseType::Oracle))
         || statement_options.result_session_id.is_some()
     {
         return statement_options;
@@ -1718,6 +1720,15 @@ async fn configured_operation_budget_for_pool_key(state: &AppState, pool_key: &s
         .unwrap_or_else(DbOperationBudget::with_defaults)
 }
 
+/// Override a transaction budget's query timeout from a per-call override (e.g. the MCP
+/// global query-timeout policy). `None` leaves the budget unchanged; `Some(secs)` follows
+/// `resolve_query_timeout` semantics (`Some(0)` clears the limit, meaning unlimited).
+fn apply_query_timeout_override(budget: &mut DbOperationBudget, timeout_secs: Option<u64>) {
+    if let Some(secs) = timeout_secs {
+        budget.query_timeout = resolve_query_timeout(Some(secs));
+    }
+}
+
 fn oceanbase_mysql_session_timeout_sql(config: Option<&ConnectionConfig>, timeout_secs: Option<u64>) -> Option<String> {
     let config = config?;
     let timeout_secs = timeout_secs.unwrap_or(config.query_timeout_secs);
@@ -1915,6 +1926,15 @@ async fn do_execute_typed(
         PoolKind::Sqlite(p) => {
             let p = p.clone();
             let max_rows = options.max_rows;
+            // SQLite execution runs in spawn_blocking, so cancelling only the
+            // awaitable future leaves the pooled connection occupied. Interrupt
+            // the native statement as soon as the shared cancellation registry
+            // receives the request so the same client session can run again.
+            if let Some(execution_id) = options.execution_id.as_deref() {
+                if let Ok(interrupt) = p.with_connection(|conn| Ok(conn.get_interrupt_handle())) {
+                    state.running_queries.register_interrupt(execution_id, move || interrupt.interrupt());
+                }
+            }
             wait_for_query_opt(cancel_token, query_timeout, db::sqlite::execute_query_with_max_rows(&p, sql, max_rows))
                 .await
         }
@@ -2937,6 +2957,42 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
         }
     };
 
+    let execution_plan = query_execution_plan(sql, db_type, is_sqlserver_agent);
+    let continue_on_error = options.continue_on_error && !execution_plan.stop_on_error;
+    let statements = execution_plan.statements;
+    if statements.is_empty() {
+        return Ok(vec![empty_query_result(0).into()]);
+    }
+
+    // Check the transaction request before database-specific fast paths. Otherwise
+    // a backend such as SQL Server or HTTP SQLite can return successful
+    // auto-commit results while the API has promised a rollbackable batch.
+    // The DDL cap applies only to this opt-in use_transaction contract: a script
+    // that the user asked to run atomically must not silently produce partial
+    // effects. Other callers that share the transaction kernel (schema-diff
+    // deploy, imports) document a mixed-outcome-on-failure behaviour instead, so
+    // they are deliberately not capped here.
+    if options.use_transaction == Some(true) && statements.len() > 1 {
+        if batch_transaction_ddl_is_unrollbackable(db_type, &statements) {
+            return Err(
+                "use_transaction cannot be used with a batch whose DDL cannot be rolled back: DDL statements implicitly commit and cannot be undone. Run the batch without use_transaction (auto-commit, one result per statement) or split the DDL and DML into separate calls."
+                    .to_string()
+                    .into(),
+            );
+        }
+        let result = execute_statements_in_transaction_typed(
+            state,
+            connection_id,
+            database,
+            &statements,
+            schema,
+            options.catalog.as_deref(),
+            options.timeout_secs,
+        )
+        .await?;
+        return Ok(vec![result.into()]);
+    }
+
     if is_sqlserver {
         return execute_multi_sqlserver(state, &pool_key, sql, cancel_token, options).await.map_err(Into::into);
     }
@@ -2949,7 +3005,7 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     };
 
     // HTTP SQLite providers send all statements in one request so the provider
-    // can preserve batch ordering and atomicity.
+    // can preserve batch ordering and atomicity in the default batch mode.
     if is_http_sqlite {
         let table_data_preview = options.table_data_preview;
         return single_statement_multi_result(
@@ -2965,28 +3021,6 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
             .await,
             table_data_preview,
         );
-    }
-
-    let execution_plan = query_execution_plan(sql, db_type, is_sqlserver_agent);
-    let continue_on_error = options.continue_on_error && !execution_plan.stop_on_error;
-    let statements = execution_plan.statements;
-    if statements.is_empty() {
-        return Ok(vec![empty_query_result(0).into()]);
-    }
-
-    // When use_transaction is explicitly true and we have multiple statements,
-    // route through the transaction wrapper instead of the sequential auto-commit loop.
-    if options.use_transaction == Some(true) && statements.len() > 1 {
-        let result = execute_statements_in_transaction_typed(
-            state,
-            connection_id,
-            database,
-            &statements,
-            schema,
-            options.catalog.as_deref(),
-        )
-        .await?;
-        return Ok(vec![result.into()]);
     }
 
     let mysql_pool = {
@@ -3106,7 +3140,12 @@ pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
     Ok(results)
 }
 
-fn query_execution_plan(
+/// Split a batch script into the statements the core will execute, using the
+/// same dialect-aware splitter for every caller. SQL Server agent pools split on
+/// `GO` batch separators (`split_sql_batches`); everything else uses the
+/// database-dialect statement splitter. Public so the MCP pre-check can align its
+/// transaction-entry decision with the core's actual script split.
+pub fn query_execution_plan(
     sql: &str,
     db_type: Option<DatabaseType>,
     preserve_sqlserver_batches: bool,
@@ -3119,6 +3158,38 @@ fn query_execution_plan(
         || crate::sql::SqlExecutionPlan { statements: split_sql_statements(sql), stop_on_error: false },
         |db_type| crate::sql::sql_execution_plan_for_database(sql, db_type),
     )
+}
+
+/// Whether a connection's pool is the SQL Server agent driver, mirroring the
+/// predicate the core uses to select the batch splitter in [`query_execution_plan`].
+/// Reads the existing pool without creating one so callers (the MCP pre-check)
+/// can align their splitter without opening a connection. `false` for non-SQL
+/// Server connections and when no pool is open yet. A SQL Server connection
+/// backed by the legacy agent driver connects as `PoolKind::Agent` and is
+/// detected here; the native driver connects as `PoolKind::SqlServer` and
+/// returns `false`.
+pub async fn connection_pool_is_sqlserver_agent(state: &AppState, connection_id: &str, database: &str) -> bool {
+    let db_type = connection_database_type(state, connection_id).await;
+    if db_type != Some(DatabaseType::SqlServer) {
+        return false;
+    }
+
+    // SQL Server base pool keys are either `connection_id` (no database) or
+    // `connection_id:database`. Peek both without creating a pool.
+    let candidates = match database.trim() {
+        "" => vec![connection_id.to_string()],
+        db => vec![format!("{connection_id}:{db}"), connection_id.to_string()],
+    };
+    for key in candidates {
+        if let Some(pool) = state.pool_handle(&key).await {
+            return match pool {
+                PoolKind::Agent(_) => true,
+                PoolKind::SqlServer(_) => false,
+                _ => false,
+            };
+        }
+    }
+    false
 }
 
 fn single_statement_multi_result(
@@ -3945,7 +4016,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
 /// - Returns a structured result (never re-executes statements to probe status).
 /// - Comment-only / empty scripts succeed as `committed` with zero statements.
 /// - When the target path cannot guarantee DDL atomicity (MySQL/Oracle DDL
-///   auto-commit, `TxPath::None`, etc.), a failure reports `mixed` and
+///   auto-commit, unsupported batch transaction paths, etc.), a failure reports `mixed` and
 ///   `executed_count` reflects the statements that were issued before the
 ///   error, so the caller can warn the user that partial effects may persist.
 pub async fn execute_schema_diff_deploy(
@@ -4087,11 +4158,10 @@ pub async fn execute_schema_diff_deploy(
 
 /// Execute multiple SQL statements within a single transaction.
 /// For pooled drivers (Postgres/MySQL), uses the driver transaction API.
-/// For SQLite and already-single-connection drivers (ClickHouse/SqlServer/Agent),
-/// uses explicit BEGIN/COMMIT/ROLLBACK on the shared connection.
-/// For databases that don't support explicit transactions (Redis, MongoDB, Oracle),
-/// executes statements sequentially without transaction.
-/// If BEGIN fails, returns an error instead of silently falling back to auto-commit.
+/// For SQLite and SQL Server, uses a transaction on the driver's shared connection.
+/// Agent drivers must provide the same rollbackable transaction contract.
+/// Backends without a verified rollbackable path are rejected instead of being
+/// silently executed one statement at a time in auto-commit mode.
 pub async fn execute_statements_in_transaction(
     state: &AppState,
     connection_id: &str,
@@ -4100,7 +4170,7 @@ pub async fn execute_statements_in_transaction(
     schema: Option<&str>,
     catalog: Option<&str>,
 ) -> Result<db::QueryResult, String> {
-    execute_statements_in_transaction_typed(state, connection_id, database, statements, schema, catalog)
+    execute_statements_in_transaction_typed(state, connection_id, database, statements, schema, catalog, None)
         .await
         .map_err(QueryExecutionError::into_legacy_string)
 }
@@ -4113,6 +4183,7 @@ pub async fn execute_statements_in_transaction_typed(
     statements: &[String],
     schema: Option<&str>,
     catalog: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<db::QueryResult, QueryExecutionError> {
     let sql_ctx = statements.first().map(|s| s.as_str()).unwrap_or("");
     let pool_database = query_pool_database(database, catalog);
@@ -4129,6 +4200,7 @@ pub async fn execute_statements_in_transaction_typed(
         statements,
         schema,
         catalog,
+        timeout_secs,
     )
     .await
 }
@@ -4152,6 +4224,7 @@ pub async fn execute_statements_in_transaction_on_pool(
         statements,
         schema,
         catalog,
+        None,
     )
     .await
     .map_err(QueryExecutionError::into_legacy_string)
@@ -4166,50 +4239,32 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
     statements: &[String],
     schema: Option<&str>,
     catalog: Option<&str>,
+    timeout_secs: Option<u64>,
 ) -> Result<db::QueryResult, QueryExecutionError> {
+    let db_type = connection_database_type(state, connection_id).await;
+
     // Read-only check: intercept all transaction paths before dispatching
     check_read_only_for_connection_multi(state, pool_key, statements).await?;
 
     let start = std::time::Instant::now();
-    let db_type = connection_database_type(state, connection_id).await;
     let mysql_catalog_dialect = connection_mysql_catalog_dialect(state, connection_id).await;
-    let operation_budget = configured_operation_budget_for_pool_key(state, pool_key).await;
+    let mut operation_budget = configured_operation_budget_for_pool_key(state, pool_key).await;
+    apply_query_timeout_override(&mut operation_budget, timeout_secs);
 
+    // This is the single capability model for explicit batch transactions.
+    // Do not add a backend here unless its execution path keeps every statement
+    // on one transaction-capable connection and can roll back on failure.
+    // Agent drivers are delegated because their transaction RPC has the same
+    // contract and rejects drivers that cannot provide it.
     // Clone the pool handle within the lock, then drop it before any async work.
-    let path = {
-        state.pool_handle(pool_key).await.as_ref().map(|p| match p {
-            PoolKind::Postgres(pg) => TxPath::Pg(pg.clone()),
-            PoolKind::Mysql(mp, _mode) => TxPath::Mysql(mp.clone(), false),
-            PoolKind::Sqlite(sq) => TxPath::Sqlite(sq.clone()),
-            PoolKind::CloudflareD1(client) => TxPath::CloudflareD1(client.clone()),
-            PoolKind::ClickHouse(_) | PoolKind::Rqlite(_) | PoolKind::Turso(_) | PoolKind::SqlServer(_) => {
-                TxPath::Explicit
-            }
-            PoolKind::Agent(client) => TxPath::Agent(client.clone()),
-            PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::Consul(_) | PoolKind::HBase(_) => TxPath::None,
-            #[cfg(feature = "mq-admin")]
-            PoolKind::Mqtt(_) => TxPath::None,
-            PoolKind::DuckDbWorker(_)
-            | PoolKind::Redis(_)
-            | PoolKind::MongoDb(_)
-            | PoolKind::DynamoDb(_)
-            | PoolKind::Elasticsearch(_)
-            | PoolKind::Easysearch(_)
-            | PoolKind::Meilisearch(_)
-            | PoolKind::VectorDb(_)
-            | PoolKind::InfluxDb(_)
-            | PoolKind::InfluxDb3(_)
-            | PoolKind::VictoriaMetrics(_)
-            | PoolKind::ExternalDriver { .. } => TxPath::None,
-        })
-    };
+    let path = { state.pool_handle(pool_key).await.as_ref().map(batch_transaction_path) };
 
     let result = match path {
-        Some(TxPath::Pg(pool)) => {
+        Some(BatchTransactionPath::Pg(pool)) => {
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
             exec_tx_pg_inner(pool, statements, schema, start, operation_budget.clone(), cancel_context).await
         }
-        Some(TxPath::Mysql(pool, _bare)) => exec_tx_mysql_inner(
+        Some(BatchTransactionPath::Mysql(pool)) => exec_tx_mysql_inner(
             state,
             pool_key,
             pool,
@@ -4222,37 +4277,37 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
         )
         .await
         .map_err(Into::into),
-        Some(TxPath::Sqlite(pool)) => exec_tx_sqlite_inner(pool, statements, start).await.map_err(Into::into),
-        Some(TxPath::CloudflareD1(client)) => {
-            let sql = statements.join(";\n");
-            wait_for_query_opt(
-                None,
-                operation_budget.query_timeout,
-                db::cloudflare_d1_driver::execute_query_with_max_rows(&client, &sql, None),
-            )
-            .await
-            .map_err(Into::into)
+        Some(BatchTransactionPath::Sqlite(pool)) => {
+            exec_tx_sqlite_inner(pool, statements, start, &operation_budget).await.map_err(Into::into)
         }
-        Some(TxPath::Agent(client)) => {
-            let result = exec_tx_agent_inner(client.clone(), db_type, Some(database), statements, schema, start).await;
+        Some(BatchTransactionPath::Agent(client)) => {
+            let result = exec_tx_agent_inner(
+                client.clone(),
+                db_type,
+                Some(database),
+                statements,
+                schema,
+                start,
+                &operation_budget,
+            )
+            .await;
             if let Err(error) = result.as_ref() {
                 discard_agent_pool_after_typed_error(state, pool_key, &client, error, RecoveryScope::UserOperation)
                     .await;
             }
             return result.map_err(QueryExecutionError::Agent);
         }
-        Some(TxPath::Explicit) => {
+        Some(BatchTransactionPath::Explicit) => {
             let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
             exec_tx_explicit_inner(state, pool_key, mysql_dialect, Some(database), statements, schema, start)
                 .await
                 .map_err(Into::into)
         }
-        Some(TxPath::None) => {
-            let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
-            exec_tx_none_inner(state, pool_key, mysql_dialect, Some(database), statements, schema, start)
-                .await
-                .map_err(Into::into)
-        }
+        Some(BatchTransactionPath::Unsupported) => Err(
+            "The active backend cannot provide a rollbackable transaction for a batch; run without use_transaction."
+                .to_string()
+                .into(),
+        ),
         None => Err("Connection not found for transaction".to_string().into()),
     };
 
@@ -4263,15 +4318,64 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
     result
 }
 
-/// Owned pool variants for safe dispatch across async boundaries.
-enum TxPath {
+/// Whether an opt-in explicit batch transaction (`use_transaction`) must be
+/// rejected because the backend's DDL statements implicitly commit and cannot be
+/// rolled back. Used by the opt-in batch-transaction entry point (the
+/// `use_transaction` branch of [`execute_multi_core_with_options_for_client_and_progress_typed`])
+/// and by the MCP layer's identical pre-check. It covers every backend whose DDL
+/// is not rollbackable (MySQL-family and Oracle) via the single capability
+/// predicate (`database_supports_transactional_ddl`) without re-listing engines
+/// here. Paths that document a mixed-outcome-on-failure behaviour (schema-diff
+/// deploy, imports) do not call this and keep running-and-reporting.
+pub fn batch_transaction_ddl_is_unrollbackable(db_type: Option<DatabaseType>, statements: &[String]) -> bool {
+    let Some(db_type) = db_type else {
+        return false;
+    };
+    if database_supports_transactional_ddl(db_type) {
+        return false;
+    }
+    statements.iter().any(|statement| matches!(classify_sql_risk_for_database(statement, db_type), Ok(SqlRisk::Ddl)))
+}
+
+/// Owned transaction-capable pool variants for safe dispatch across async boundaries.
+enum BatchTransactionPath {
     Pg(deadpool_postgres::Pool),
-    Mysql(db::mysql::MySqlPool, bool),
+    Mysql(db::mysql::MySqlPool),
     Sqlite(db::sqlite::SqliteHandle),
-    CloudflareD1(db::cloudflare_d1_driver::CloudflareD1Client),
     Agent(Arc<crate::db::agent_driver::PooledAgentClient>),
     Explicit,
-    None,
+    Unsupported,
+}
+
+fn batch_transaction_path(pool: &PoolKind) -> BatchTransactionPath {
+    match pool {
+        PoolKind::Postgres(pg) => BatchTransactionPath::Pg(pg.clone()),
+        PoolKind::Mysql(pool, _mode) => BatchTransactionPath::Mysql(pool.clone()),
+        PoolKind::Sqlite(pool) => BatchTransactionPath::Sqlite(pool.clone()),
+        PoolKind::SqlServer(_) => BatchTransactionPath::Explicit,
+        PoolKind::Agent(client) => BatchTransactionPath::Agent(client.clone()),
+        PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::Consul(_) | PoolKind::HBase(_) => {
+            BatchTransactionPath::Unsupported
+        }
+        #[cfg(feature = "mq-admin")]
+        PoolKind::Mqtt(_) => BatchTransactionPath::Unsupported,
+        PoolKind::DuckDbWorker(_)
+        | PoolKind::Redis(_)
+        | PoolKind::MongoDb(_)
+        | PoolKind::DynamoDb(_)
+        | PoolKind::ClickHouse(_)
+        | PoolKind::Rqlite(_)
+        | PoolKind::Turso(_)
+        | PoolKind::CloudflareD1(_)
+        | PoolKind::Elasticsearch(_)
+        | PoolKind::Easysearch(_)
+        | PoolKind::Meilisearch(_)
+        | PoolKind::VectorDb(_)
+        | PoolKind::InfluxDb(_)
+        | PoolKind::InfluxDb3(_)
+        | PoolKind::VictoriaMetrics(_)
+        | PoolKind::ExternalDriver { .. } => BatchTransactionPath::Unsupported,
+    }
 }
 
 // Each of these acquires a dedicated connection and runs all statements within
@@ -4457,40 +4561,173 @@ async fn exec_tx_sqlite_inner(
     pool: db::sqlite::SqliteHandle,
     statements: &[String],
     start: std::time::Instant,
+    budget: &DbOperationBudget,
 ) -> Result<db::QueryResult, String> {
     let statements = statements.to_vec();
+    let query_timeout = budget.query_timeout;
     tokio::task::spawn_blocking(move || {
         pool.with_connection(|conn| {
             conn.execute_batch("BEGIN").map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+            // rusqlite's synchronous API blocks for the full duration of a single
+            // statement, so a per-statement-boundary elapsed check alone cannot
+            // interrupt a statement that itself runs past the query budget. Use a
+            // cross-thread watchdog: it sleeps on a condvar for the budget, then
+            // fires `InterruptHandle::interrupt()` (SQLITE_INTERRUPT) which aborts
+            // the currently executing statement mid-flight. The watchdog is disarmed
+            // and joined before COMMIT so a stale interrupt can never land on a
+            // future, unrelated query of this pooled connection.
+            let interrupt = conn.get_interrupt_handle();
+            let armed = Arc::new((Mutex::new(true), Condvar::new()));
+            let watchdog = match query_timeout {
+                Some(timeout) => {
+                    let armed = armed.clone();
+                    Some(std::thread::spawn(move || {
+                        let (lock, cvar) = &*armed;
+                        let mut guard = lock.lock().unwrap();
+                        let mut should_interrupt = false;
+                        if *guard {
+                            // Armed at wait start: wait for the budget or until the
+                            // main thread disarms (notifies) after finishing. A
+                            // spurious wakeup re-waits for the remaining budget, so
+                            // interrupt() only fires when the budget genuinely
+                            // elapsed while still armed.
+                            let wait_start = std::time::Instant::now();
+                            let mut remaining = timeout;
+                            loop {
+                                let (guard2, wait_result) = cvar
+                                    .wait_timeout(guard, remaining)
+                                    .expect("sqlite tx watchdog condvar wait poisoned");
+                                guard = guard2;
+                                if !*guard {
+                                    // Disarmed: the main thread finished first.
+                                    break;
+                                }
+                                if wait_result.timed_out() || wait_start.elapsed() >= timeout {
+                                    // Budget elapsed while still armed: interrupt.
+                                    should_interrupt = true;
+                                    break;
+                                }
+                                remaining = timeout.saturating_sub(wait_start.elapsed());
+                            }
+                        }
+                        if should_interrupt {
+                            interrupt.interrupt();
+                        }
+                    }))
+                }
+                None => None,
+            };
+
+            let mut timeout_error: Option<String> = None;
+            let mut statement_error: Option<String> = None;
             let mut total_affected: u64 = 0;
-            for (i, sql) in statements.iter().enumerate() {
-                match conn.execute_batch(sql) {
-                    Ok(_) => total_affected += conn.changes(),
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK");
-                        return Err(query_error_with_omitted_sql_context(
-                            &format!("Statement {} failed: {}", i + 1, e),
-                            sql,
-                        ));
+            let result = (|| {
+                for (i, sql) in statements.iter().enumerate() {
+                    // Defense in depth: the boundary check still runs (it also
+                    // guarantees we never COMMIT past the budget even if the
+                    // watchdog was not armed because the timeout is None).
+                    if let Some(timeout) = query_timeout {
+                        if start.elapsed() >= timeout {
+                            timeout_error = Some(format!("Query timed out after {} seconds", timeout.as_secs()));
+                            return Err(());
+                        }
+                    }
+                    match conn.execute_batch(sql) {
+                        Ok(_) => total_affected += conn.changes(),
+                        Err(e) => {
+                            // The watchdog interrupt aborts the statement with
+                            // SQLITE_INTERRUPT; surface it as a query timeout
+                            // (matching `mysql_query_iter_with_timeout` wording so
+                            // `is_dbx_query_timeout_error` recognizes it). The
+                            // interrupt is detected by the SQLITE_INTERRUPT error
+                            // code, never by matching "interrupt" in the message
+                            // text (user/trigger/constraint text could otherwise
+                            // be misclassified as a timeout).
+                            //
+                            // The SQLITE_INTERRUPT error-code match is only
+                            // consulted when a query budget is set: the watchdog
+                            // (this function's only in-process source of
+                            // SQLITE_INTERRUPT intended to be a timeout) is only
+                            // armed when query_timeout is Some. An EXTERNAL
+                            // interrupt (e.g. the query_cancel mechanism) with no
+                            // budget must surface as a normal statement error, not
+                            // a timeout — misclassifying it panics on
+                            // `query_timeout.unwrap()` below (None) and skips the
+                            // ROLLBACK/disarm below, leaking the open transaction.
+                            let timed_out = query_timeout.is_some_and(|timeout| {
+                                start.elapsed() >= timeout
+                                    || matches!(
+                                        e.sqlite_error_code(),
+                                        Some(rusqlite::ffi::ErrorCode::OperationInterrupted)
+                                    )
+                            });
+                            if timed_out {
+                                timeout_error = Some(format!(
+                                    "Query timed out after {} seconds",
+                                    query_timeout.unwrap_or_default().as_secs()
+                                ));
+                                return Err(());
+                            }
+                            statement_error = Some(query_error_with_omitted_sql_context(
+                                &format!("Statement {} failed: {}", i + 1, e),
+                                sql,
+                            ));
+                            return Err(());
+                        }
                     }
                 }
+                Ok(())
+            })();
+
+            // Disarm and join the watchdog before issuing COMMIT (or ROLLBACK) so
+            // no interrupt can be delivered after the transaction ends.
+            {
+                let (lock, cvar) = &*armed;
+                *lock.lock().unwrap() = false;
+                cvar.notify_all();
             }
-            conn.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {}", e))?;
-            Ok(db::QueryResult {
-                columns: vec![],
-                column_types: Vec::new(),
-                column_sortables: vec![],
-                spatial_columns: vec![],
-                spatial_values: vec![],
-                rows: vec![],
-                affected_rows: total_affected,
-                execution_time_ms: start.elapsed().as_millis(),
-                truncated: false,
-                session_id: None,
-                has_more: false,
-                elasticsearch_raw_body: None,
-                messages: Vec::new(),
-            })
+            if let Some(watchdog) = watchdog {
+                watchdog.join().expect("sqlite tx watchdog thread joined");
+            }
+
+            match result {
+                Ok(()) => {
+                    // The boundary check above runs at the top of each loop
+                    // iteration only. After the last statement the loop returns
+                    // Ok and COMMIT would run without any elapsed re-check, so a
+                    // statement that started under budget and finished after the
+                    // budget elapsed could still COMMIT. Guard once more here,
+                    // before COMMIT, so we never COMMIT past the budget.
+                    if let Some(timeout) = query_timeout {
+                        if start.elapsed() >= timeout {
+                            let _ = conn.execute_batch("ROLLBACK");
+                            return Err(format!("Query timed out after {} seconds", timeout.as_secs()));
+                        }
+                    }
+                    conn.execute_batch("COMMIT").map_err(|e| format!("COMMIT failed: {}", e)).map(|_| db::QueryResult {
+                        columns: vec![],
+                        column_types: Vec::new(),
+                        column_sortables: vec![],
+                        spatial_columns: vec![],
+                        spatial_values: vec![],
+                        rows: vec![],
+                        affected_rows: total_affected,
+                        execution_time_ms: start.elapsed().as_millis(),
+                        truncated: false,
+                        session_id: None,
+                        has_more: false,
+                        elasticsearch_raw_body: None,
+                        messages: Vec::new(),
+                    })
+                }
+                Err(()) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(timeout_error
+                        .or(statement_error)
+                        .unwrap_or_else(|| "Statement execution failed inside the transaction".to_string()))
+                }
+            }
         })
     })
     .await
@@ -4575,6 +4812,7 @@ async fn exec_tx_agent_inner(
     statements: &[String],
     schema: Option<&str>,
     start: std::time::Instant,
+    budget: &DbOperationBudget,
 ) -> Result<db::QueryResult, AgentCallError> {
     let execution_schema = schema_for_execution_context(db_type, schema);
     let rewritten_statements;
@@ -4588,54 +4826,9 @@ async fn exec_tx_agent_inner(
         statements
     };
     let mut client = client.lock().await;
-    let result: db::QueryResult = client.execute_transaction_typed(database, statements, execution_schema).await?;
+    let result: db::QueryResult =
+        client.execute_transaction_typed(database, statements, execution_schema, budget.query_timeout).await?;
     Ok(db::QueryResult { execution_time_ms: start.elapsed().as_millis(), ..result })
-}
-
-async fn exec_tx_none_inner(
-    state: &AppState,
-    pool_key: &str,
-    mysql_dialect: db::mysql::MySqlQueryDialect,
-    database: Option<&str>,
-    statements: &[String],
-    schema: Option<&str>,
-    start: std::time::Instant,
-) -> Result<db::QueryResult, String> {
-    let mut total_affected: u64 = 0;
-    for (i, sql) in statements.iter().enumerate() {
-        log::info!("[query][tx-none:statement:start] index={}", i + 1);
-        match do_execute(state, pool_key, mysql_dialect, database, sql, schema, None, QueryExecutionOptions::default())
-            .await
-        {
-            Ok(result) => {
-                total_affected += result.affected_rows;
-                log::info!("[query][tx-none:statement:done] index={} affected_rows={}", i + 1, result.affected_rows);
-            }
-            Err(e) => {
-                log::warn!("Statement {} failed (no transaction support): {}", i + 1, e);
-                return Err(query_error_with_omitted_sql_context(
-                    &format!("Statement {} failed: {}. No transaction support for this database type.", i + 1, e),
-                    sql,
-                ));
-            }
-        }
-    }
-
-    Ok(db::QueryResult {
-        columns: vec![],
-        column_types: Vec::new(),
-        column_sortables: vec![],
-        spatial_columns: vec![],
-        spatial_values: vec![],
-        rows: vec![],
-        affected_rows: total_affected,
-        execution_time_ms: start.elapsed().as_millis(),
-        truncated: false,
-        session_id: None,
-        has_more: false,
-        elasticsearch_raw_body: None,
-        messages: Vec::new(),
-    })
 }
 
 /// Start a manual transaction session, holding a connection from the pool.
@@ -4774,6 +4967,7 @@ async fn begin_transaction_session(
             (TxnConnection::Mysql(Some(conn)), probe_pool_key.clone())
         }
         TxnPoolHandle::Agent => {
+            let db_type = connection_database_type(state, connection_id).await;
             let client_session_id = format!("manual-txn-{}", uuid::Uuid::new_v4());
             let agent_pool_key =
                 state.get_or_create_pool_for_session(connection_id, pool_database, Some(&client_session_id)).await?;
@@ -4789,7 +4983,9 @@ async fn begin_transaction_session(
             };
             let begin_result = {
                 let mut locked = client.lock().await;
-                locked.begin_manual_transaction::<serde_json::Value>(schema).await
+                locked
+                    .begin_manual_transaction::<serde_json::Value>(schema_for_execution_context(db_type, schema))
+                    .await
             };
             if let Err(error) = begin_result {
                 let _ = state.close_client_session_pool(connection_id, pool_database, &client_session_id).await;
@@ -5264,82 +5460,53 @@ where
             }
         }
         TxnConnection::Mysql(Some(conn)) => {
-            let query_result = match cancel_token.as_ref() {
-                Some(cancel_token) => {
-                    tokio::select! {
-                        _ = cancel_token.cancelled() => Err(QUERY_CANCELED.to_string()),
-                        result = conn.query_iter(sql) => result.map_err(|error| format!("Query failed: {error}")),
+            // The query timeout is an inactivity budget reset by every received row,
+            // not a cap on the total duration of a long backup/export stream.
+            let progress_clock = Arc::new(StreamProgressClock::new());
+            let progress_clock_for_rows = progress_clock.clone();
+            let timeout_error = format!(
+                "Query timed out after {} seconds",
+                operation_budget.query_timeout.map_or(0, |timeout| timeout.as_secs())
+            );
+            let stream_future = async {
+                let mut result = conn.query_iter(sql).await.map_err(|error| format!("Query failed: {error}"))?;
+                let Some(mut stream) =
+                    result.stream::<mysql_async::Row>().await.map_err(|error| format!("Query failed: {error}"))?
+                else {
+                    return Err("Empty result set stream".to_string());
+                };
+
+                let mut batch = Vec::with_capacity(batch_size);
+                let mut total_rows = 0_u64;
+                while let Some(row_result) = stream.next().await {
+                    match row_result {
+                        Ok(row) => {
+                            batch.push(
+                                (0..row.len()).map(|index| db::mysql::mysql_value_to_json(&row, index)).collect(),
+                            );
+                            total_rows += 1;
+                            if batch.len() >= batch_size {
+                                on_batch(std::mem::take(&mut batch))?;
+                                batch = Vec::with_capacity(batch_size);
+                            }
+                        }
+                        Err(err) => return Err(format!("Query failed: {err}")),
                     }
+                    progress_clock_for_rows.mark();
                 }
-                None => conn.query_iter(sql).await.map_err(|error| format!("Query failed: {error}")),
+                if !batch.is_empty() {
+                    on_batch(batch)?;
+                }
+                Ok(total_rows)
             };
-            match query_result {
-                Ok(mut result) => {
-                    let stream_result = match cancel_token.as_ref() {
-                        Some(cancel_token) => {
-                            tokio::select! {
-                                _ = cancel_token.cancelled() => Err(QUERY_CANCELED.to_string()),
-                                stream = result.stream::<mysql_async::Row>() => stream.map_err(|error| format!("Query failed: {error}")),
-                            }
-                        }
-                        None => {
-                            result.stream::<mysql_async::Row>().await.map_err(|error| format!("Query failed: {error}"))
-                        }
-                    };
-                    match stream_result {
-                        Ok(Some(mut stream)) => {
-                            let mut batch = Vec::with_capacity(batch_size);
-                            let mut total_rows = 0_u64;
-                            let mut error = None;
-                            loop {
-                                let next_row = match cancel_token.as_ref() {
-                                    Some(cancel_token) => {
-                                        tokio::select! {
-                                            _ = cancel_token.cancelled() => {
-                                                error = Some(QUERY_CANCELED.to_string());
-                                                break;
-                                            }
-                                            row = stream.next() => row,
-                                        }
-                                    }
-                                    None => stream.next().await,
-                                };
-                                let Some(row_result) = next_row else { break };
-                                match row_result {
-                                    Ok(row) => {
-                                        batch.push(
-                                            (0..row.len())
-                                                .map(|index| db::mysql::mysql_value_to_json(&row, index))
-                                                .collect(),
-                                        );
-                                        total_rows += 1;
-                                        if batch.len() >= batch_size {
-                                            if let Err(err) = on_batch(std::mem::take(&mut batch)) {
-                                                error = Some(err);
-                                                break;
-                                            }
-                                            batch = Vec::with_capacity(batch_size);
-                                        }
-                                    }
-                                    Err(err) => {
-                                        error = Some(format!("Query failed: {err}"));
-                                        break;
-                                    }
-                                }
-                            }
-                            if error.is_none() && !batch.is_empty() {
-                                if let Err(err) = on_batch(batch) {
-                                    error = Some(err);
-                                }
-                            }
-                            error.map_or(Ok(total_rows), Err)
-                        }
-                        Ok(None) => Err("Empty result set stream".to_string()),
-                        Err(error) => Err(error),
-                    }
-                }
-                Err(error) => Err(error),
-            }
+            await_stream_with_progress_timeout(
+                stream_future,
+                operation_budget.query_timeout,
+                progress_clock,
+                cancel_token.as_ref(),
+                timeout_error,
+            )
+            .await
         }
         TxnConnection::Mysql(None) => Err(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR.to_string()),
         TxnConnection::Agent { .. } => {
@@ -5793,12 +5960,423 @@ pub async fn rollback_manual_transaction(state: &AppState, txn_session_id: &str)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_cancel::RunningTaskMetadata;
 
     #[test]
     fn redshift_queries_prefer_text_protocol() {
         assert!(postgres_prefers_text_protocol(Some(DatabaseType::Redshift)));
         assert!(!postgres_prefers_text_protocol(Some(DatabaseType::Postgres)));
         assert!(!postgres_prefers_text_protocol(None));
+    }
+
+    #[test]
+    fn apply_query_timeout_override_respects_resolve_semantics() {
+        // None leaves the budget unchanged.
+        let mut budget = DbOperationBudget::with_defaults();
+        let original = budget.query_timeout;
+        apply_query_timeout_override(&mut budget, None);
+        assert_eq!(budget.query_timeout, original);
+
+        // Some(5) sets query_timeout to 5s.
+        let mut budget = DbOperationBudget::with_defaults();
+        apply_query_timeout_override(&mut budget, Some(5));
+        assert_eq!(budget.query_timeout, Some(Duration::from_secs(5)));
+
+        // Some(0) clears the limit (unlimited), matching resolve_query_timeout.
+        let mut budget = DbOperationBudget::with_defaults();
+        apply_query_timeout_override(&mut budget, Some(0));
+        assert_eq!(budget.query_timeout, None);
+    }
+
+    #[tokio::test]
+    async fn sqlite_transaction_timeout_rolls_back_and_commits_nothing() {
+        use std::sync::mpsc;
+
+        let pool = db::sqlite::connect_path(":memory:").await.expect("connect in-memory SQLite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        // Deterministic timeout: hold the connection lock from a helper thread so the
+        // transaction's first statement-boundary check is guaranteed to observe
+        // elapsed time >= the 1ms query budget, regardless of machine speed.
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = Some(Duration::from_millis(1));
+        let (lock_held_tx, lock_held_rx) = mpsc::channel();
+        let holder = {
+            let pool = pool.clone();
+            std::thread::spawn(move || {
+                pool.with_connection(|_conn| {
+                    let _ = lock_held_tx.send(());
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(())
+                })
+                .expect("helper holds sqlite connection lock");
+            })
+        };
+        lock_held_rx.recv().expect("helper acquired sqlite connection lock");
+
+        let error = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t (val) VALUES ('one')".to_string(), "INSERT INTO t (val) VALUES ('two')".to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect_err("sqlite transaction must time out");
+
+        assert!(error.contains("Query timed out after"), "unexpected error: {error}");
+
+        // The transaction was rolled back (or never got past the first statement):
+        // no partial rows may survive.
+        holder.join().expect("helper thread joined");
+        let result = db::sqlite::execute_query(&pool, "SELECT COUNT(*) AS n FROM t").await.expect("count rows");
+        assert_eq!(result.rows[0][0], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn sqlite_slow_statement_is_interrupted_and_rolled_back() {
+        // A statement that genuinely BLOCKS past the query budget must be aborted
+        // mid-flight by the watchdog (SQLITE_INTERRUPT) rather than running to
+        // completion and then committing. This is the gap the lock-holder test
+        // above does not cover: that one only makes the first statement-boundary
+        // check observe an already-elapsed budget.
+        //
+        // Lock-holder approach verified empirically and REJECTED: holding a write
+        // lock from a second connection and letting the main handle busy-wait is
+        // NOT interrupted by sqlite3_interrupt on the bundled SQLite 3.45.3
+        // (rusqlite 0.32). `pager_wait_on_lock` loops on the busy handler without
+        // re-checking `db->u1.isInterrupted`, so the wait runs out the full busy
+        // timeout (a 60s wait with a 50ms budget confirmed it) instead of failing
+        // fast. So the deterministic proof uses a slow-but-bounded statement whose
+        // VDBE loop re-checks the interrupt flag every iteration (WITH RECURSIVE
+        // row generator) — the watchdog interrupts it mid-flight.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join("slow.db");
+        let db_path = db_path.to_str().expect("utf8 temp path");
+
+        let pool = db::sqlite::connect_path_create_if_missing(db_path).await.expect("connect sqlite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = Some(Duration::from_millis(50));
+
+        // Generating 50M rows takes seconds, so this single statement is provably
+        // still running when the 50ms watchdog fires. A busy-wait would not prove
+        // the point (see above); this statement is interrupted mid-flight. It is
+        // the LAST statement of a 2-statement batch so it also exercises the
+        // loop-exit-then-final-guard path: a fast first statement, then a slow
+        // second one that is still running when the budget elapses.
+        let slow_sql = "INSERT INTO t (val) SELECT 'slow' FROM (WITH RECURSIVE cnt(x) AS \
+                        (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 50000000) SELECT x FROM cnt)";
+        let error = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t (val) VALUES ('fast')".to_string(), slow_sql.to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect_err("sqlite transaction with a slow statement must time out");
+
+        assert!(error.contains("Query timed out after"), "unexpected error: {error}");
+        let result = db::sqlite::execute_query(&pool, "SELECT COUNT(*) AS n FROM t").await.expect("count rows");
+        assert_eq!(result.rows[0][0], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn sqlite_legitimate_interrupt_text_error_is_not_reported_as_timeout() {
+        // A genuine statement error whose MESSAGE contains "interrupt" (here a
+        // missing column named `interrupted_at`) must NOT be misclassified as a
+        // watchdog timeout. The interrupt is detected by the SQLITE_INTERRUPT
+        // error code only, never by matching the message text. A large 60s budget
+        // guarantees elapsed can never trigger the timeout path, so only the
+        // error-code match could classify it.
+        let pool = db::sqlite::connect_path(":memory:").await.expect("connect in-memory SQLite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = Some(Duration::from_secs(60));
+
+        let error = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t (interrupted_at) VALUES (1)".to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect_err("sqlite transaction must fail with the statement error");
+
+        assert!(
+            !error.contains("Query timed out after"),
+            "legitimate 'interrupt'-text error must not be masked as a timeout: {error}"
+        );
+        assert!(error.contains("Statement 1 failed") && error.contains("interrupted_at"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn sqlite_external_interrupt_without_budget_does_not_panic() {
+        // Regression: with query_timeout = None (MCP policy can set it to 0 =
+        // unlimited; resolve_query_timeout(Some(0)) -> None), an SQLITE_INTERRUPT
+        // arriving from an EXTERNAL source (e.g. the query_cancel mechanism, not
+        // this function's watchdog, which is only armed when query_timeout is
+        // Some) used to be misclassified as a timeout, then `query_timeout.unwrap()`
+        // panicked on None. The panic fired before the watchdog disarm/join and
+        // before ROLLBACK, leaking the watchdog thread and leaving the BEGIN
+        // transaction open on the pooled connection.
+        //
+        // Determinism: the bundled SQLite 3.45.3 clears the interrupt flag at
+        // VDBE step start whenever `nVdbeActive == 0` (sqlite3Step), so a
+        // pre-set interrupt fires only if it lands mid-statement. This was
+        // verified empirically below. So the interrupt is issued from a timer
+        // thread DURING a slow-but-bounded statement whose VDBE loop re-checks
+        // the interrupt flag every iteration (WITH RECURSIVE row generator —
+        // same technique the watchdog test uses; a lock busy-wait would not be
+        // aborted because pager_wait_on_lock does not recheck isInterrupted).
+        let pool = db::sqlite::connect_path(":memory:").await.expect("connect in-memory SQLite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        let interrupt =
+            pool.with_connection(|conn| Ok(conn.get_interrupt_handle())).expect("get sqlite interrupt handle");
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = None; // external interrupt: no in-process watchdog is armed
+
+        // Arm the timer BEFORE the statement starts and send the go signal first,
+        // so the interrupt can land mid-statement. A single pre-set interrupt
+        // would be cleared (nVdbeActive==0 at step start), so the timer fires in
+        // a short retry loop: as soon as the slow statement is running, the flag
+        // sticks and the VDBE aborts on its next interrupt check. The `done` flag
+        // stops the loop as soon as exec returns so no stray interrupt can hit a
+        // later query, and we join the timer before any further query anyway.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (timer_tx, timer_rx) = std::sync::mpsc::channel();
+        let timer = {
+            let done = done.clone();
+            std::thread::spawn(move || {
+                timer_rx.recv().expect("go signal");
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !done.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
+                    interrupt.interrupt(); // external interrupt mid-statement
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+        timer_tx.send(()).expect("send go signal");
+
+        // Single slow statement that takes seconds to run, so an interrupt that
+        // lands within milliseconds of its start always hits mid-execution.
+        let slow_sql = "INSERT INTO t (val) SELECT 'slow' FROM (WITH RECURSIVE cnt(x) AS \
+                        (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 10000000) SELECT x FROM cnt)";
+        let error = exec_tx_sqlite_inner(pool.clone(), &[slow_sql.to_string()], std::time::Instant::now(), &budget)
+            .await
+            .expect_err("sqlite transaction must fail with the external interrupt");
+
+        done.store(true, Ordering::Relaxed);
+        timer.join().expect("timer thread joined");
+
+        // Must NOT panic, must NOT be masked as a timeout (no budget), and must
+        // surface as a plain statement error like any other failure.
+        assert!(
+            !error.contains("Query timed out after"),
+            "external interrupt with no budget must not be reported as a timeout: {error}"
+        );
+        assert!(
+            error.contains("Statement 1 failed") && error.contains("interrupted"),
+            "expected a plain interrupted-statement error, got: {error}"
+        );
+
+        // The external interrupt must still roll back the transaction (0 rows),
+        // just like any other statement failure.
+        let result = db::sqlite::execute_query(&pool, "SELECT COUNT(*) AS n FROM t").await.expect("count rows");
+        assert_eq!(result.rows[0][0], serde_json::json!(0));
+    }
+
+    #[tokio::test]
+    async fn sqlite_cancelled_query_can_execute_again_on_same_client_session() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = Storage::open(&dir.path().join("storage.db")).await.expect("open test storage");
+        let state = Arc::new(AppState::new(storage));
+        let connection_id = "sqlite-cancel-session";
+        let client_session_id = "query-tab-8414";
+        let execution_id = "sqlite-cancel-execution";
+        let db_path = dir.path().join("query.db");
+        std::fs::File::create(&db_path).expect("create SQLite database file");
+        let mut config = test_connection_config(DatabaseType::Sqlite);
+        config.id = connection_id.to_string();
+        config.host = db_path.to_string_lossy().into_owned();
+        config.query_timeout_secs = 0;
+        state.configs.write().await.insert(connection_id.to_string(), config);
+
+        let pool_key = state
+            .get_or_create_pool_for_session(connection_id, Some(""), Some(client_session_id))
+            .await
+            .expect("create SQLite query-tab session pool");
+        let sqlite = match state.pool_handle(&pool_key).await.expect("SQLite pool") {
+            PoolKind::Sqlite(pool) => pool,
+            _ => panic!("expected SQLite pool"),
+        };
+        db::sqlite::execute_query(&sqlite, "CREATE TABLE t (value TEXT)").await.expect("create test table");
+
+        let cleanup_interrupt =
+            sqlite.with_connection(|conn| Ok(conn.get_interrupt_handle())).expect("get SQLite interrupt handle");
+        let started = Arc::new(AtomicBool::new(false));
+        let started_by_sqlite = started.clone();
+        sqlite
+            .with_connection(|conn| {
+                conn.create_scalar_function(
+                    "dbx_test_query_started",
+                    0,
+                    rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                    move |_ctx| {
+                        started_by_sqlite.store(true, Ordering::SeqCst);
+                        Ok(1_i64)
+                    },
+                )
+                .map_err(|error| error.to_string())
+            })
+            .expect("register query-start marker");
+
+        let registered = state.running_queries.register_task(
+            execution_id.to_string(),
+            RunningTaskMetadata::query(connection_id, "", Some(client_session_id.to_string())),
+        );
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            execute_sql_statement_with_options_typed(
+                first_state.as_ref(),
+                connection_id,
+                "",
+                "INSERT INTO t (value) SELECT 'slow' FROM (WITH RECURSIVE cnt(x) AS (SELECT dbx_test_query_started() UNION ALL SELECT x + 1 FROM cnt WHERE x < 100000000) SELECT x FROM cnt)",
+                None,
+                Some(registered.token()),
+                QueryExecutionOptions {
+                    client_session_id: Some(client_session_id.to_string()),
+                    execution_id: Some(execution_id.to_string()),
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        let started_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !started.load(Ordering::SeqCst) {
+            assert!(!first.is_finished(), "slow SQLite query exited before it started");
+            assert!(std::time::Instant::now() < started_deadline, "slow SQLite query did not start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert!(state.running_queries.cancel(execution_id), "query cancellation was not registered");
+        let first_result = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("cancelled SQLite query did not return")
+            .expect("join cancelled SQLite query")
+            .expect_err("cancelled SQLite query unexpectedly succeeded");
+        assert!(
+            matches!(first_result, QueryExecutionError::Canceled { .. }),
+            "unexpected cancellation error: {first_result}"
+        );
+
+        let next_execution_id = "sqlite-cancel-execution-next";
+        let next_registered = state.running_queries.register_task(
+            next_execution_id.to_string(),
+            RunningTaskMetadata::query(connection_id, "", Some(client_session_id.to_string())),
+        );
+        let next_state = state.clone();
+        let mut next = tokio::spawn(async move {
+            execute_sql_statement_with_options_typed(
+                next_state.as_ref(),
+                connection_id,
+                "",
+                "SELECT 1",
+                None,
+                Some(next_registered.token()),
+                QueryExecutionOptions {
+                    client_session_id: Some(client_session_id.to_string()),
+                    execution_id: Some(next_execution_id.to_string()),
+                    timeout_secs: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        let next_wait = tokio::time::timeout(Duration::from_secs(2), &mut next).await;
+        let next_timed_out = next_wait.is_err();
+        if next_timed_out {
+            // Keep the regression test bounded even on the unfixed implementation:
+            // the manually retained handle interrupts the still-running blocking
+            // SQLite statement so the test runtime can shut down cleanly.
+            cleanup_interrupt.interrupt();
+        }
+        let next_result = match next_wait {
+            Ok(result) => result.expect("join follow-up SQLite query"),
+            Err(_) => tokio::time::timeout(Duration::from_secs(2), &mut next)
+                .await
+                .expect("follow-up SQLite query did not finish after cleanup interrupt")
+                .expect("join follow-up SQLite query after cleanup"),
+        };
+        assert!(!next_timed_out, "same query-tab SQLite session remained blocked after cancellation");
+        let next_result = next_result.expect("follow-up SELECT 1 failed");
+        assert_eq!(next_result.rows, vec![vec![serde_json::json!(1)]]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_pre_set_interrupt_is_cleared_before_next_statement() {
+        // Empirical probe for the pre-set-interrupt question: `sqlite3_interrupt`
+        // unconditionally sets the interrupt flag, but bundled SQLite 3.45.3
+        // clears it at VDBE step start whenever `nVdbeActive == 0` (sqlite3Step,
+        // "prevents a call to sqlite3_interrupt from interrupting a statement
+        // that has not yet started"). Verified here: a pre-set interrupt (with
+        // nothing running) is cleared before the NEXT statement begins, so that
+        // statement runs to completion. A regression test therefore cannot rely
+        // on a pre-set interrupt — it must interrupt DURING a running statement
+        // (see sqlite_external_interrupt_without_budget_does_not_panic).
+        let pool = db::sqlite::connect_path(":memory:").await.expect("connect in-memory SQLite");
+        db::sqlite::execute_query(&pool, "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .await
+            .expect("create table");
+
+        let interrupt =
+            pool.with_connection(|conn| Ok(conn.get_interrupt_handle())).expect("get sqlite interrupt handle");
+
+        // Pre-set the interrupt, then run a fast statement on the SAME
+        // connection: the flag is cleared at step start, so the statement
+        // succeeds (it does NOT fail with SQLITE_INTERRUPT).
+        pool.with_connection(|conn| {
+            interrupt.interrupt(); // pre-set, nothing running yet
+            conn.execute_batch("INSERT INTO t (val) VALUES ('one')").map_err(|e| e.to_string())
+        })
+        .expect("pre-set interrupt must be cleared before the statement runs");
+
+        // Same for a transaction: pre-set the interrupt, then the transaction's
+        // first statement must still run and commit.
+        pool.with_connection(|_conn| {
+            interrupt.interrupt(); // pre-set, nothing running yet
+            Ok(())
+        })
+        .expect("pre-set interrupt on idle connection");
+
+        let mut budget = DbOperationBudget::with_defaults();
+        budget.query_timeout = None;
+        let result = exec_tx_sqlite_inner(
+            pool.clone(),
+            &["INSERT INTO t (val) VALUES ('two')".to_string()],
+            std::time::Instant::now(),
+            &budget,
+        )
+        .await
+        .expect("transaction with a pre-set interrupt must still succeed (flag cleared at step start)");
+        assert_eq!(result.affected_rows, 1);
+
+        let count = db::sqlite::execute_query(&pool, "SELECT COUNT(*) AS n FROM t").await.expect("count rows");
+        assert_eq!(count.rows[0][0], serde_json::json!(2));
     }
 
     #[test]
@@ -6161,6 +6739,7 @@ for line in sys.stdin:
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -6248,6 +6827,18 @@ for line in sys.stdin:
             'rows': [[req['params']['sql']]], 'affected_rows': 0, 'execution_time_ms': 1,
             'truncated': False, 'session_id': None, 'has_more': False
         }
+    elif req['method'] in ('execute_batch', 'execute_transaction'):
+        if req['params'].get('schema') is not None:
+            print(json.dumps({
+                'jsonrpc': '2.0', 'id': req['id'],
+                'error': {'code': -1, 'message': 'legacy SQL Server schema switch attempted'}
+            }), flush=True)
+            continue
+        result = {
+            'columns': [], 'column_types': [], 'column_sortables': [], 'rows': [],
+            'affected_rows': 1, 'execution_time_ms': 1, 'truncated': False,
+            'session_id': None, 'has_more': False
+        }
     else:
         result = {}
     print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
@@ -6305,6 +6896,25 @@ for line in sys.stdin:
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].result.rows, vec![vec![serde_json::Value::String(sql.to_string())]]);
+
+        runtime.kill();
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sqlserver_agent_write_paths_do_not_request_schema_switch() {
+        let (state, dir, runtime) = sqlserver_agent_echo_state().await;
+        let statements = ["UPDATE [dbo].[users] SET [active] = 1 WHERE [id] = 7".to_string()];
+
+        let batch = execute_statements(&state, "conn-1", "", &statements, Some("dbo"), None).await.unwrap();
+        let transaction =
+            execute_statements_in_transaction_on_pool(&state, "conn-1", "conn-1", "", &statements, Some("dbo"), None)
+                .await
+                .unwrap();
+
+        assert_eq!(batch.affected_rows, 1);
+        assert_eq!(transaction.affected_rows, 1);
 
         runtime.kill();
         drop(state);
@@ -6388,7 +6998,7 @@ for line in sys.stdin:
         let error = execute_sql_statement(&state, "conn-1", "", "SELECT 1", None, None).await.unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.pool_handle("conn-1").await.is_some());
+        assert!(state.pool_handle("conn-1").await.is_none());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -6514,7 +7124,7 @@ for line in sys.stdin:
         .unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.pool_handle("conn-1").await.is_some());
+        assert!(state.pool_handle("conn-1").await.is_none());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -6531,7 +7141,7 @@ for line in sys.stdin:
                 .unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.pool_handle("conn-1").await.is_some());
+        assert!(state.pool_handle("conn-1").await.is_none());
         assert!(runtime.is_failed());
 
         runtime.kill();
@@ -6545,7 +7155,7 @@ for line in sys.stdin:
         let error = execute_sql_statement(&state, "conn-1", "", "SELECT 1", None, None).await.unwrap_err();
 
         assert!(error.contains("injected Agent failure"));
-        assert!(!state.pool_handle("conn-1").await.is_some());
+        assert!(state.pool_handle("conn-1").await.is_none());
         assert!(!runtime.is_failed());
 
         runtime.kill();
@@ -6649,6 +7259,79 @@ for line in sys.stdin:
         assert_eq!(!table_check.rows.is_empty(), continue_on_error);
     }
 
+    #[tokio::test]
+    async fn transactional_sqlite_batch_rolls_back_when_a_later_statement_fails() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-transaction-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "sqlite-transaction";
+        let sqlite = db::sqlite::connect_path_create_if_missing(dir.join("query.db").to_str().unwrap()).await.unwrap();
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Sqlite));
+
+        let error = execute_multi_core_with_options(
+            &state,
+            connection_id,
+            "",
+            "CREATE TABLE rolled_back_table (id INTEGER); INSERT INTO missing_table VALUES (1);",
+            None,
+            None,
+            QueryExecutionOptions { use_transaction: Some(true), ..Default::default() },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("missing_table"), "unexpected transaction error: {error}");
+
+        let table_check = execute_sql_statement(
+            &state,
+            connection_id,
+            "",
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'rolled_back_table'",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(table_check.rows.is_empty(), "the failed batch must roll back its preceding DDL");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn transactional_batch_rejects_an_unsupported_backend_before_execution() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-unsupported-transaction-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "message-queue-transaction";
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(connection_id.to_string(), PoolKind::MessageQueue);
+            })
+            .await;
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Redis));
+
+        let error = execute_multi_core_with_options(
+            &state,
+            connection_id,
+            "",
+            "INSERT INTO first_statement VALUES (1); INSERT INTO second_statement VALUES (2);",
+            None,
+            None,
+            QueryExecutionOptions { use_transaction: Some(true), ..Default::default() },
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("cannot provide a rollbackable transaction"), "unexpected transaction error: {error}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn agent_execute_batch_unsupported_detects_case_insensitive_method_errors() {
         assert!(is_agent_execute_batch_unsupported("Agent RPC error (-1): unknown method: execute_batch"));
@@ -6660,6 +7343,98 @@ for line in sys.stdin:
     fn agent_execute_batch_unsupported_ignores_unrelated_errors() {
         assert!(!is_agent_execute_batch_unsupported("ORA-00955: name is already used by an existing object"));
         assert!(!is_agent_execute_batch_unsupported("Agent RPC error (-1): unknown method: execute_query"));
+    }
+
+    #[test]
+    fn batch_transaction_ddl_is_unrollbackable_covers_oracle_and_mysql_family() {
+        let ddl = vec!["CREATE TABLE test_table (id INT)".to_string()];
+        let dml = vec!["INSERT INTO test_table VALUES (1)".to_string()];
+
+        // MySQL-family and Oracle DDL implicitly commit; explicit transactions
+        // over such DDL cannot be rolled back, so use_transaction is rejected.
+        for db in [DatabaseType::Mysql, DatabaseType::Goldendb, DatabaseType::Oracle] {
+            assert!(batch_transaction_ddl_is_unrollbackable(Some(db), &ddl), "expected {db:?} to reject DDL");
+        }
+        assert!(!batch_transaction_ddl_is_unrollbackable(Some(DatabaseType::Mysql), &dml));
+        // Postgres and SQLite have transactional DDL and must both be allowed.
+        assert!(!batch_transaction_ddl_is_unrollbackable(Some(DatabaseType::Postgres), &ddl));
+        assert!(!batch_transaction_ddl_is_unrollbackable(Some(DatabaseType::Sqlite), &ddl));
+        // An unknown db type cannot be verified — do not risk rejecting valid DDL batches.
+        assert!(!batch_transaction_ddl_is_unrollbackable(None, &ddl));
+    }
+
+    #[tokio::test]
+    async fn connection_pool_is_sqlserver_agent_detects_agent_and_native_pools() {
+        let dir = std::env::temp_dir().join(format!("dbx-query-sqlserver-agent-flag-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+
+        // Non-SQL-Server connections never use the SQL Server agent splitter.
+        state.configs.write().await.insert("pg".to_string(), test_connection_config(DatabaseType::Postgres));
+        assert!(!connection_pool_is_sqlserver_agent(&state, "pg", "").await);
+
+        // SQL Server with no pool yet defaults to the native (non-agent) splitter.
+        state.configs.write().await.insert("mssql".to_string(), test_connection_config(DatabaseType::SqlServer));
+        assert!(!connection_pool_is_sqlserver_agent(&state, "mssql", "").await);
+
+        // A SQL Server connection backed by the agent driver is detected, so the
+        // MCP pre-check uses the same GO-batch splitter as the core.
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(
+                    "mssql".to_string(),
+                    PoolKind::agent(crate::db::agent_driver::AgentDriverClient::test_stub()),
+                );
+            })
+            .await;
+        assert!(connection_pool_is_sqlserver_agent(&state, "mssql", "").await);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn transaction_kernel_dispatches_by_backend_capability_not_ddl_content() {
+        // Regression for the maintainer review: the unrollbackable-DDL cap now lives
+        // only in the opt-in use_transaction entry point. The shared transaction
+        // kernel dispatches on the backend's transaction capability, so the
+        // use_transaction error never leaks to callers that share the kernel but do
+        // not set it (schema-diff deploy, imports), which document a mixed outcome
+        // on failure for DDL that cannot be rolled back.
+        let dir = std::env::temp_dir().join(format!("dbx-query-tx-predispatch-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "message-queue-tx-ddl";
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(connection_id.to_string(), PoolKind::MessageQueue);
+            })
+            .await;
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Redis));
+
+        let error = execute_statements_in_transaction_on_pool(
+            &state,
+            connection_id,
+            connection_id,
+            "",
+            &["CREATE TABLE t (id INT)".to_string()],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.contains("cannot provide a rollbackable transaction"),
+            "expected a backend-capability reject, got: {error}"
+        );
+        assert!(
+            !error.contains("whose DDL cannot be rolled back"),
+            "the opt-in use_transaction DDL cap leaked into the shared transaction kernel: {error}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -7527,7 +8302,9 @@ for line in sys.stdin:
         );
         assert_eq!(
             backend_error.detail(),
-            Some("Query timed out after 1 seconds\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.")
+            Some(
+                "Query timed out after 1 seconds\nSQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement."
+            )
         );
     }
 
@@ -7678,7 +8455,9 @@ for line in sys.stdin:
         );
         assert_eq!(
             external_driver_preview_fallback_sql(sql).as_deref(),
-            Some("SELECT \"id\", \"description\" AS \"description\", \"metadata\"::text AS \"metadata\", 'left(\"literal\", 1)' AS \"note\", 'T:139' AS \"__DBX_LARGE_VALUE_BYTES_T_1\" FROM \"job_details\" WHERE left(note, 1) = 'x' LIMIT 100")
+            Some(
+                "SELECT \"id\", \"description\" AS \"description\", \"metadata\"::text AS \"metadata\", 'left(\"literal\", 1)' AS \"note\", 'T:139' AS \"__DBX_LARGE_VALUE_BYTES_T_1\" FROM \"job_details\" WHERE left(note, 1) = 'x' LIMIT 100"
+            )
         );
     }
 
@@ -7691,7 +8470,9 @@ for line in sys.stdin:
         );
         assert_eq!(
             external_driver_preview_fallback_sql(sql).as_deref(),
-            Some("SELECT coalesce(\"description\", concat('a,b', \"fallback\")) AS \"description\", 'FROM left(\"literal\", 1)' AS \"note\", 'T:140' AS \"__DBX_LARGE_VALUE_BYTES_T_0\" FROM \"job_details\"")
+            Some(
+                "SELECT coalesce(\"description\", concat('a,b', \"fallback\")) AS \"description\", 'FROM left(\"literal\", 1)' AS \"note\", 'T:140' AS \"__DBX_LARGE_VALUE_BYTES_T_0\" FROM \"job_details\""
+            )
         );
     }
 
@@ -7918,7 +8699,7 @@ for line in sys.stdin:
             execute_in_manual_transaction(&state, "txn-test", "SELECT 42", "dbx_test", None, Some(10)).await.unwrap();
         assert_eq!(results[0].rows, vec![vec![serde_json::json!(42)]]);
         commit_manual_transaction(&state, "txn-test").await.unwrap();
-        assert!(!state.pool_handle(pool_key).await.is_some());
+        assert!(state.pool_handle(pool_key).await.is_none());
         assert_eq!(
             std::fs::read_to_string(&calls).unwrap(),
             "beginManualTransaction\nexecuteInManualTransaction\ncommitManualTransaction\n"
@@ -8248,7 +9029,9 @@ for line in sys.stdin:
 
         assert_eq!(
             error.detail(),
-            Some("Server error: `ERROR 1064 (42000): syntax error` SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement.")
+            Some(
+                "Server error: `ERROR 1064 (42000): syntax error` SQL text omitted from user-facing error; enable debug SQL diagnostics to inspect the original statement."
+            )
         );
     }
 
@@ -8476,6 +9259,7 @@ for line in sys.stdin:
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -8554,8 +9338,9 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn iris_execution_context_omits_schema() {
+    fn agent_execution_context_omits_unsupported_schema_switches() {
         assert_eq!(schema_for_execution_context(Some(DatabaseType::Iris), Some("SQLUser")), None);
+        assert_eq!(schema_for_execution_context(Some(DatabaseType::SqlServer), Some("dbo")), None);
         assert_eq!(schema_for_execution_context(Some(DatabaseType::Oracle), Some("APP")), Some("APP"));
         assert_eq!(schema_for_execution_context(None, Some("APP")), Some("APP"));
     }
@@ -8957,7 +9742,7 @@ for line in sys.stdin:
             ..Default::default()
         };
 
-        for db_type in [DatabaseType::Kingbase, DatabaseType::Vastbase] {
+        for db_type in [DatabaseType::Kingbase, DatabaseType::Vastbase, DatabaseType::Oracle] {
             let adjusted = options_for_sequential_statements(&options, 2, Some(db_type));
 
             assert_eq!(adjusted.page_size, None);
@@ -9000,7 +9785,7 @@ for line in sys.stdin:
     fn other_databases_keep_multi_statement_cursor_options() {
         let options = QueryExecutionOptions { max_rows: Some(100_000), page_size: Some(100), ..Default::default() };
 
-        let adjusted = options_for_sequential_statements(&options, 2, Some(DatabaseType::Oracle));
+        let adjusted = options_for_sequential_statements(&options, 2, Some(DatabaseType::Dameng));
 
         assert_eq!(adjusted.page_size, Some(100));
         assert_eq!(adjusted.max_rows, Some(100_000));

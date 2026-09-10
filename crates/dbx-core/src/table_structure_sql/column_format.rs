@@ -1,6 +1,40 @@
 use super::dialect::{is_oracle_like, StructureDialect};
-use super::types::EditableStructureColumn;
+use super::types::{EditableStructureColumn, TableStructureSqlOptions};
 use super::util::{clean, format_default_for_sql, normalize_default, quote_ident, quote_string};
+
+/// Drops the `CHARACTER SET` / `COLLATE` inputs of MySQL columns that merely
+/// inherit the table's default collation, so the generated DDL does not spell
+/// out clauses the server would apply anyway.
+///
+/// MySQL reports the *effective* collation of every character column and never
+/// records whether it was written out explicitly, so "equals the table default"
+/// is the only signal available. Omitting the clauses is equivalent to keeping
+/// them: a column definition without `CHARACTER SET` takes the table default,
+/// which is exactly the value being dropped here. This runs on the DDL inputs
+/// only — introspection (`get_columns`) still reports the real values so the
+/// structure editor can show the column's current charset and collation.
+///
+/// The original snapshot is normalized alongside the draft so that an untouched
+/// column does not register as a charset change and trigger a needless `MODIFY`.
+pub(super) fn strip_inherited_mysql_column_charsets(options: &mut TableStructureSqlOptions) {
+    let Some(table_collation) = options.table_collation.as_deref().map(str::trim).filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let inherits = |collation: &str| collation.trim().eq_ignore_ascii_case(table_collation);
+    for column in &mut options.columns {
+        if inherits(&column.collation) {
+            column.character_set = String::new();
+            column.collation = String::new();
+        }
+        if let Some(original) = column.original.as_mut() {
+            if original.collation.as_deref().is_some_and(inherits) {
+                original.character_set = None;
+                original.collation = None;
+            }
+        }
+    }
+}
 
 pub(super) fn column_definition(dialect: StructureDialect, column: &EditableStructureColumn) -> String {
     let data_type = column_data_type(dialect, column);
@@ -45,7 +79,7 @@ pub(super) fn column_definition(dialect: StructureDialect, column: &EditableStru
     if mysql_generated_clause.is_none() {
         if let Some(on_update) = column.extra.as_ref().and_then(|e| e.on_update_current_timestamp).filter(|v| *v) {
             if on_update && dialect == StructureDialect::Mysql {
-                parts.push("ON UPDATE CURRENT_TIMESTAMP".to_string());
+                parts.push(mysql_on_update_current_timestamp_clause(&column.data_type));
             }
         }
     }
@@ -384,6 +418,39 @@ pub(super) fn is_valid_temporal_precision(params: &str, dialect: StructureDialec
         6
     };
     value <= max && params == value.to_string()
+}
+
+/// Fractional-seconds precision of a MySQL temporal column type, e.g. `3` for
+/// `datetime(3)`. MySQL requires every `CURRENT_TIMESTAMP` in a column
+/// definition to carry the same precision the column type declares: a
+/// `datetime(3) ... DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`
+/// definition is rejected with `ERROR 1067 (42000): Invalid default value`
+/// while the `(3)`-suffixed clauses succeed. The editor model keeps only an
+/// on-update flag, so the precision has to be recovered from the data type.
+/// Non-temporal types and invalid precisions fall back to `None` (no suffix).
+pub(super) fn mysql_temporal_precision(data_type: &str) -> Option<String> {
+    let trimmed = data_type.trim();
+    let open_index = trimmed.find('(')?;
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    let base_type = trimmed[..open_index].trim();
+    let params = trimmed[open_index + 1..trimmed.len() - 1].trim();
+    if !is_temporal_precision_type(StructureDialect::Mysql, base_type)
+        || !is_valid_temporal_precision(params, StructureDialect::Mysql)
+    {
+        return None;
+    }
+    Some(params.to_string())
+}
+
+/// `ON UPDATE CURRENT_TIMESTAMP` clause for a MySQL column, carrying the
+/// column's temporal precision (if any) so the clause matches the type.
+pub(super) fn mysql_on_update_current_timestamp_clause(data_type: &str) -> String {
+    match mysql_temporal_precision(data_type) {
+        Some(fsp) => format!("ON UPDATE CURRENT_TIMESTAMP({fsp})"),
+        None => "ON UPDATE CURRENT_TIMESTAMP".to_string(),
+    }
 }
 
 pub(super) fn clickhouse_column_type(column: &EditableStructureColumn) -> String {

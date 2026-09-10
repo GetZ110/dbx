@@ -27,6 +27,7 @@ import { createDbxCodeMirrorSqlDialect } from "@/lib/editor/codemirrorSqlDialect
 import { useToast } from "@/composables/useToast";
 import { type SqlHighlighter, createShikiSqlHighlighter } from "@/lib/sql/sqlHighlighter";
 import { joinSqlStatementsForScript } from "@/lib/sql/sqlBatchScript";
+import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { splitSqlStatementRanges } from "@/lib/sql/sqlStatementRanges";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
@@ -37,6 +38,7 @@ import { invalidateObjectMetadataCache, loadObjectMetadataFacet, type ObjectMeta
 import { invalidateTableMetadataCache } from "@/lib/metadata/tableMetadataCache";
 import { type BuildTableStructureChangeSqlOptions, type EditableStructureColumn, type EditableStructureForeignKey, type EditableStructureIndex, type EditableStructureTrigger } from "@/lib/table/tableStructureEditorSql";
 import { buildMysqlAutoIncrementCounterStatement, canEditMysqlAutoIncrementCounter, refreshMysqlAutoIncrementCounterDraft } from "@/lib/table/mysqlAutoIncrementCounter";
+import { mysqlTableCollationSql, parseMysqlTableCollation } from "@/lib/table/mysqlTableCollation";
 import { MYSQL_STORAGE_ENGINES_SQL, mysqlTableEngineSql, mysqlTableEngineSqlOption, parseMysqlTableEngineMetadata, refreshMysqlTableEngineDraft, supportsMysqlTableEngine } from "@/lib/table/mysqlTableEngine";
 import { PRESET_FIELDS_TEMPLATE_ID, createTableColumnTemplateDrafts } from "@/lib/table/tableColumnTemplates";
 import { getMysqlDataTypeHelp } from "@/lib/table/mysqlDataTypeHelp";
@@ -928,6 +930,9 @@ const showCharacterSet = computed(() => structureDialect.value === "mysql");
 
 const serverCharsetMetadata = ref<CreateDatabaseCharsetMetadata>();
 const charsetMetadataLoading = ref(false);
+// The table's own default collation, used only to keep inherited charsets out of the
+// generated DDL. Columns keep the real values MySQL reports so the pickers stay filled.
+const mysqlTableDefaultCollation = ref("");
 
 const mysqlCharsetOptions = computed<string[]>(() => {
   const meta = serverCharsetMetadata.value;
@@ -953,6 +958,22 @@ async function loadCharsetMetadata() {
     serverCharsetMetadata.value = fallbackCreateDatabaseCharsetMetadata();
   } finally {
     charsetMetadataLoading.value = false;
+  }
+}
+
+async function loadMysqlTableDefaultCollation() {
+  if (!showCharacterSet.value || isCreateMode.value || !props.connectionId || !props.database || !props.tableName) {
+    mysqlTableDefaultCollation.value = "";
+    return;
+  }
+  try {
+    await store.ensureConnected(props.connectionId);
+    const result = await api.executeQuery(props.connectionId, props.database, mysqlTableCollationSql(props.database, props.tableName), undefined, undefined, { maxRows: 1 });
+    mysqlTableDefaultCollation.value = parseMysqlTableCollation(result);
+  } catch {
+    // Optional metadata: without it the DDL just spells out the charset the column
+    // already has, which is equivalent SQL — never block the editor on this lookup.
+    mysqlTableDefaultCollation.value = "";
   }
 }
 
@@ -1126,6 +1147,8 @@ function isManticoreJsonColumn(column: EditableStructureColumn): boolean {
 
 let sqlPreviewRequestId = 0;
 let structureLoadRequestId = 0;
+let tableCommentLoadRequestId = 0;
+let tableCommentLoadPromise: Promise<void> | null = null;
 let tableOwnerLoadRequestId = 0;
 let tableOwnerRolesLoadRequestId = 0;
 let mysqlAutoIncrementLoadRequestId = 0;
@@ -1138,6 +1161,7 @@ let skipNextRefreshVersion = false;
 let restoringDraft = false;
 let syncingDraft = false;
 let draftHydrated = false;
+let lastAppliedInitialTabRequestId: number | undefined;
 let hydratingRestoredDraft = false;
 let structureScrollFrame = 0;
 let structureHorizontalScrollbarThumbLeftPercent = 0;
@@ -1339,6 +1363,7 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     triggersLoaded: triggersLoaded.value,
     loadedMetadataFacets: [...loadedMetadataFacets],
     scrollPositions: cloneDraftValue(structureScrollPositions.value),
+    appliedInitialTabRequestId: lastAppliedInitialTabRequestId,
     initialized,
   };
 }
@@ -1354,6 +1379,7 @@ function syncDraftToParent() {
 function restoreDraft(draft: TableStructureEditorDraft) {
   restoringDraft = true;
   draftHydrated = false;
+  lastAppliedInitialTabRequestId = draft.appliedInitialTabRequestId;
   activeTab.value = draft.activeTab || "columns";
   // Restore the DDL baseline alongside the edit, otherwise the restored script
   // would read as dirty (or clean) against the wrong reference text.
@@ -1603,6 +1629,7 @@ function scheduleSqlPreviewRefresh() {
 function structureChangeOptions(): BuildTableStructureChangeSqlOptions {
   return {
     databaseType: databaseType.value,
+    driverProfile: connection.value?.driver_profile,
     schema: props.schema,
     tableName: isCreateMode.value ? newTableName.value.trim() : props.tableName || "",
     // Do not let a draft created by an older build submit properties that the
@@ -1614,6 +1641,7 @@ function structureChangeOptions(): BuildTableStructureChangeSqlOptions {
     tableComment: tableComment.value,
     originalTableComment: isCreateMode.value ? undefined : originalTableComment.value,
     mysqlEngine: mysqlTableEngineSqlOption({ value: mysqlTableEngine.value, originalValue: originalMysqlTableEngine.value }, isCreateMode.value, supportsMysqlEngine.value && !mysqlTableEngineLoading.value && !mysqlTableEngineLoadError.value),
+    tableCollation: mysqlTableDefaultCollation.value || undefined,
     partitioned: isPartitionedParent.value,
     isGaussdbMMode: connection.value?.driver_profile?.toLowerCase() === "gaussdb-m",
   };
@@ -1690,7 +1718,9 @@ async function refreshSqlPreview() {
       }),
     ]);
     if (requestId !== sqlPreviewRequestId) return;
-    pendingStatements.value = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : [])];
+    const statements = [...result.statements, ...ownerResult.statements, ...(mysqlAutoIncrementStatement ? [mysqlAutoIncrementStatement] : [])];
+    // SQLite type-change apply regenerates this revision-checked plan, so its preview must stay byte-for-byte aligned.
+    pendingStatements.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers || hasSqliteTypeChange.value ? statements : statements.map((statement) => omitDdlIdentifierQuotes(statement, sqlFormatDialectForDbType(databaseType.value)));
     warnings.value = [...result.warnings, ...ownerResult.warnings];
     sqliteSchemaRevision.value = "schemaRevision" in result && typeof result.schemaRevision === "string" ? result.schemaRevision : undefined;
   } catch (e: any) {
@@ -1772,6 +1802,7 @@ function resetState() {
   mysqlTableEngineLoadRequestId += 1;
   mysqlTableEngineLoading.value = false;
   mysqlTableEngineLoadError.value = "";
+  mysqlTableDefaultCollation.value = "";
   tableOwner.value = "";
   originalTableOwner.value = "";
   tableOwnerLoadRequestId += 1;
@@ -1811,7 +1842,8 @@ async function reloadStructureFromDatabase() {
   ddlDraft.value = null;
   if (refreshDdl) {
     ddlFetched.value = false;
-    await Promise.all([fetchDdl(true), loadTableOwner(true), loadTableOwnerRoles(), loadMysqlTableEngine(true)]);
+    await Promise.all([fetchDdl(true), loadVisibleTableComment(true), loadTableOwner(true), loadTableOwnerRoles(), loadMysqlTableEngine(true)]);
+    markDraftHydratedAndSync();
   } else {
     await Promise.all([loadStructure(false, visibleTableStructureRefreshScope(activeTab.value), true, { blockSecondaryMetadata: true, forceDdl: true, forceMetadata: true }), loadTableOwner(true), loadTableOwnerRoles(), loadMysqlTableEngine(true)]);
   }
@@ -1846,6 +1878,40 @@ async function fetchTableCommentValue(connectionId: string, database: string, sc
 
 function loadCachedTableComment(request: ReturnType<typeof ddlRequest>, force = false): Promise<{ value: string | undefined; cacheStatus: "memory" | "disk" | "remote" }> {
   return loadObjectMetadataFacet(request, "comment", () => fetchTableCommentValue(request.connectionId, request.database, request.schema, request.tableName, request.catalog), { force });
+}
+
+async function loadVisibleTableComment(force = false, preserveDraft = false) {
+  const connectionId = props.connectionId;
+  const database = props.database;
+  const schema = metadataSchema.value;
+  const tableName = props.tableName;
+  const catalog = props.catalog;
+  if (!structureCapabilities.value.comment || !connectionId || !database || !tableName) return;
+  if (!force && loadedMetadataFacets.has("comment")) return;
+  if (!force && tableCommentLoadPromise) return tableCommentLoadPromise;
+
+  const requestId = ++tableCommentLoadRequestId;
+  const loadPromise = (async () => {
+    try {
+      await store.ensureConnected(connectionId);
+      const { value } = await loadCachedTableComment({ connectionId, database, schema, tableName, catalog }, force);
+      if (requestId !== tableCommentLoadRequestId) return;
+      if (connectionId !== props.connectionId || database !== props.database || schema !== metadataSchema.value || tableName !== props.tableName || (catalog || "") !== (props.catalog || "")) return;
+      if (value === undefined) return;
+      const hasCommentDraft = tableComment.value !== originalTableComment.value;
+      originalTableComment.value = value;
+      if (!preserveDraft || !hasCommentDraft) tableComment.value = value;
+      loadedMetadataFacets.add("comment");
+    } catch (error) {
+      if (requestId === tableCommentLoadRequestId) console.warn("[DBX][structure-editor:comment-metadata-failed]", error);
+    }
+  })();
+  tableCommentLoadPromise = loadPromise;
+  try {
+    await loadPromise;
+  } finally {
+    if (tableCommentLoadPromise === loadPromise) tableCommentLoadPromise = null;
+  }
 }
 
 async function loadMysqlAutoIncrementCounter(preserveDraft = false) {
@@ -2040,6 +2106,7 @@ async function loadStructure(
       // Load live charset/collation metadata from the MySQL server so the column
       // editor shows the correct options for the server version.
       void loadCharsetMetadata();
+      void loadMysqlTableDefaultCollation();
       const nextColumnDrafts = createColumnDrafts(nextColumns, databaseType.value);
       const hydratedColumnDrafts = supportsCharacterLengthUnits.value && options.characterLengthUnitsAfterSave ? restoreCharacterLengthUnitsAfterSave(databaseType.value, nextColumnDrafts, options.characterLengthUnitsAfterSave) : nextColumnDrafts;
       columns.value = applyStoredLocalColumnOrder(hydratedColumnDrafts);
@@ -2958,6 +3025,22 @@ function focusIndexSearch() {
   });
 }
 
+function focusSearch(): boolean {
+  if (activeTab.value === "columns") {
+    focusColumnSearch();
+    return true;
+  }
+  if (activeTab.value === "indexes") {
+    focusIndexSearch();
+    return true;
+  }
+  if (activeTab.value === "ddl") {
+    ddlSearchPanelRef.value?.openSearch();
+    return true;
+  }
+  return false;
+}
+
 function scrollToIndexSearchMatch(direction: 1 | -1 = 1) {
   const query = indexSearchText.value.trim();
   if (!query) {
@@ -3150,6 +3233,7 @@ function addIndex() {
     includedColumns: [],
     comment: "",
     concurrently: false,
+    columnOpclasses: [],
     markedForDrop: false,
   });
   void nextTick(() => {
@@ -3585,7 +3669,7 @@ async function applyChanges() {
   }
 }
 
-defineExpose({ applyChanges });
+defineExpose({ applyChanges, focusSearch });
 
 function addItemForActiveTab(): boolean {
   if (activeTab.value === "columns" && canAddColumn.value) {
@@ -3651,10 +3735,10 @@ function onStructureEditorKeydown(event: KeyboardEvent) {
     return;
   }
   if (isPlainModShortcut(event, "f")) {
-    event.preventDefault();
-    event.stopPropagation();
-    if (activeTab.value === "columns") focusColumnSearch();
-    else if (activeTab.value === "ddl") ddlSearchPanelRef.value?.openSearch();
+    if (focusSearch()) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
     return;
   }
   if (isPlainModShortcut(event, "s")) {
@@ -3688,14 +3772,17 @@ function unregisterStructureEditorShortcuts() {
 
 onMounted(() => {
   resetState();
-  applyInitialStructureTab();
+  // With an initialized draft the restore below owns the tab (plus any
+  // unconsumed initial tab); applying the stale initial tab first would only
+  // flash the wrong facet and kick its metadata load (#8419).
+  if (!props.draft?.initialized) applyInitialStructureTab();
   applyInitialStructureTarget();
   registerStructureEditorShortcuts();
   void loadDynamicDataTypeOptions();
   if (props.draft?.initialized) {
     restoreDraft(props.draft);
     // A restored draft owns its saved tab unless navigation explicitly requested another one.
-    applyInitialStructureTab(false);
+    applyPendingInitialStructureTab();
     applyInitialStructureTarget();
   }
   structureEditorReady = true;
@@ -3712,7 +3799,7 @@ onMounted(() => {
   } else if (isCreateMode.value) {
     markDraftHydratedAndSync();
   } else if (activeTab.value === "ddl") {
-    void fetchDdl();
+    void Promise.all([fetchDdl(), loadVisibleTableComment()]).then(markDraftHydratedAndSync);
   } else {
     void loadStructure(false, visibleTableStructureRefreshScope(activeTab.value), true, { blockSecondaryMetadata: true }).then(() => applyInitialStructureTarget());
   }
@@ -3778,9 +3865,21 @@ function resolveStructureMetadataTab(tab: TableInfoTab | undefined, capabilities
 function applyInitialStructureTab(useDefault = true) {
   if (props.initialTab) {
     activeTab.value = resolveStructureMetadataTab(props.initialTab);
+    lastAppliedInitialTabRequestId = props.initialTabRequestId;
   } else if (useDefault) {
     activeTab.value = resolveStructureMetadataTab(undefined);
   }
+}
+
+// The tab's structureInitialTab stays populated after it was consumed once
+// (e.g. the side panel opened the editor on its foreign-keys facet). Replaying
+// it on every remount would override the draft-restored tab the user last
+// selected, so an initial tab only applies again when navigation bumped the
+// request id (#8419).
+function applyPendingInitialStructureTab() {
+  if (!props.initialTab) return;
+  if (props.initialTabRequestId !== undefined && props.initialTabRequestId === lastAppliedInitialTabRequestId) return;
+  applyInitialStructureTab(false);
 }
 
 function initialTargetKey(target: TableStructureEditorTarget): string {
@@ -3854,6 +3953,7 @@ watch(
     () => props.tableName,
     newTableName,
     tableComment,
+    originalTableComment,
     mysqlAutoIncrementValue,
     originalMysqlAutoIncrementValue,
     mysqlAutoIncrementLoading,
@@ -3862,6 +3962,7 @@ watch(
     originalMysqlTableEngine,
     mysqlTableEngineLoading,
     mysqlTableEngineLoadError,
+    mysqlTableDefaultCollation,
     tableOwner,
     ddlDraft,
     columns,
@@ -3937,7 +4038,7 @@ watch(refreshVersion, (version, previous) => {
 async function loadActiveTableStructureMetadataIfNeeded() {
   if (!structureEditorReady || isCreateMode.value) return;
   if (activeTab.value === "ddl") {
-    await fetchDdl();
+    await Promise.all([ddlLoading.value ? Promise.resolve() : fetchDdl(), loadVisibleTableComment(false, true)]);
     return;
   }
   if (loading.value || secondaryMetadataLoading.value) return;

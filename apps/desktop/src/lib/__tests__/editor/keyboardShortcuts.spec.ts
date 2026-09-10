@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   eventToModifierOnlyShortcut,
   eventToShortcut,
+  isConvertNamingStyleShortcut,
   isEditTableStructureShortcut,
   isExecuteSqlInNewResultTabShortcut,
   isGoToColumnShortcut,
@@ -10,6 +11,7 @@ import {
   isGoToNextPageShortcut,
   isGoToPreviousPageShortcut,
   isToggleZenModeShortcut,
+  isToggleAiPanelShortcut,
   matchesModifierOnlyShortcut,
   matchesShortcut,
   tabSwitcherDirectionFromShortcut,
@@ -47,6 +49,20 @@ describe("keyboard shortcut matching", () => {
     ["Ò", "KeyL", "Shift+Alt+L"],
   ])("records macOS Option-modified %s by physical letter", (key, code, expected) => {
     expect(eventToShortcut({ key, code, altKey: true, shiftKey: true }, "MacIntel")).toBe(expected);
+  });
+
+  it("matches the naming style shortcut by physical key and rejects extra modifiers", () => {
+    const macEvent = { key: "Ç", code: "KeyC", altKey: true, shiftKey: true };
+    expect(isConvertNamingStyleShortcut(macEvent, undefined, "MacIntel")).toBe(true);
+    expect(isConvertNamingStyleShortcut({ key: "c", code: "KeyC", altKey: true, shiftKey: true }, undefined, "Win32")).toBe(true);
+
+    // Extra Ctrl/Meta held must not fire the Shift+Alt+C default binding.
+    expect(isConvertNamingStyleShortcut({ ...macEvent, ctrlKey: true }, undefined, "MacIntel")).toBe(false);
+    expect(isConvertNamingStyleShortcut({ ...macEvent, metaKey: true }, undefined, "MacIntel")).toBe(false);
+
+    // Custom settings are honored.
+    expect(isConvertNamingStyleShortcut({ key: "n", code: "KeyN", altKey: true, shiftKey: true }, { convertNamingStyle: "Shift+Alt+N" }, "Win32")).toBe(true);
+    expect(isConvertNamingStyleShortcut({ key: "c", code: "KeyC", altKey: true, shiftKey: true }, { convertNamingStyle: "Shift+Alt+N" }, "Win32")).toBe(false);
   });
 
   it("keeps Control distinct from Command when recording macOS shortcuts", () => {
@@ -107,6 +123,13 @@ describe("keyboard shortcut matching", () => {
     expect(isToggleZenModeShortcut(platformModEvent, { toggleZenMode: "" })).toBe(false);
   });
 
+  it("matches the platform-specific AI panel shortcut", () => {
+    expect(isToggleAiPanelShortcut({ key: "i", ctrlKey: true, metaKey: true }, undefined, "MacIntel")).toBe(true);
+    expect(isToggleAiPanelShortcut({ key: "i", ctrlKey: true, altKey: true }, undefined, "Win32")).toBe(true);
+    expect(isToggleAiPanelShortcut({ key: "a", ctrlKey: true, shiftKey: true }, { toggleAiPanel: "Mod+Shift+A" }, "Win32")).toBe(true);
+    expect(isToggleAiPanelShortcut({ key: "i", ctrlKey: true, metaKey: true }, { toggleAiPanel: "" }, "MacIntel")).toBe(false);
+  });
+
   it("matches legacy plus-key shortcuts saved with plus as a separator", () => {
     expect(matchesShortcut({ key: "+", ctrlKey: true }, "Mod++", "Win32")).toBe(true);
     expect(matchesShortcut({ key: "+", ctrlKey: true, shiftKey: true }, "Shift+Mod++", "Win32")).toBe(true);
@@ -125,8 +148,9 @@ describe("keyboard shortcut matching", () => {
   });
 
   it("matches the edit-table-structure shortcut on Windows and macOS", () => {
-    expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, undefined, "Win32")).toBe(true);
-    expect(isEditTableStructureShortcut({ key: "d", metaKey: true }, undefined, "MacIntel")).toBe(true);
+    expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true, shiftKey: true }, undefined, "Win32")).toBe(true);
+    expect(isEditTableStructureShortcut({ key: "d", metaKey: true, shiftKey: true }, undefined, "MacIntel")).toBe(true);
+    expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, undefined, "Win32")).toBe(false);
     expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, undefined, "MacIntel")).toBe(false);
   });
 

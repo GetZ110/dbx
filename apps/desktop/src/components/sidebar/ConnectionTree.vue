@@ -37,7 +37,7 @@ import { formatSidebarTableCopyText } from "@/lib/sidebar/sidebarTableNameCopy";
 import { pruneTreeSelectionToVisibleNodeIds } from "@/lib/sidebar/sidebarTreeSelection";
 import { isEditableSidebarTypeSearchTarget, sidebarTypeSearchNextQuery } from "@/lib/sidebar/sidebarTypeSearch";
 import { isInternalDorisCatalog, usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
-import { connectionObjectTreeNodeSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { connectionObjectTreeNodeSchema, connectionShouldDiscoverJdbcSchemas, connectionUsesConnectionRootSchemaMode, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import {
   activeTabSidebarTarget,
   findSidebarConnectionNode,
@@ -429,9 +429,10 @@ function collectExpandedObjectSearchTargets(node: TreeNode, tasks: SidebarSearch
     if (searchableObjectGroupTypes.has(node.type)) {
       if (searchAutoExpandedNodeIds.has(node.id)) {
         // Search opened this group on the user's behalf to check for matches;
-        // once the query is gone there is nothing to show, so collapse it back
-        // instead of reloading and leaving it open.
+        // once the query is gone, drop the filtered projection and collapse it
+        // back. Its next explicit expansion will load the ordinary first page.
         node.isExpanded = false;
+        store.discardFilteredTreeNodeChildren(node.id);
       } else {
         tasks.push(() => store.loadObjectGroupChildren(node, { force: true }));
       }
@@ -1398,6 +1399,10 @@ const pasteHandlerRegistry = createSidebarPasteHandlerRegistry();
 provide(sidebarTreeContextKey, {
   getVisibleNodes: () => selectableVisibleNodes.value,
   getVisibleNodeIndex: (id: string) => selectableVisibleNodeIndexById.value.get(id) ?? -1,
+  getVisibleFlatNodes: () => flatNodes.value.filter((item) => !isSidebarTableSearchControlNode(item.node)),
+  focusTreeNode: (nodeId: string) => {
+    void focusSidebarTreeNode(nodeId);
+  },
   getProjectedConnectionIds: () => projectedConnectionIds.value,
   // Cover both sides of the input debounce: the immediate query prevents a
   // collapse while a projection is about to start, and the deferred query
@@ -1489,6 +1494,24 @@ async function scrollToSidebarNode(nodeId: string, options?: { align?: SidebarNo
   }
 }
 
+// Arrow-key navigation moves the selection first; only after the row re-renders
+// as the tabbable one (tabindex follows selection) can focus follow it.
+async function focusSidebarTreeNode(nodeId: string) {
+  await nextTick();
+  // Scroll before querying the row: the virtualized tree only keeps rows in
+  // the materialized window in the DOM, so querying first would never find an
+  // out-of-window row and focus would stall at the window edge. Scrolling is
+  // index-driven (no DOM lookup) and a no-op when the row is already visible;
+  // one render frame lets RecycleScroller materialize the target row.
+  await scrollToSidebarNode(nodeId);
+  const root = rootRef.value;
+  if (!root) return;
+  await waitForSidebarRenderFrame();
+  const row = root.querySelector<HTMLElement>(`[data-node-id="${CSS.escape(nodeId)}"]`);
+  if (!row) return;
+  row.focus({ preventScroll: true });
+}
+
 function clearSidebarSelection() {
   // Clicking the blank area of the tree clears the current selection. Row
   // clicks call event.stopPropagation(), so this only fires for blank clicks
@@ -1559,8 +1582,10 @@ async function locateTabInSidebar(tab: QueryTab | undefined | null, align: Sideb
 
   const config = connId ? store.getConfig(connId) : undefined;
   const cursorCandidate = locatesSavedSql ? null : queryCursorTableCandidate(tab, effectiveDatabaseTypeForConnection(config));
+  const tabTableCandidate = locatesSavedSql || cursorCandidate ? null : tableLocateCandidateFromTarget(tabTarget, config);
+  const locateTableCandidate = cursorCandidate ?? tabTableCandidate;
   const fallbackTarget = locatesSavedSql ? tabTarget : (queryContextTargetFromCandidate(tab, cursorCandidate) ?? tabTarget);
-  const initialTarget = cursorCandidate ? tableTargetFromCandidate(cursorCandidate) : fallbackTarget;
+  const initialTarget = locateTableCandidate ? tableTargetFromCandidate(locateTableCandidate) : fallbackTarget;
   if (!initialTarget) return;
 
   // Ensure the tree is loaded deep enough to contain the preferred target.
@@ -1585,7 +1610,7 @@ async function locateTabInSidebar(tab: QueryTab | undefined | null, align: Sideb
     clearSearchScopeFilter();
   }
 
-  let target = resolveLoadedLocateTarget(initialTarget, cursorCandidate);
+  let target = resolveLoadedLocateTarget(initialTarget, locateTableCandidate);
   let nodePath = target ? findNodePathForTarget(target, store.treeNodes) : null;
   if (!nodePath && !locatesSavedSql) {
     // The first load may have served a stale schema cache whose async refresh
@@ -1593,13 +1618,13 @@ async function locateTabInSidebar(tab: QueryTab | undefined | null, align: Sideb
     // table isn't in the tree yet. Force a synchronous reload and retry once so
     // locate reaches the table, not just the database (issue #715).
     await ensureTreeLoadedForTarget(treeLoadTarget, { force: true });
-    target = resolveLoadedLocateTarget(initialTarget, cursorCandidate);
+    target = resolveLoadedLocateTarget(initialTarget, locateTableCandidate);
     nodePath = target ? findNodePathForTarget(target, store.treeNodes) : null;
   }
 
-  if (!nodePath && cursorCandidate) {
-    await store.loadTableForLocate(cursorCandidate);
-    target = resolveLoadedLocateTarget(initialTarget, cursorCandidate);
+  if (!nodePath && locateTableCandidate) {
+    await store.loadTableForLocate(locateTableCandidate);
+    target = resolveLoadedLocateTarget(initialTarget, locateTableCandidate);
     nodePath = target ? findNodePathForTarget(target, store.treeNodes) : null;
   }
 
@@ -1652,6 +1677,17 @@ function tableTargetFromCandidate(candidate: QueryCursorTableCandidate): ActiveT
     database: candidate.database,
     schema: candidate.schema,
     tableName: candidate.tableName,
+  };
+}
+
+function tableLocateCandidateFromTarget(target: ActiveTabSidebarTarget | null, config: ReturnType<typeof store.getConfig>): QueryCursorTableCandidate | null {
+  if (target?.type !== "table") return null;
+  const database = connectionUsesConnectionRootSchemaMode(config) && target.schema ? target.schema : target.database;
+  return {
+    connectionId: target.connectionId,
+    database,
+    schema: target.schema,
+    tableName: target.tableName,
   };
 }
 
@@ -1718,12 +1754,24 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
   }
 
   // Find the database node
+  const targetSchema = "schema" in target ? target.schema : undefined;
+  const effectiveDbType = effectiveDatabaseTypeForConnection(config);
+  if (target.type === "table" && connectionUsesConnectionRootSchemaMode(config)) {
+    const schemaName = targetSchema || target.database;
+    if (!schemaName) return;
+    const schemaNode = findSchemaNode(store.treeNodes, connId, schemaName, schemaName);
+    if (!schemaNode) return;
+    if (force || !schemaNode.children || schemaNode.children.length === 0) {
+      await store.loadTables(connId, schemaNode.database || schemaName, schemaNode.schema ?? schemaName, loadOptions);
+    }
+    await ensureTableObjectGroupsLoaded({ ...target, database: schemaNode.database || schemaName, schema: schemaNode.schema ?? schemaName }, loadOptions);
+    return;
+  }
+
   const dbNode = findDatabaseNode(store.treeNodes, connId, target.database, targetCatalog, usesExactCatalogScope);
   if (!dbNode) return;
-  const targetSchema = "schema" in target ? target.schema : undefined;
   const databaseChildrenLoaded = !!dbNode.children && dbNode.children.length > 0;
-  const effectiveDbType = effectiveDatabaseTypeForConnection(config);
-  const usesSchemaTree = usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config);
+  const usesSchemaTree = (usesTreeSchemaMode(effectiveDbType) && !connectionUsesDatabaseObjectTreeMode(config)) || connectionShouldDiscoverJdbcSchemas(config);
   const shouldLoadSchemaTables = target.type === "table" && !!targetSchema && usesSchemaTree;
   if (!force && databaseChildrenLoaded && !shouldLoadSchemaTables) return;
 
@@ -2806,7 +2854,7 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes, locateTabInSid
 
 <style scoped>
 .sticky-database-header {
-  background-color: var(--background);
+  background-color: var(--sidebar);
 }
 
 .connection-tree-scroller {
@@ -2815,6 +2863,13 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes, locateTabInSid
   scrollbar-width: none;
   -ms-overflow-style: none;
   overflow-anchor: none;
+  /* Lets TreeItem's full-bleed row/search-box backgrounds (see
+     tree-item-connection-tint / tree-table-search-control in TreeItem.vue)
+     size themselves off this scroller's own width via cqw instead of a
+     fixed -9999px offset, so they can't inflate this element's own
+     scrollWidth when sidebarAllowHorizontalScroll turns on overflow-x. */
+  container-type: inline-size;
+  container-name: sidebar-tree;
 }
 
 .connection-tree-scroller::-webkit-scrollbar {

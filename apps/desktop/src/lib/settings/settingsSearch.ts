@@ -1,5 +1,16 @@
 export type SettingsCategory = "editor" | "formatter" | "appearance" | "navigation" | "data" | "backups" | "tunnels" | "shortcuts" | "snippets" | "sync" | "ai" | "mcp" | "security" | "about";
 
+const SETTINGS_CATEGORIES: readonly SettingsCategory[] = ["editor", "formatter", "appearance", "navigation", "data", "backups", "tunnels", "shortcuts", "snippets", "sync", "ai", "mcp", "security", "about"];
+
+/**
+ * Maps retired settings tabs to their current home so saved links and external
+ * navigation requests continue to open a populated settings page.
+ */
+export function resolveSettingsCategory(initialTab?: string): SettingsCategory {
+  if (initialTab === "sqlFile") return "editor";
+  return SETTINGS_CATEGORIES.includes(initialTab as SettingsCategory) ? (initialTab as SettingsCategory) : "appearance";
+}
+
 export interface SettingsSearchContext {
   isWeb: boolean;
   visibleCategories: ReadonlySet<SettingsCategory>;
@@ -123,6 +134,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "editor-app-close-unsaved-tabs", category: "editor", titleKey: "settings.appCloseUnsavedTabsMode", descriptionKey: "settings.appCloseUnsavedTabsModeDescription", targetId: "editor" },
   { id: "editor-prefill-query", category: "navigation", titleKey: "settings.prefillNewQueryWithSelect", descriptionKey: "settings.prefillNewQueryWithSelectDescription", targetId: "navigation" },
   { id: "editor-generate-sql-include-database", category: "editor", titleKey: "settings.generateSqlIncludeDatabaseName", descriptionKey: "settings.generateSqlIncludeDatabaseNameDescription", targetId: "editor" },
+  { id: "editor-generate-sql-quote-identifiers", category: "editor", titleKey: "settings.generateSqlQuoteIdentifiers", descriptionKey: "settings.generateSqlQuoteIdentifiersDescription", targetId: "editor" },
   { id: "editor-format-sql-on-sql-file-save", category: "editor", titleKey: "settings.formatSqlOnSqlFileSave", descriptionKey: "settings.formatSqlOnSqlFileSaveDescription", targetId: "editor" },
   { id: "editor-table-ddl-hover-preview", category: "editor", titleKey: "settings.showTableDdlHoverPreview", descriptionKey: "settings.showTableDdlHoverPreviewDescription", targetId: "editor" },
   { id: "editor-diagnostics", category: "editor", titleKey: "settings.sqlSemanticDiagnosticsEnabled", descriptionKey: "settings.sqlSemanticDiagnosticsEnabledDescription", targetId: "editor" },
@@ -182,6 +194,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "navigation-disconnect-tabs", category: "navigation", titleKey: "settings.disconnectTabHandlingMode", descriptionKey: "settings.disconnectTabHandlingModeDescription", targetId: "navigation" },
   { id: "query-page-size", category: "data", titleKey: "settings.queryPageSize", descriptionKey: "settings.queryPageSizeDescription", targetId: "data" },
   { id: "data-page-size", category: "data", titleKey: "settings.tableOpenPageSize", descriptionKey: "settings.tableOpenPageSizeDescription", targetId: "data" },
+  { id: "default-auto-keep-results", category: "data", titleKey: "settings.defaultAutoKeepResults", descriptionKey: "settings.defaultAutoKeepResultsDescription", targetId: "default-auto-keep-results" },
   { id: "multi-statement-default-view", category: "data", titleKey: "settings.multiStatementDefaultView", descriptionKey: "settings.multiStatementDefaultViewDescription", targetId: "multi-statement-default-view" },
   { id: "query-result-max-rows", category: "data", titleKey: "settings.queryResultMaxRows", descriptionKey: "settings.queryResultMaxRowsDescription", targetId: "data" },
   { id: "data-grid-header-comments", category: "data", titleKey: "settings.showColumnCommentsInHeader", descriptionKey: "settings.showColumnCommentsInHeaderDescription", targetId: "data" },
@@ -198,6 +211,8 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "data-grid-quick-entry", category: "data", titleKey: "settings.dataGridQuickEntry", descriptionKey: "settings.dataGridQuickEntryDescription", targetId: "data" },
   { id: "data-grid-filter-view", category: "data", titleKey: "settings.dataGridFilterView", descriptionKey: "settings.dataGridFilterViewDescription", targetId: "data-grid-filter-view" },
   { id: "data-grid-flattening-multi-line", category: "data", titleKey: "settings.flatteningMultiLineText", descriptionKey: "settings.flatteningMultiLineTextDescription", targetId: "data" },
+  { id: "sql-file-editor-max-mb", category: "editor", titleKey: "settings.externalSqlEditorMaxMb", descriptionKey: "settings.externalSqlEditorMaxMbDescription", targetId: "editor-sql-file" },
+  { id: "sql-file-web-upload-max-mb", category: "data", titleKey: "settings.webSqlFileUploadMaxMb", descriptionKey: "settings.webSqlFileUploadMaxMbDescription", targetId: "data-sql-file-upload", visible: (context) => context.isWeb },
   { id: "appearance-toolbar", category: "appearance", titleKey: "settings.toolbarTitle", descriptionKey: "settings.toolbarHiddenHint", targetId: "appearance" },
   { id: "appearance-exclusive-sidebar-panels", category: "appearance", titleKey: "settings.exclusiveRightSidebarPanels", descriptionKey: "settings.exclusiveRightSidebarPanelsDescription", targetId: "appearance" },
   ...createToolbarVisibilitySettingsSearchDefinitions(),
@@ -245,6 +260,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "security", category: "security", titleKey: "settings.securityTab", targetId: "security", visible: webOnly },
   { id: "security-password", category: "security", titleKey: "auth.changePassword", targetId: "security", visible: webOnly },
   { id: "about-support", category: "about", titleKey: "settings.supportInfoTitle", descriptionKey: "settings.supportInfoDescription", targetId: "about" },
+  { id: "about-transfer", category: "about", titleKey: "settings.settingsTransferTitle", descriptionKey: "settings.settingsTransferDescription", targetId: "about" },
   { id: "about-update", category: "about", titleKey: "settings.updateDownloadSource", descriptionKey: "settings.updateDownloadSourceDescription", targetId: "about" },
 ];
 

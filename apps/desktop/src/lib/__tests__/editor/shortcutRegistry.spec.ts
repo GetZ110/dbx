@@ -9,6 +9,7 @@ import {
   normalizeShortcutSettings,
   selectionOccurrenceDefaultShortcut,
   shortcutToCodeMirrorKey,
+  toggleAiPanelDefaultShortcut,
   type ShortcutActionId,
 } from "@/lib/editor/shortcutRegistry";
 
@@ -96,30 +97,32 @@ describe("shortcutRegistry editor actions", () => {
   it("detects go-to-column conflicts only within the grid scope", () => {
     const shortcuts = normalizeShortcutSettings({ goToColumn: "Mod+D" });
 
-    expect(findShortcutConflict("goToColumn", shortcuts.goToColumn, shortcuts)).toBe("editTableStructure");
+    expect(findShortcutConflict("goToColumn", shortcuts.goToColumn, shortcuts)).toBe("copyCurrentRow");
     expect(findShortcutConflict("goToColumn", "Mod+F", shortcuts)).toBeNull();
   });
 
-  it("registers edit table structure as the conflict-free default Mod+D grid action", () => {
+  it("registers copy-current-row Mod+D and edit-table-structure Mod+Shift+D as conflict-free grid defaults", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "editTableStructure");
 
     expect(definition).toMatchObject({
       labelKey: "settings.shortcutEditTableStructure",
       scope: "grid",
-      defaultShortcut: "Mod+D",
+      defaultShortcut: "Mod+Shift+D",
     });
-    expect(DEFAULT_SHORTCUT_SETTINGS.editTableStructure).toBe("Mod+D");
-    expect(DEFAULT_SHORTCUT_SETTINGS.copyCurrentRow).toBe("");
+    expect(DEFAULT_SHORTCUT_SETTINGS.editTableStructure).toBe("Mod+Shift+D");
+    expect(DEFAULT_SHORTCUT_SETTINGS.copyCurrentRow).toBe("Mod+D");
     expect(findShortcutConflict("editTableStructure", DEFAULT_SHORTCUT_SETTINGS.editTableStructure, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+    expect(findShortcutConflict("copyCurrentRow", DEFAULT_SHORTCUT_SETTINGS.copyCurrentRow, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
     expect(findShortcutConflict("duplicateLine", DEFAULT_SHORTCUT_SETTINGS.duplicateLine, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
-  it("migrates the legacy copy-row Mod+D default without overwriting explicit shortcuts", () => {
-    expect(normalizeShortcutSettings()).toMatchObject({ editTableStructure: "Mod+D", copyCurrentRow: "" });
-    expect(normalizeShortcutSettings({ copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "Mod+D", copyCurrentRow: "" });
-    expect(normalizeShortcutSettings({ copyCurrentRow: "Shift+Mod+C" })).toMatchObject({ editTableStructure: "Mod+D", copyCurrentRow: "Shift+Mod+C" });
+  it("restores copy-current-row Mod+D after the previous edit-structure migration", () => {
+    expect(normalizeShortcutSettings()).toMatchObject({ editTableStructure: "Mod+Shift+D", copyCurrentRow: "Mod+D" });
+    expect(normalizeShortcutSettings({ copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "Mod+Shift+D", copyCurrentRow: "Mod+D" });
+    expect(normalizeShortcutSettings({ copyCurrentRow: "Shift+Mod+C" })).toMatchObject({ editTableStructure: "Mod+Shift+D", copyCurrentRow: "Shift+Mod+C" });
     expect(normalizeShortcutSettings({ editTableStructure: "", copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "", copyCurrentRow: "Mod+D" });
     expect(normalizeShortcutSettings({ editTableStructure: "Shift+Mod+D", copyCurrentRow: "Mod+D" })).toMatchObject({ editTableStructure: "Shift+Mod+D", copyCurrentRow: "Mod+D" });
+    expect(normalizeShortcutSettings({ editTableStructure: "Mod+D", copyCurrentRow: "" })).toMatchObject({ editTableStructure: "Mod+Shift+D", copyCurrentRow: "Mod+D" });
   });
 
   it("registers the new-data-tab mouse modifier as a configurable sidebar shortcut", () => {
@@ -149,6 +152,14 @@ describe("shortcutRegistry editor actions", () => {
     expect(findShortcutConflict("expandSelectStar", DEFAULT_SHORTCUT_SETTINGS.expandSelectStar, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
+  it("registers a configurable editor shortcut for the explain plan", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "explainSql");
+
+    expect(definition).toMatchObject({ labelKey: "toolbar.explainPlan", scope: "editor", defaultShortcut: "Mod+E" });
+    expect(shortcutToCodeMirrorKey(DEFAULT_SHORTCUT_SETTINGS.explainSql)).toBe("Mod-e");
+    expect(findShortcutConflict("explainSql", "Mod+E", DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
   it("keeps current-view search and editor find contextual on Mod+F", () => {
     const focusSearch = SHORTCUT_DEFINITIONS.find((item) => item.id === "focusSearch");
     const find = SHORTCUT_DEFINITIONS.find((item) => item.id === "find");
@@ -165,6 +176,17 @@ describe("shortcutRegistry editor actions", () => {
     expect(definition).toMatchObject({ labelKey: "settings.shortcutToggleZenMode", scope: "global", defaultShortcut: "Shift+Mod+F12" });
     expect(DEFAULT_SHORTCUT_SETTINGS.toggleZenMode).toBe("Shift+Mod+F12");
     expect(findShortcutConflict("toggleZenMode", DEFAULT_SHORTCUT_SETTINGS.toggleZenMode, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+  });
+
+  it("uses a platform-specific shortcut for toggling the AI panel", () => {
+    const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "toggleAiPanel");
+
+    expect(definition).toMatchObject({ id: "toggleAiPanel", labelKey: "settings.shortcutToggleAiPanel", scope: "global" });
+    expect(toggleAiPanelDefaultShortcut("MacIntel")).toBe("Ctrl+Mod+I");
+    expect(toggleAiPanelDefaultShortcut("Win32")).toBe("Ctrl+Alt+I");
+    expect(normalizeShortcutSettings({ toggleAiPanel: "Ctrl+Alt+I" }, "MacIntel").toggleAiPanel).toBe("Ctrl+Mod+I");
+    expect(normalizeShortcutSettings({ toggleAiPanel: "Ctrl+Mod+I" }, "Win32").toggleAiPanel).toBe("Ctrl+Alt+I");
+    expect(findShortcutConflict("toggleAiPanel", normalizeShortcutSettings().toggleAiPanel, normalizeShortcutSettings())).toBeNull();
   });
 
   it("uses Shift+Enter for inserting a complete line below", () => {

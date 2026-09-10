@@ -1,9 +1,10 @@
 <script setup lang="ts">
+import { useUpdateBlocker } from "@/lib/app/updatePreparation";
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, shallowRef, useId, watch } from "vue";
-import { Compartment, StateEffect, StateField, type Extension } from "@codemirror/state";
-import { StreamLanguage, ensureSyntaxTree } from "@codemirror/language";
+import { Compartment, StateEffect, StateField } from "@codemirror/state";
+import { ensureSyntaxTree } from "@codemirror/language";
 import { Decoration, EditorView } from "@codemirror/view";
-import { Archive, ArrowLeftRight, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clipboard, Columns3, Download, FileClock, FileInput, FileText, Loader2, Network, Plus, RefreshCw, Save, Search, Send, Server, Trash2, X } from "@lucide/vue";
+import { Archive, ArrowLeftRight, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, Clipboard, Columns3, Download, ExternalLink, FileClock, FileInput, FileText, Loader2, Maximize2, Minimize2, Network, Plus, RefreshCw, Save, Search, Send, Server, Trash2, X } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import ProductionContextBadge from "@/components/common/ProductionContextBadge.vue";
@@ -40,6 +41,8 @@ import {
   isNacosConfigDeleteSnapshotInScope,
   resolveNacosConfigCopyText,
   resolveNacosConfigSaveCompletion,
+  resolveNacosConsoleUrl,
+  nacosMetadataTableRows,
   type NacosConfigDeleteSnapshot,
 } from "@/lib/nacos/nacosAdmin";
 import { createNacosNamespaceRequestGuard, subscribeNacosNamespacesChanged, type NacosNamespacesChangedDetail } from "@/lib/nacos/nacosNamespaceCache";
@@ -57,6 +60,7 @@ import { executeWithProductionContextGuard } from "@/lib/database/productionExec
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
 import { validateNacosConfigContent, type NacosConfigDiagnostic } from "@/lib/nacos/nacosConfigValidation";
+import { loadNacosConfigLanguage, resolveNacosConfigFormat } from "@/lib/nacos/nacosConfigLanguage";
 import type { NacosConfigEditorViewport } from "@/types/database";
 import type {
   NacosBatchPreview,
@@ -83,6 +87,7 @@ import type {
 } from "@/types/nacos";
 import { Splitpanes, Pane } from "splitpanes";
 import "splitpanes/dist/splitpanes.css";
+import { useTabUiState } from "@/lib/tabs/tabUiState";
 
 const props = defineProps<{
   connectionId: string;
@@ -93,6 +98,33 @@ const props = defineProps<{
   targetKeyword?: string;
   targetRequestId?: number;
   readOnly?: boolean;
+  zenMode?: boolean;
+}>();
+
+interface NacosTabUiState {
+  activeTab?: AdminTab;
+  configGroup?: string;
+  configDataId?: string;
+  configAppName?: string;
+  configPageNo?: number;
+  configPageSize?: number;
+  configAdvancedOpen?: boolean;
+  historyOpen?: boolean;
+  historyPageNo?: number;
+  historyPageSize?: number;
+  serviceGroup?: string;
+  serviceName?: string;
+  serviceCluster?: string;
+  servicePageNo?: number;
+  servicePageSize?: number;
+  serviceDetailExpanded?: boolean;
+  nacosSplitSize?: number;
+}
+
+const { initialState: restoredUiState, track: trackUiState } = useTabUiState<NacosTabUiState>({}, "NacosAdminConsole");
+
+const emit = defineEmits<{
+  toggleZenMode: [];
 }>();
 
 type AdminTab = "configs" | "services";
@@ -104,21 +136,21 @@ const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
 const { isDark, themePalette } = useTheme();
-const activeTab = ref<AdminTab>("configs");
+const activeTab = ref<AdminTab>(restoredUiState.activeTab ?? "configs");
 const connectionInfo = ref<NacosConnectionInfo | null>(null);
 const connectionError = ref("");
 const infoLoading = ref(false);
 
 const configLoading = ref(false);
 const configError = ref("");
-const configGroup = ref("");
-const configDataId = ref("");
-const configAppName = ref("");
-const configPageNo = ref(1);
+const configGroup = ref(restoredUiState.configGroup ?? "");
+const configDataId = ref(restoredUiState.configDataId ?? "");
+const configAppName = ref(restoredUiState.configAppName ?? "");
+const configPageNo = ref(restoredUiState.configPageNo ?? 1);
 const NACOS_CONFIG_PAGE_SIZE_OPTIONS = [20, 50, 100, 200, 500] as const;
 const NACOS_CONFIG_PAGE_SIZE_STORAGE_KEY = "dbx-nacos-config-page-size";
 const savedNacosConfigPageSize = Number(safeLocalStorageGet(NACOS_CONFIG_PAGE_SIZE_STORAGE_KEY));
-const configPageSize = ref<number>(NACOS_CONFIG_PAGE_SIZE_OPTIONS.find((size) => size === savedNacosConfigPageSize) ?? 20);
+const configPageSize = ref<number>(restoredUiState.configPageSize ?? NACOS_CONFIG_PAGE_SIZE_OPTIONS.find((size) => size === savedNacosConfigPageSize) ?? 20);
 const configs = ref<NacosConfigItem[]>([]);
 const configTotal = ref(0);
 const selectedConfig = ref<NacosConfigItem | null>(null);
@@ -130,7 +162,7 @@ const originalConfigType = ref("text");
 const originalConfigMetadata = ref({ appName: "", desc: "", tags: "" });
 const savingConfig = ref(false);
 const deletingConfig = ref(false);
-const configAdvancedOpen = ref(false);
+const configAdvancedOpen = ref(restoredUiState.configAdvancedOpen ?? false);
 const configSaveNotice = ref("");
 const configValidationOpen = ref(false);
 const configValidationDiagnostics = ref<NacosConfigDiagnostic[]>([]);
@@ -142,19 +174,21 @@ interface NacosBatchDeleteSnapshot {
   keys: NacosConfigKey[];
 }
 const pendingBatchDelete = ref<NacosBatchDeleteSnapshot | null>(null);
-const historyOpen = ref(false);
+const historyOpen = ref(restoredUiState.historyOpen ?? false);
 const historyLoading = ref(false);
 const historyError = ref("");
 const historyItems = ref<NacosConfigHistoryItem[]>([]);
-const historyPageNo = ref(1);
-const historyPageSize = ref(20);
+const historyPageNo = ref(restoredUiState.historyPageNo ?? 1);
+const historyPageSize = ref(restoredUiState.historyPageSize ?? 20);
 const historyTotal = ref(0);
 const historyViewingItem = ref<NacosConfigHistoryItem | null>(null);
 const historyViewingContent = ref("");
+const historyViewingFormat = ref("text");
 const historyViewingLoading = ref(false);
 const historyCompareOpen = ref(false);
 const historyCompareCurrent = ref("");
 const historyCompareContent = ref("");
+const historyCompareFormat = ref("text");
 const historyCompareLoading = ref(false);
 const historyCompareItem = ref<NacosConfigHistoryItem | null>(null);
 const pendingHistoryRollback = ref<NacosConfigHistoryItem | null>(null);
@@ -219,18 +253,18 @@ let latestConfigSaveRequestId = 0;
 
 const servicesLoading = ref(false);
 const servicesError = ref("");
-const serviceGroup = ref("");
-const serviceName = ref("");
-const serviceCluster = ref("");
-const servicePageNo = ref(1);
-const servicePageSize = ref(20);
+const serviceGroup = ref(restoredUiState.serviceGroup ?? "");
+const serviceName = ref(restoredUiState.serviceName ?? "");
+const serviceCluster = ref(restoredUiState.serviceCluster ?? "");
+const servicePageNo = ref(restoredUiState.servicePageNo ?? 1);
+const servicePageSize = ref(restoredUiState.servicePageSize ?? 20);
 const services = ref<NacosServiceInfo[]>([]);
 const serviceTotal = ref(0);
 const selectedService = ref<NacosServiceInfo | null>(null);
 const selectedServiceDetail = ref<NacosServiceDetail | null>(null);
 const serviceDetailLoading = ref(false);
 const serviceDetailError = ref("");
-const serviceDetailExpanded = ref(false);
+const serviceDetailExpanded = ref(restoredUiState.serviceDetailExpanded ?? false);
 const instances = ref<NacosInstanceInfo[]>([]);
 const instancesLoading = ref(false);
 const instancesError = ref("");
@@ -241,6 +275,8 @@ const instanceEditorOpen = ref(false);
 const instanceEditorError = ref("");
 const instanceEditorTarget = ref<NacosInstanceInfo | null>(null);
 const instanceEditor = ref({ weight: "1", metadata: "{}" });
+const instanceMetadataTableOpen = ref(false);
+const instanceMetadataTableTarget = ref<NacosInstanceInfo | null>(null);
 const serviceEditorOpen = ref(false);
 const serviceEditorLoading = ref(false);
 const serviceEditorError = ref("");
@@ -262,7 +298,27 @@ let serviceMutationSequence = 0;
 
 const NACOS_SPLIT_SIZE_KEY = "dbx-nacos-admin-split-size";
 const savedNacosSplitSize = Number(safeLocalStorageGet(NACOS_SPLIT_SIZE_KEY));
-const nacosSplitSize = ref(savedNacosSplitSize >= 20 && savedNacosSplitSize <= 80 ? savedNacosSplitSize : 42);
+const nacosSplitSize = ref(restoredUiState.nacosSplitSize ?? (savedNacosSplitSize >= 20 && savedNacosSplitSize <= 80 ? savedNacosSplitSize : 42));
+
+trackUiState(() => ({
+  activeTab: activeTab.value,
+  configGroup: configGroup.value,
+  configDataId: configDataId.value,
+  configAppName: configAppName.value,
+  configPageNo: configPageNo.value,
+  configPageSize: configPageSize.value,
+  configAdvancedOpen: configAdvancedOpen.value,
+  historyOpen: historyOpen.value,
+  historyPageNo: historyPageNo.value,
+  historyPageSize: historyPageSize.value,
+  serviceGroup: serviceGroup.value,
+  serviceName: serviceName.value,
+  serviceCluster: serviceCluster.value,
+  servicePageNo: servicePageNo.value,
+  servicePageSize: servicePageSize.value,
+  serviceDetailExpanded: serviceDetailExpanded.value,
+  nacosSplitSize: nacosSplitSize.value,
+}));
 const CONNECTION_NOT_FOUND_RETRY_DELAYS_MS = [150, 350, 700];
 const configListViewport = ref<HTMLElement | null>(null);
 const configListViewportWidth = ref(0);
@@ -289,6 +345,16 @@ function isSelectedConfigListItem(item: NacosConfigItem) {
 }
 
 const namespace = computed(() => props.namespace ?? connectionInfo.value?.namespace ?? "");
+const instanceMetadataTableRows = computed(() => nacosMetadataTableRows(instanceMetadataTableTarget.value?.metadata));
+const nacosConsoleUrl = computed(() => {
+  const config = connectionStore.getConfig(props.connectionId)?.external_config;
+  if (!config || typeof config !== "object" || Array.isArray(config)) return undefined;
+  try {
+    return resolveNacosConsoleUrl(config as import("@/types/nacos").NacosAdminConfig);
+  } catch {
+    return undefined;
+  }
+});
 const nacosProductionContext = computed(() => productionContextForDatabase(connectionStore.getConfig(props.connectionId), namespace.value));
 const batchTargetConnections = computed<NacosConfigTransferTarget[]>(() =>
   connectionStore.connections
@@ -482,37 +548,6 @@ function currentCustomThemeColors() {
   return activeTheme?.colors ?? settings.customThemeColors;
 }
 
-async function configLanguageExtension(format: string): Promise<Extension[]> {
-  switch (format) {
-    case "json": {
-      const { json } = await import("@codemirror/lang-json");
-      return [json()];
-    }
-    case "yaml": {
-      const { yaml } = await import("@codemirror/lang-yaml");
-      return [yaml()];
-    }
-    case "xml": {
-      const { xml } = await import("@codemirror/lang-xml");
-      return [xml()];
-    }
-    case "html": {
-      const { html } = await import("@codemirror/lang-html");
-      return [html({ matchClosingTags: false })];
-    }
-    case "properties": {
-      const { properties } = await import("@codemirror/legacy-modes/mode/properties");
-      return [StreamLanguage.define(properties)];
-    }
-    case "toml": {
-      const { toml } = await import("@codemirror/legacy-modes/mode/toml");
-      return [StreamLanguage.define(toml)];
-    }
-    default:
-      return [];
-  }
-}
-
 function configValidationHighlightExtension() {
   const decorationsFor = (state: import("@codemirror/state").EditorState, diagnostics: NacosConfigDiagnostic[]) => {
     const ranges = diagnostics
@@ -558,7 +593,7 @@ async function mountConfigEditor() {
     import("codemirror"),
     import("@codemirror/commands"),
     import("@codemirror/search"),
-    configLanguageExtension(format),
+    loadNacosConfigLanguage(format),
   ]);
   const editorSettings = settingsStore.editorSettings;
   configEditorFontSize.value = clampEditorFontSize(editorSettings.fontSize);
@@ -1661,9 +1696,11 @@ async function viewConfigHistory(item: NacosConfigHistoryItem) {
   await nextTick();
   historyViewingItem.value = item;
   historyViewingContent.value = "";
+  historyViewingFormat.value = resolveNacosConfigFormat(item.configType, item.dataId);
   historyViewingLoading.value = true;
   const detail = await loadHistoryDetail(item);
   historyViewingContent.value = detail?.content || "";
+  historyViewingFormat.value = resolveNacosConfigFormat(detail?.configType || item.configType, detail?.dataId || item.dataId);
   historyViewingLoading.value = false;
 }
 
@@ -1671,6 +1708,7 @@ function closeHistoryDetail() {
   historyViewingItem.value = null;
   historyViewingContent.value = "";
   historyViewingLoading.value = false;
+  historyViewingFormat.value = "text";
 }
 
 async function compareConfigHistory(item: NacosConfigHistoryItem) {
@@ -1680,10 +1718,12 @@ async function compareConfigHistory(item: NacosConfigHistoryItem) {
   historyCompareItem.value = item;
   historyCompareCurrent.value = "";
   historyCompareContent.value = "";
+  historyCompareFormat.value = resolveNacosConfigFormat(item.configType, item.dataId);
   try {
     const [current, history] = await Promise.all([api.nacosGetConfig(props.connectionId, selectedConfigOriginalKey.value), api.nacosGetConfigHistory(props.connectionId, historyKeyFor(item))]);
     historyCompareCurrent.value = current.content || "";
     historyCompareContent.value = history.content || "";
+    historyCompareFormat.value = resolveNacosConfigFormat(history.configType || item.configType || current.configType, history.dataId || item.dataId);
   } catch (error) {
     await handleRNacosConsoleError(error, () => compareConfigHistory(item), "history");
     historyCompareOpen.value = false;
@@ -2152,6 +2192,11 @@ function openInstanceEditor(instance: NacosInstanceInfo) {
   instanceEditorOpen.value = true;
 }
 
+function openInstanceMetadataTable(instance: NacosInstanceInfo) {
+  instanceMetadataTableTarget.value = instance;
+  instanceMetadataTableOpen.value = true;
+}
+
 function submitInstanceEditor() {
   const instance = instanceEditorTarget.value;
   const weight = Number(instanceEditor.value.weight);
@@ -2603,7 +2648,7 @@ onMounted(async () => {
     console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
   }
   await loadInfo();
-  await Promise.all([loadConfigsWithRetry(1), loadServicesWithRetry(1)]);
+  await Promise.all([loadConfigsWithRetry(configPageNo.value), loadServicesWithRetry(servicePageNo.value)]);
   if (props.targetDataId) await openTargetConfig(props.targetDataId, props.targetGroup || "DEFAULT_GROUP", props.targetKeyword);
   else await restoreSelectedConfig();
 });
@@ -2645,6 +2690,42 @@ onBeforeUnmount(() => {
   pauseConfigEditorViewportWork();
   destroyConfigEditor();
 });
+
+function openNacosConsole() {
+  const url = nacosConsoleUrl.value;
+  if (!url) {
+    toast(t("nacos.consoleUrlMissing"), 5000);
+    return;
+  }
+  if (isTauriRuntime()) {
+    void import("@tauri-apps/plugin-shell").then(({ open }) => open(url)).catch(() => toast(t("nacos.consoleOpenFailed"), 5000));
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+useUpdateBlocker(() =>
+  isConfigDirty.value ||
+  isCreatingConfig.value ||
+  savingConfig.value ||
+  deletingConfig.value ||
+  pendingConfigSave.value ||
+  pendingDeleteConfig.value ||
+  pendingBatchDelete.value ||
+  pendingHistoryRollback.value ||
+  rollingBackHistory.value ||
+  instanceEditorOpen.value ||
+  serviceEditorOpen.value ||
+  registerInstanceOpen.value ||
+  pendingInstanceUpdate.value ||
+  pendingInstanceDeregister.value ||
+  pendingServiceDelete.value ||
+  deletingService.value ||
+  registeringInstance.value ||
+  Object.keys(updatingInstanceKeys.value).length > 0 ||
+  Object.keys(instanceWeightDrafts.value).length > 0
+    ? t("updates.preparationDrafts")
+    : undefined,
+);
 </script>
 
 <template>
@@ -2661,6 +2742,15 @@ onBeforeUnmount(() => {
       </div>
       <div class="flex min-w-0 flex-wrap items-center justify-end gap-2">
         <span v-if="connectionError" class="max-w-96 truncate text-xs text-destructive">{{ connectionError }}</span>
+        <Button size="sm" variant="outline" class="h-8 gap-1.5" :title="nacosConsoleUrl ? t('nacos.openConsole') : t('nacos.consoleUrlMissing')" :aria-label="t('nacos.openConsole')" :disabled="!nacosConsoleUrl" @click="openNacosConsole">
+          <ExternalLink class="h-3.5 w-3.5" />
+          {{ t("nacos.openConsole") }}
+        </Button>
+        <Button size="sm" variant="outline" class="h-8 gap-1.5" :title="props.zenMode ? t('nacos.exitZenMode') : t('nacos.enterZenMode')" :aria-label="props.zenMode ? t('nacos.exitZenMode') : t('nacos.enterZenMode')" @click="emit('toggleZenMode')">
+          <Minimize2 v-if="props.zenMode" class="h-3.5 w-3.5" />
+          <Maximize2 v-else class="h-3.5 w-3.5" />
+          {{ props.zenMode ? t("nacos.exitZenMode") : t("nacos.enterZenMode") }}
+        </Button>
         <Button v-if="connectionError" size="sm" variant="outline" class="h-8 w-8 px-0" :title="t('nacos.retryConnectionInfo')" :aria-label="t('nacos.retryConnectionInfo')" :disabled="infoLoading" @click="loadInfo">
           <Loader2 v-if="infoLoading" class="h-3.5 w-3.5 animate-spin" />
           <RefreshCw v-else class="h-3.5 w-3.5" />
@@ -3220,10 +3310,18 @@ onBeforeUnmount(() => {
                           <Button size="sm" variant="ghost" class="h-7 px-2" :disabled="isInstanceUpdating(instance)" @click="resetInstanceWeightDraft(instance)">{{ t("nacos.restore") }}</Button>
                         </div>
                       </div>
-                      <details v-if="instance.metadata && Object.keys(instance.metadata).length" class="min-w-0 self-start text-muted-foreground">
-                        <summary class="cursor-pointer select-none hover:text-foreground">{{ t("nacos.metadataLabel") }}（{{ t("nacos.itemCount", { count: Object.keys(instance.metadata).length }) }}）</summary>
-                        <pre class="mt-1 max-h-32 max-w-full overflow-auto rounded bg-muted p-2 font-mono text-[11px] text-foreground">{{ JSON.stringify(instance.metadata, null, 2) }}</pre>
-                      </details>
+                      <div v-if="instance.metadata && typeof instance.metadata === 'object' && Object.keys(instance.metadata).length" class="min-w-0 self-start">
+                        <div class="nacos-instance-metadata-actions flex min-w-0 flex-wrap items-center gap-1">
+                          <details class="min-w-0 text-muted-foreground">
+                            <summary class="cursor-pointer select-none hover:text-foreground">{{ t("nacos.metadataLabel") }}（{{ t("nacos.itemCount", { count: Object.keys(instance.metadata).length }) }}）</summary>
+                            <pre class="mt-1 max-h-32 max-w-full overflow-auto rounded bg-muted p-2 font-mono text-[11px] text-foreground">{{ JSON.stringify(instance.metadata, null, 2) }}</pre>
+                          </details>
+                          <Button size="sm" variant="ghost" class="h-6 shrink-0 gap-1 px-1.5 text-xs text-muted-foreground hover:text-foreground" :aria-label="t('nacos.viewMetadataTable')" @click="openInstanceMetadataTable(instance)">
+                            <Columns3 class="h-3.5 w-3.5" />
+                            {{ t("nacos.viewMetadataTable") }}
+                          </Button>
+                        </div>
+                      </div>
                       <span v-else class="self-start text-muted-foreground">{{ t("nacos.noMetadata") }}</span>
                     </div>
                   </div>
@@ -3287,7 +3385,7 @@ onBeforeUnmount(() => {
       </DialogContent>
     </Dialog>
 
-    <NacosConfigDiffDialog v-model:open="pendingConfigSave" :before="originalConfigContent" :after="configContent" :loading="savingConfig" @confirm="saveConfig" />
+    <NacosConfigDiffDialog v-model:open="pendingConfigSave" :before="originalConfigContent" :after="configContent" :format="resolveNacosConfigFormat(configType, configDataId)" :loading="savingConfig" @confirm="saveConfig" />
 
     <NacosContentSearchDialog
       v-model:open="searchOpen"
@@ -3340,6 +3438,7 @@ onBeforeUnmount(() => {
       :read-only="readOnly"
       :viewing-item="historyViewingItem"
       :viewing-content="historyViewingContent"
+      :viewing-format="historyViewingFormat"
       :viewing-loading="historyViewingLoading"
       @load="loadConfigHistory"
       @view="viewConfigHistory"
@@ -3379,6 +3478,7 @@ onBeforeUnmount(() => {
       :after-label="t('nacos.historyVersionContent')"
       :before="historyCompareCurrent"
       :after="historyCompareContent"
+      :format="historyCompareFormat"
       :loading="historyCompareLoading"
       :show-confirm="!readOnly"
       :confirm-label="t('nacos.rollback')"
@@ -3475,6 +3575,34 @@ onBeforeUnmount(() => {
         <DialogFooter>
           <Button variant="outline" @click="instanceEditorOpen = false">{{ t("nacos.cancel") }}</Button>
           <Button @click="submitInstanceEditor">{{ t("nacos.save") }}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <Dialog v-model:open="instanceMetadataTableOpen">
+      <DialogContent class="flex max-h-[80vh] flex-col sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>{{ t("nacos.instanceMetadataTitle") }}</DialogTitle>
+          <DialogDescription>{{ instanceMetadataTableTarget ? `${instanceMetadataTableTarget.ip}:${instanceMetadataTableTarget.port} · ${instanceMetadataTableTarget.clusterName || "DEFAULT"}` : "" }}</DialogDescription>
+        </DialogHeader>
+        <div class="min-h-0 overflow-auto rounded-md border">
+          <table class="w-full min-w-[420px] text-left text-sm">
+            <thead class="sticky top-0 z-10 bg-muted/85 text-xs text-muted-foreground">
+              <tr>
+                <th class="w-1/3 border-b px-3 py-2 font-medium">{{ t("nacos.metadataKey") }}</th>
+                <th class="border-b px-3 py-2 font-medium">{{ t("nacos.metadataValue") }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in instanceMetadataTableRows" :key="row.key" class="border-b last:border-0">
+                <td class="break-all px-3 py-2 align-top font-mono text-xs font-medium">{{ row.key }}</td>
+                <td class="whitespace-pre-wrap break-all px-3 py-2 align-top font-mono text-xs">{{ row.value }}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="instanceMetadataTableOpen = false">{{ t("nacos.cancel") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

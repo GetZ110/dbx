@@ -12,6 +12,7 @@ import { expandToSqlStatementWindow } from "@/lib/sql/insertValueHints";
 import type { SqlSemanticBuildOptions, SqlSemanticSpan } from "@/lib/sql/semantic/types";
 import { isEditorStatePlausibleFor, resolveLexicalLeafFromSyntaxTree, resolveSqlStatementWindow } from "@/lib/sql/sqlSyntaxTreeWindow";
 import { DEFAULT_SQL_SNIPPETS, MANTICORESEARCH_SQL_SNIPPETS, resolveSqlSnippetBodyForDatabase } from "@/lib/sql/sqlSnippetTemplates";
+import { BACKSLASH_ESCAPE_STRING_DIALECTS } from "@/lib/sql/sqlStatementRanges";
 import { requiresMysqlIdentifierQuote, requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
 import { identifierMatchScore, matchesIdentifierSearch } from "@/lib/sql/identifierSearch";
 import { containsHan, orderedSubsequenceSpan, pinyinFirstLetters } from "@/lib/common/pinyin";
@@ -381,6 +382,7 @@ const COMMON_SQL_KEYWORDS = [
 ];
 
 const POSTGRES_SQL_KEYWORDS = [
+  "COMMENT",
   "BIGSERIAL",
   "JSON",
   "JSONB",
@@ -409,11 +411,16 @@ const POSTGRES_SQL_KEYWORDS = [
   "JSONB_BUILD_OBJECT",
   "JSONB_AGG",
   "TO_JSONB",
+  "CURRENT_DATE",
+  "CURRENT_TIME",
   "CURRENT_TIMESTAMP",
+  "LOCALTIME",
+  "LOCALTIMESTAMP",
 ];
 
 const MYSQL_SQL_KEYWORDS = [
   "AUTO_INCREMENT",
+  "COMMENT",
   "UNSIGNED",
   "ZEROFILL",
   "ENGINE",
@@ -576,6 +583,15 @@ const DATABASE_SQL_KEYWORDS: Partial<Record<DatabaseType, string[]>> = {
   oracle: ORACLE_SQL_KEYWORDS,
   "oceanbase-oracle": ORACLE_SQL_KEYWORDS,
   manticoresearch: MANTICORESEARCH_SQL_KEYWORDS,
+  duckdb: ["COMMENT"],
+  clickhouse: ["COMMENT"],
+  doris: ["COMMENT"],
+  starrocks: ["COMMENT"],
+  dameng: ["COMMENT"],
+  kingbase: ["COMMENT"],
+  vastbase: ["COMMENT"],
+  spark: ["COMMENT"],
+  iotdb: ["COMMENT"],
 };
 
 // Keywords that appear in nearly every SQL query — boosted so frequency beats length tie-breaking.
@@ -639,6 +655,7 @@ const DDL_ONLY_KEYWORDS = new Set([
   "CREATE",
   "ALTER",
   "DROP",
+  "COMMENT",
   "TABLE",
   "VIEW",
   "INDEX",
@@ -2887,7 +2904,8 @@ const MYSQL_DASH_COMMENT_DIALECTS = new Set<DatabaseType>(["mysql", "doris", "st
 // why that's unsafe (a trailing backslash before a closing quote in a dialect that doesn't escape
 // it, e.g. a Postgres Windows-path string literal, would misread the real closing quote as
 // escaped and swallow the rest of the query).
-const BACKSLASH_ESCAPE_STRING_DIALECTS = new Set<DatabaseType>(["mysql", "doris", "starrocks", "hive", "argo", "impala", "spark"]);
+// The authoritative set lives in sqlStatementRanges.ts (the statement splitter depends on it too);
+// import it here to keep a single source of truth.
 
 // Table/schema/db unquoted-identifier continue class needs @ and # in addition to what
 // SQL_IDENTIFIER_CONTINUE_CHAR covers, so splice its inner class body into a locally-built class
@@ -3496,7 +3514,15 @@ function splitQualifiedNameRawParts(input: string): string[] {
       continue;
     }
     if (ch === "[" && !inDoubleQuote && !inBacktick) inBracket = true;
-    if (ch === "]" && inBracket) inBracket = false;
+    if (ch === "]" && inBracket) {
+      current += ch;
+      if (input[i + 1] === "]") {
+        current += input[++i];
+      } else {
+        inBracket = false;
+      }
+      continue;
+    }
     if (ch === "." && !inDoubleQuote && !inBacktick && !inBracket) {
       parts.push(current.trim());
       current = "";
@@ -3535,6 +3561,8 @@ export function quoteSqlIdentifier(identifier: string, dialect?: SqlCompletionAp
 }
 
 const POSTGRES_IDENTIFIER_KEYWORDS = new Set(SQL_KEYWORDS.map((keyword) => keyword.toLowerCase()));
+const SQLSERVER_IDENTIFIER_KEYWORDS = new Set(sqlDialectCompletionWords(MSSQL.spec.keywords).map((keyword) => keyword.toLowerCase()));
+const SQLSERVER_REGULAR_IDENTIFIER = /^[\p{L}_][\p{L}\p{Nd}_@$#]*$/u;
 
 // Unlike quoteSqlIdentifier (also used by the data grid condition editor, which
 // intentionally leaves MySQL identifiers unquoted and applies backticks itself
@@ -3545,14 +3573,19 @@ function quoteCompletionApplyIdentifier(identifier: string, dialect?: SqlComplet
     if (!requiresMysqlIdentifierQuote(identifier, POSTGRES_IDENTIFIER_KEYWORDS)) return identifier;
     return `\`${identifier.replaceAll("`", "``")}\``;
   }
+  if (dialect === "sqlserver") {
+    if (SQLSERVER_REGULAR_IDENTIFIER.test(identifier) && !requiresMysqlIdentifierQuote(identifier.toLowerCase(), SQLSERVER_IDENTIFIER_KEYWORDS)) return identifier;
+    const escaped = identifier.replaceAll("]", "]]");
+    return `[${escaped}]`;
+  }
   return quoteSqlIdentifier(identifier, dialect);
 }
 
 function quoteCompletionApplyName(applyName: string, dialect?: SqlCompletionApplyDialect): string {
-  if (dialect !== "mysql" && dialect !== "oracle") return applyName;
+  if (dialect !== "mysql" && dialect !== "oracle" && dialect !== "sqlserver") return applyName;
   const parts = splitQualifiedNameRawParts(applyName);
   if (parts.length === 0) return applyName;
-  return parts.map((part) => (isQuotedIdentifier(part) ? part : quoteCompletionApplyIdentifier(part, dialect))).join(".");
+  return parts.map((part) => ((dialect === "sqlserver" && !part) || isQuotedIdentifier(part) ? part : quoteCompletionApplyIdentifier(part, dialect))).join(".");
 }
 
 function quoteCompletionRoutineIdentifier(identifier: string, dialect?: SqlCompletionApplyDialect): string {
@@ -3638,7 +3671,8 @@ function buildTableItems(
     .map((table) => {
       const qualifiedByContext = !!qualifierSchema && !!table.schema && normalizeIdentifierPart(qualifierSchema) === normalizeIdentifierPart(table.schema);
       const { ambiguousTableName, defaultApplyName } = resolveTableSchemaQualification(table, dialect, databaseType, currentSchema, schemasByTableName);
-      const suppliedApplyName = table.applyName?.trim();
+      const rawSuppliedApplyName = table.applyName?.trim();
+      const suppliedApplyName = dialect === "sqlserver" && rawSuppliedApplyName ? quoteCompletionApplyName(rawSuppliedApplyName, dialect) : rawSuppliedApplyName;
       const suppliedApplyNameIsQualified = suppliedApplyName?.includes(".") === true;
       const applyName = qualifiedByContext ? quoteCompletionApplyIdentifier(table.name, dialect) : ambiguousTableName && !!table.schema && (!suppliedApplyName || !suppliedApplyNameIsQualified) ? defaultApplyName : (suppliedApplyName ?? defaultApplyName);
       const alias = autoAliasTables ? generateTableCompletionAlias(table.name, existingAliases) : "";
@@ -4607,6 +4641,13 @@ function buildColumnDetail(column: SqlCompletionColumn): string {
   let detail = column.dataType ? `${tableInfo}  [${column.dataType}]` : tableInfo;
   if (column.isNullable === false) {
     detail += "  NOT NULL";
+  }
+  // Surface the column comment inline in the completion row (e.g. Chinese
+  // field notes) so it shows without opening the side info panel. This was
+  // dropped when qualified completion queries were optimized; keep it here.
+  const comment = column.comment?.trim();
+  if (comment) {
+    detail += `  -- ${comment}`;
   }
   return detail;
 }

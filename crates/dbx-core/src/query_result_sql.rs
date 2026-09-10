@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::models::connection::DatabaseType;
 use crate::sql::{find_statement_at_cursor, find_statement_at_cursor_for_database};
 use crate::sql_dialect::{
-    firebird_rows_clause, pagination_strategy, quote_table_identifier, PaginationContext, TablePaginationStrategy,
+    firebird_rows_clause, pagination_strategy, quote_iris_identifier, quote_table_identifier, PaginationContext,
+    TablePaginationStrategy,
 };
 use sqlparser::ast::{
     visit_expressions, Expr, GroupByExpr, LimitClause, ObjectNamePart, OrderByKind, Select, SelectItem,
@@ -344,6 +345,19 @@ pub fn build_count_query_sql(options: CountQuerySqlOptions) -> QuerySqlBuildResu
     } else {
         quote_table_identifier(options.database_type, "dbx_count")
     };
+    if options.database_type == Some(DatabaseType::Hive) && starts_with_cte(&statement) {
+        if let Some(main_query_start) = top_level_sql_tokens(&statement)
+            .into_iter()
+            .find(|token| matches!(token.text.as_str(), "SELECT" | "FROM"))
+            .map(|token| token.start)
+        {
+            let (with_clause, main_query) = statement.split_at(main_query_start);
+            return ok(format!(
+                "{execution_hint}{with_clause}{}",
+                derived_table_sql("SELECT COUNT(*) AS dbx_total_rows FROM", main_query, &format!("{alias};"))
+            ));
+        }
+    }
     let wrapped_sql = match options.database_type {
         Some(DatabaseType::Iris) => iris_statement_for_derived_table(&statement),
         _ => statement,
@@ -391,6 +405,8 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     }
 
     let aliases = build_derived_column_aliases(&options.result_columns);
+    // Caché/IRIS rejects derived-table column alias lists (`t(col, col)`)
+    // outright (SQLCODE -25), regardless of delimited-identifier support.
     let use_derived_column_aliases = options.database_type != Some(DatabaseType::Mysql)
         && options.database_type != Some(DatabaseType::ClickHouse)
         // Doris accepts the derived-table alias but not its column-name list.
@@ -400,7 +416,8 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
         && options.database_type != Some(DatabaseType::Dameng)
         && options.database_type != Some(DatabaseType::Oracle)
         && options.database_type != Some(DatabaseType::OceanbaseOracle)
-        && options.database_type != Some(DatabaseType::SapHana);
+        && options.database_type != Some(DatabaseType::SapHana)
+        && options.database_type != Some(DatabaseType::Iris);
     let sort_alias = if use_derived_column_aliases {
         aliases
             .get(options.column_index)
@@ -422,13 +439,24 @@ pub fn build_sorted_query_sql(options: SortedQuerySqlOptions) -> QuerySqlBuildRe
     let use_sort_ordinal = !use_derived_column_aliases
         && matches!(
             options.database_type,
-            Some(DatabaseType::Dameng | DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::SapHana)
+            Some(
+                DatabaseType::Dameng
+                    | DatabaseType::Oracle
+                    | DatabaseType::OceanbaseOracle
+                    | DatabaseType::SapHana
+                    | DatabaseType::Iris
+            )
         )
         && options.result_columns.get(options.column_index).is_some_and(|column| {
             options.result_columns.iter().filter(|candidate| candidate.eq_ignore_ascii_case(column)).count() > 1
         });
     let sort_reference = if use_sort_ordinal {
         (options.column_index + 1).to_string()
+    } else if options.database_type == Some(DatabaseType::Iris) {
+        // With delimited identifiers disabled, a quoted ORDER BY name becomes
+        // a string literal on Caché and the sort silently degrades to a
+        // constant. Ordinary names must be sent unquoted.
+        quote_iris_identifier(&sort_alias, None)
     } else {
         quote_table_identifier(options.database_type, &sort_alias)
     };
@@ -628,13 +656,18 @@ fn add_sql_server_offset_fetch(statement: &str, limit: usize, offset: usize) -> 
         return Some(inject_sql_server_top(statement, limit));
     }
 
-    let statement_without_order = order_by_index.map(|index| statement[..index].trim_end()).unwrap_or(statement);
+    // The inner query may end with a line comment after removing ORDER BY.
+    // Keep the derived-table closing parenthesis on a new line so it is not
+    // swallowed by `--` / `#` comments.
+    let statement_without_order = order_by_index
+        .map(|index| statement_for_sql_suffix(statement[..index].trim_end()))
+        .unwrap_or_else(|| statement_for_sql_suffix(statement));
     if !sql_server_row_number_pagination_safe(statement) {
         return Some(add_sql_server_rowcount_pagination(statement, limit, offset));
     }
 
     let row_number_order = order_by_index
-        .map(|index| statement[index..].trim().to_string())
+        .map(|index| statement_for_sql_suffix(statement[index..].trim()))
         .unwrap_or_else(|| "ORDER BY (SELECT NULL)".to_string());
     let end = offset + limit;
     Some(format!(
@@ -718,12 +751,14 @@ fn add_sql_server_existing_top_pagination(statement: &str, limit: usize, offset:
     let row_number_order = sql_server_derived_pagination_order(statement)
         .unwrap_or_else(|| format!("ORDER BY {}", sql_server_default_pagination_order(statement)));
     if offset == 0 {
-        return format!("SELECT TOP ({limit}) * FROM ({statement}) [dbx_page] {row_number_order};");
+        let derived_statement = statement_for_sql_suffix(statement);
+        return format!("SELECT TOP ({limit}) * FROM ({derived_statement}) [dbx_page] {row_number_order};");
     }
 
     let end = offset + limit;
+    let derived_statement = statement_for_sql_suffix(statement);
     format!(
-        "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER ({row_number_order}) AS [__dbx_row_num] FROM ({statement}) dbx_page_source) dbx_page WHERE [__dbx_row_num] > {offset} AND [__dbx_row_num] <= {end} ORDER BY [__dbx_row_num];"
+        "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER ({row_number_order}) AS [__dbx_row_num] FROM ({derived_statement}) dbx_page_source) dbx_page WHERE [__dbx_row_num] > {offset} AND [__dbx_row_num] <= {end} ORDER BY [__dbx_row_num];"
     )
 }
 
@@ -2335,6 +2370,64 @@ fn fallback_alias(index: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Query shape from issue #7832: a MySQL GROUP BY over a LEFT JOIN with an
+    /// aggregated derived table, COUNT(DISTINCT IF(...)) in the projection, and
+    /// inline `-- 中文` line comments. Locks in the invariants that keep DBX's
+    /// derived page/count SQL row-count-identical to the user's statement:
+    /// the statement splitter must keep it a single statement, the page SQL
+    /// must preserve the GROUP BY while injecting deterministic pagination,
+    /// and the count wrap must count the grouped result, not the raw join.
+    #[test]
+    fn mysql_group_by_with_distinct_if_and_comments_keeps_grouping_in_page_and_count_sql() {
+        let sql = "SELECT\n  base.brand_name\n ,base.stall_id\n ,base.floor\n ,COUNT(1) total_invite -- 邀约数量\n ,SUM(IFNULL(base.ver_status, 0)) sign_num -- 签到数量\n ,SUM(IFNULL(dr.draw_count, 0)) draw_num -- 抽奖次数\n ,SUM(IFNULL(dr.draw_user_num, 0)) draw_user_num -- 抽奖人数\n ,COUNT(distinct IF(base.ver_status = 1, base.mobile, null)) sign_and_draw_user_num\nFROM v_form_data_1786326962 base\nLEFT JOIN (\n  SELECT id, SUM(IFNULL(hx_status, 0)) draw_count, COUNT(distinct IF(hx_status = 1, mobile, null)) draw_user_num\n  FROM v_form_data_1786326962_coupon\n  GROUP BY id\n) dr ON base.id = dr.id\nGROUP BY base.brand_name, base.stall_id, base.floor";
+
+        let statements = crate::sql::split_sql_statements_for_database(sql, DatabaseType::Mysql);
+        assert_eq!(statements.len(), 1, "inline comments must not split the statement");
+
+        let plan = build_query_pagination_execution_plan(QueryPaginationExecutionPlanOptions {
+            sql: sql.to_string(),
+            query_base_sql: sql.to_string(),
+            database_type: Some(DatabaseType::Mysql),
+            pagination: QueryPagination { limit: 500, offset: 0, session_id: None },
+            use_agent_cursor: false,
+            first_page_uses_actual_sql: false,
+        });
+
+        let page_sql = plan.page_sql.expect("pagination plan provides page SQL");
+        assert!(page_sql.to_uppercase().contains("GROUP BY"));
+        assert!(
+            page_sql.contains("ORDER BY 1, 2, 3 LIMIT 500;"),
+            "dedup pagination must be appended after the GROUP BY, got: {page_sql}"
+        );
+
+        let count_sql = plan.count_sql.expect("pagination plan provides count SQL");
+        assert!(count_sql.starts_with("SELECT COUNT(*) AS dbx_total_rows FROM ("));
+        assert_eq!(
+            count_sql.matches("GROUP BY").count(),
+            2,
+            "the count wrap must keep both the outer and derived-table GROUP BY, got: {count_sql}"
+        );
+
+        let mut variants = vec![
+            ("crlf", sql.replace('\n', "\r\n")),
+            ("trailing semicolon", format!("{sql};")),
+            ("trailing GROUP BY comment", format!("{sql} -- 分组")),
+        ];
+        if let Some(stripped) = sql.strip_prefix("SELECT") {
+            variants.push(("leading comment", format!("-- header\nSELECT{stripped}")));
+        }
+        for (name, variant) in variants {
+            let counted = build_count_query_sql(CountQuerySqlOptions {
+                original_sql: variant.clone(),
+                database_type: Some(DatabaseType::Mysql),
+            });
+            let counted = counted.sql.unwrap_or_default();
+            assert_eq!(counted.matches("GROUP BY").count(), 2, "{name}: count wrap kept both GROUP BYs");
+            let statements = crate::sql::split_sql_statements_for_database(&variant, DatabaseType::Mysql);
+            assert_eq!(statements.len(), 1, "{name}: still a single statement");
+        }
+    }
+
     #[test]
     fn easysearch_uses_elasticsearch_sql_pagination_rules() {
         let paginated = build_paginated_query_sql(PaginatedQuerySqlOptions {
@@ -2950,6 +3043,36 @@ mod tests {
             result.sql.unwrap(),
             "SELECT * FROM (SELECT dbx_page_source.*, ROW_NUMBER() OVER (ORDER BY [id]) AS [__dbx_row_num] FROM (SELECT TOP (500) [id], [order_no], [store_id], [product_id], [customer_name], [quantity], [amount], [order_status], [created_at] FROM [sales].[orders_10k]) dbx_page_source) dbx_page WHERE [__dbx_row_num] > 100 AND [__dbx_row_num] <= 200 ORDER BY [__dbx_row_num];"
         );
+    }
+
+    #[test]
+    fn sqlserver_later_page_keeps_derived_table_closing_after_comment_before_order_by() {
+        let sql = "SELECT\n*\nFROM\ncode\n-- WHERE\n-- ccode = '1002'\nORDER BY\nccode;";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 100,
+        });
+
+        let generated = result.sql.expect("build SQL Server page SQL");
+        assert!(generated.contains("FROM (SELECT\n*\nFROM\ncode\n-- WHERE\n-- ccode = '1002'\n) dbx_page_source"));
+        assert!(!generated.contains("-- ccode = '1002') dbx_page_source"));
+    }
+
+    #[test]
+    fn sqlserver_later_page_keeps_row_number_window_after_comment_after_order_by() {
+        let sql = "SELECT\n*\nFROM\ncode\nORDER BY\nccode -- sort";
+        let result = build_paginated_query_sql(PaginatedQuerySqlOptions {
+            original_sql: sql.to_string(),
+            database_type: Some(DatabaseType::SqlServer),
+            limit: 100,
+            offset: 100,
+        });
+
+        let generated = result.sql.expect("build SQL Server page SQL");
+        assert!(generated.contains("ROW_NUMBER() OVER (ORDER BY\nccode -- sort\n) AS [__dbx_row_num]"));
+        assert!(!generated.contains("-- sort) AS [__dbx_row_num]"));
     }
 
     #[test]
@@ -3991,6 +4114,32 @@ WHERE u.id = picked.id;
     }
 
     #[test]
+    fn hive_count_keeps_cte_outside_derived_table() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "WITH cte AS (SELECT 1 AS id) SELECT * FROM cte".to_string(),
+            database_type: Some(DatabaseType::Hive),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "WITH cte AS (SELECT 1 AS id) SELECT COUNT(*) AS dbx_total_rows FROM (SELECT * FROM cte) `dbx_count`;"
+        );
+    }
+
+    #[test]
+    fn hive_count_keeps_from_style_query_inside_derived_table() {
+        let result = build_count_query_sql(CountQuerySqlOptions {
+            original_sql: "WITH cte AS (SELECT 1 AS id) FROM cte SELECT *".to_string(),
+            database_type: Some(DatabaseType::Hive),
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "WITH cte AS (SELECT 1 AS id) SELECT COUNT(*) AS dbx_total_rows FROM (FROM cte SELECT *) `dbx_count`;"
+        );
+    }
+
+    #[test]
     fn mysql_count_rewrites_ambiguous_join_projection() {
         for sql in [
             "SELECT a.*, b.* FROM a JOIN b ON b.a_id = a.id ORDER BY b.id",
@@ -4756,6 +4905,42 @@ WHERE u.id = picked.id;
         assert_eq!(
             result.sql.unwrap(),
             "SELECT * FROM (SELECT ID, NAME, AMOUNT FROM DBX_ISSUE_7274_SORT) t ORDER BY \"NAME\" ASC;"
+        );
+    }
+
+    #[test]
+    fn builds_iris_sorted_query_without_derived_column_alias_list() {
+        // Caché/IRIS rejects `t(col, col)` derived alias lists (SQLCODE -25) and
+        // a quoted ORDER BY name becomes a string literal when delimited
+        // identifiers are disabled, so the wrap must stay alias-free and
+        // unquoted (#8340).
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT ID, Name FROM SQLUser.CT_Country".to_string(),
+            database_type: Some(DatabaseType::Iris),
+            result_columns: vec!["ID".to_string(), "Name".to_string()],
+            column_index: 1,
+            column: "Name".to_string(),
+            direction: QuerySortDirection::Asc,
+        });
+        let sql = result.sql.unwrap();
+        assert!(!sql.contains(") t("), "derived column alias list must not be emitted: {sql}");
+        assert_eq!(sql, "SELECT * FROM (SELECT ID, Name FROM SQLUser.CT_Country) t ORDER BY Name ASC;");
+    }
+
+    #[test]
+    fn builds_iris_sorted_query_by_ordinal_for_duplicate_columns() {
+        let result = build_sorted_query_sql(SortedQuerySqlOptions {
+            original_sql: "SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id".to_string(),
+            database_type: Some(DatabaseType::Iris),
+            result_columns: vec!["ID".to_string(), "id".to_string()],
+            column_index: 1,
+            column: "id".to_string(),
+            direction: QuerySortDirection::Desc,
+        });
+
+        assert_eq!(
+            result.sql.unwrap(),
+            "SELECT * FROM (SELECT a.id, b.id FROM a JOIN b ON b.a_id = a.id) t ORDER BY 2 DESC;"
         );
     }
 

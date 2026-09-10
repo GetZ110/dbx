@@ -1,13 +1,17 @@
 import { computed, ref } from "vue";
+import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useDataGridExport, type UseDataGridExportOptions } from "@/composables/useDataGridExport";
+import type { DatabaseType } from "@/types/database";
 import { buildDataGridCopyUpdateStatements } from "@/lib/dataGrid/dataGridSql";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import type { DataGridTableMeta } from "@/lib/dataGrid/dataGridSql";
 import type { CellSelectionMatrix, SelectionData } from "@/lib/dataGrid/gridSelection";
-import { extractDataGridSelection } from "@/lib/backend/api";
+import type { CellValue } from "@/lib/dataGrid/cellValue";
+import { extractDataGridSelection, exportQueryResultCsv, exportQueryResultJson } from "@/lib/backend/api";
 import { DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS } from "@/lib/dataGrid/dataGridCopyExtractor";
 import { clearDataGridClipboardCopy, parseDataGridClipboard } from "@/lib/dataGrid/dataGridClipboard";
+import { MONGO_DOCUMENT_GRID_NULL, mongoDocumentGridExternalValue } from "@/lib/mongo/mongoDocumentValues";
 
 const toast = vi.fn();
 
@@ -44,6 +48,8 @@ vi.mock("@/lib/backend/api", async (importOriginal) => {
   return {
     ...original,
     extractDataGridSelection: vi.fn(),
+    exportQueryResultCsv: vi.fn(),
+    exportQueryResultJson: vi.fn(),
   };
 });
 
@@ -68,6 +74,8 @@ function createMongoExportState(options: {
   mongoUpdateTarget?: false;
   contextColumn?: number;
   syntheticContext?: boolean;
+  fullExportResult?: UseDataGridExportOptions["fullExportResult"];
+  externalCellValue?: UseDataGridExportOptions["externalCellValue"];
 }) {
   const items = options.items ?? [options.item];
   const selectedRowIds = options.selectedRowIds ?? new Set<number>();
@@ -97,6 +105,8 @@ function createMongoExportState(options: {
     getRowItem: (rowId) => items.find((item) => item.id === rowId),
     selectedRowIds: ref(selectedRowIds),
     hasRowSelection: computed(() => selectedRowIds.size > 0),
+    fullExportResult: options.fullExportResult,
+    externalCellValue: options.externalCellValue,
   };
   return useDataGridExport(state);
 }
@@ -115,6 +125,8 @@ function createExportState(
   isSyntheticContext = false,
   contextRowId?: number | null,
   contextColumn?: number,
+  databaseType: DatabaseType = "mysql",
+  displayValue?: (value: CellValue, columnIndex: number) => string,
 ) {
   const rows = (rowDataList ?? [rowData ?? columns.map((column, index) => (column === "id" ? 1 : `value-${index}`))]).map((data, index) => ({ ...row(data), id: index + 1 }));
   const resolvedContextRowId = contextRowId === undefined ? (rows[0]?.id ?? null) : contextRowId;
@@ -124,7 +136,8 @@ function createExportState(
     displayItems: computed(() => rows),
     sql: computed(() => undefined),
     tableMeta: computed(() => tableMeta),
-    databaseType: computed(() => "mysql"),
+    databaseType: computed(() => databaseType),
+    displayValue,
     connectionId: computed(() => "connection-1"),
     database: computed(() => "dbx"),
     context: computed(() => "table-data"),
@@ -738,6 +751,19 @@ describe("useDataGridExport prepared row statements", () => {
     expect(copyToClipboard).toHaveBeenCalledWith("");
   });
 
+  it("copies Oracle temporal cells using the displayed value", async () => {
+    const table: DataGridTableMeta = {
+      tableName: "events",
+      columns: [{ name: "created_at", data_type: "timestamp", is_nullable: true }],
+      primaryKeys: [],
+    };
+    const state = createExportState(table, ["created_at"], undefined, ["2020-12-02T15:18:29"], undefined, undefined, [], DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, false, undefined, false, 1, 0, "oracle", () => "2020-12-02 15:18:29");
+
+    await state.copyCell();
+
+    expect(copyToClipboard).toHaveBeenCalledWith("2020-12-02 15:18:29");
+  });
+
   it("copies all rows with empty fields for NULL cells", async () => {
     const text = "id\tname\n1\t\n2\tAda";
     const state = createExportState(editableTable, ["id", "name"], undefined, undefined, undefined, [
@@ -923,15 +949,41 @@ describe("useDataGridExport prepared row statements", () => {
   });
 
   it("disables INSERT when primary-key exclusion removes every selected column", () => {
+    const autoIncrementTable: DataGridTableMeta = {
+      tableName: "users",
+      primaryKeys: ["id"],
+      columns: [{ name: "id", data_type: "int", is_nullable: false, is_primary_key: true, extra: "auto_increment" }],
+    };
     const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [0], columns: ["id"], rows: [[1]] };
     const excludePrimaryKeys = {
       ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS,
       sql: { ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS.sql, skipGeneratedColumns: false, excludePrimaryKeysFromInsert: true },
     };
 
-    const state = createExportState(editableTable, ["id"], matrix, [1], undefined, undefined, [], excludePrimaryKeys);
+    const state = createExportState(autoIncrementTable, ["id"], matrix, [1], undefined, undefined, [], excludePrimaryKeys);
 
     expect(state.canCopyWithExtractor("sql-inserts")).toBe(false);
+  });
+
+  it("keeps a manually-assigned primary key insertable under primary-key exclusion", () => {
+    const compositeKeyTable: DataGridTableMeta = {
+      tableName: "daily_stats",
+      primaryKeys: ["id", "stat_date"],
+      columns: [
+        { name: "id", data_type: "bigint", is_nullable: false, is_primary_key: true, extra: "auto_increment" },
+        { name: "stat_date", data_type: "date", is_nullable: false, is_primary_key: true },
+        { name: "name", data_type: "varchar", is_nullable: false },
+      ],
+    };
+    const matrix: CellSelectionMatrix = { rowIndexes: [0], columnIndexes: [1], columns: ["stat_date"], rows: [["2026-08-18"]] };
+    const excludePrimaryKeys = {
+      ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS,
+      sql: { ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS.sql, skipGeneratedColumns: false, excludePrimaryKeysFromInsert: true },
+    };
+
+    const state = createExportState(compositeKeyTable, ["id", "stat_date", "name"], matrix, [1, "2026-08-18", "Ada"], undefined, undefined, [], excludePrimaryKeys);
+
+    expect(state.canCopyWithExtractor("sql-inserts")).toBe(true);
   });
 
   it("keeps an auto-increment primary key when copying only the primary key column as INSERT", () => {
@@ -1464,6 +1516,101 @@ describe("useDataGridExport prepared row statements", () => {
     await expect(state.copyWithExtractor("sql-updates")).resolves.toBe(false);
     expect(extractDataGridSelection).not.toHaveBeenCalled();
     expect(copyToClipboard).not.toHaveBeenCalled();
+  });
+
+  it("restores Mongo collection-grid values before bulk copy, extractors, and CSV export", async () => {
+    const item = { ...row(["1", MONGO_DOCUMENT_GRID_NULL]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns: ["_id", "nullable"],
+      item,
+      mongoDocuments: [{ _id: "1", nullable: null }],
+      externalCellValue: (value) => mongoDocumentGridExternalValue(value) as CellValue,
+      selectedCellMatrix: {
+        rowIndexes: [0],
+        columnIndexes: [1],
+        columns: ["nullable"],
+        rows: [[MONGO_DOCUMENT_GRID_NULL]],
+      },
+    });
+
+    await state.copyAll();
+    expect(copyToClipboard).toHaveBeenCalledWith("_id\tnullable\n1\t");
+
+    vi.mocked(extractDataGridSelection).mockResolvedValueOnce({ text: "", mimeType: "text/tab-separated-values", fileExtension: "tsv", rowCount: 1, columnCount: 1 });
+    await expect(state.copyWithExtractor("tsv")).resolves.toBe(true);
+    expect(extractDataGridSelection).toHaveBeenCalledWith(expect.objectContaining({ rows: [[null]] }));
+
+    setActivePinia(createPinia());
+    await state.exportCurrentPageCsv();
+    expect(exportQueryResultCsv).toHaveBeenCalledWith(expect.any(String), ["_id", "nullable"], [["1", null]], expect.anything());
+
+    const reservedString = MONGO_DOCUMENT_GRID_NULL;
+    const fullExportState = createMongoExportState({
+      columns: ["_id", "value"],
+      item: { ...row(["1", mongoDocumentGridExternalValue(reservedString)]), sourceIndex: 0 },
+      mongoDocuments: [{ _id: "1", value: reservedString }],
+      externalCellValue: (value) => mongoDocumentGridExternalValue(value) as CellValue,
+      fullExportResult: async () => ({
+        columns: ["_id", "value"],
+        column_types: ["", ""],
+        rows: [["1", reservedString]],
+        mongo_documents: [{ _id: "1", value: reservedString }],
+        affected_rows: 1,
+        execution_time_ms: 1,
+      }),
+    });
+
+    await fullExportState.exportCsv();
+    expect(exportQueryResultCsv).toHaveBeenLastCalledWith(expect.any(String), ["_id", "value"], [["1", reservedString]], expect.anything());
+  });
+
+  it("exports missing Mongo fields as null while retaining explicit empty strings", async () => {
+    const columns = ["_id", "missing", "nullable", "empty"];
+    const document = { _id: "1", nullable: null, empty: "" };
+    const item = { ...row(["1", "", MONGO_DOCUMENT_GRID_NULL, ""]), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns,
+      item,
+      mongoDocuments: [document],
+      externalCellValue: mongoDocumentGridExternalValue,
+      fullExportResult: async () => ({
+        columns,
+        column_types: ["", "", "", ""],
+        rows: [item.data],
+        mongo_copy_documents: [document],
+        affected_rows: 1,
+        execution_time_ms: 1,
+      }),
+    });
+    await state.exportJson();
+    expect(exportQueryResultJson).toHaveBeenCalledWith(expect.any(String), columns, [["1", null, null, ""]]);
+  });
+
+  it("preserves Mongo Extended JSON objects and dates in JSON exports", async () => {
+    const columns = ["_id", "valueMap", "createdTime"];
+    const mongoCopyDocument = {
+      _id: { $oid: "6a9fb51db2f0c46b94002f26" },
+      valueMap: { field1: "10147E", field2: "0" },
+      createdTime: { $date: "2026-09-08T07:11:25.458Z" },
+    };
+    const item = { ...row(["6a9fb51db2f0c46b94002f26", JSON.stringify(mongoCopyDocument.valueMap), 'ISODate("2026-09-08T07:11:25.458Z")']), sourceIndex: 0 };
+    const state = createMongoExportState({
+      columns,
+      item,
+      mongoDocuments: [mongoCopyDocument],
+      fullExportResult: async () => ({
+        columns,
+        column_types: ["", "", "datetime"],
+        rows: [item.data as [string, string, string]],
+        mongo_copy_documents: [mongoCopyDocument],
+        affected_rows: 1,
+        execution_time_ms: 1,
+      }),
+    });
+
+    await state.exportJson();
+
+    expect(exportQueryResultJson).toHaveBeenCalledWith(expect.any(String), columns, [[mongoCopyDocument._id, mongoCopyDocument.valueMap, mongoCopyDocument.createdTime]]);
   });
 });
 

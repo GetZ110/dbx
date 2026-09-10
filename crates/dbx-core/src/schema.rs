@@ -1711,14 +1711,8 @@ async fn external_driver_oracle_columns_via_sql(
     }
 }
 
-fn should_query_oracle_columns_via_sql_first(
-    db_type: &DatabaseType,
-    schema: &str,
-    client_session_id: Option<&str>,
-) -> bool {
-    *db_type == DatabaseType::Oracle
-        && schema.trim().is_empty()
-        && client_session_id.is_some_and(|session_id| !session_id.trim().is_empty())
+fn should_query_oracle_columns_via_sql_first(db_type: &DatabaseType, client_session_id: Option<&str>) -> bool {
+    *db_type == DatabaseType::Oracle && client_session_id.is_some_and(|session_id| !session_id.trim().is_empty())
 }
 
 fn oracle_object_statistics_sql(schema: &str) -> String {
@@ -1863,6 +1857,28 @@ fn dameng_object_statistics_rows_only_sql(schema: &str) -> String {
          ORDER BY t.TABLE_NAME",
         oracle_owner_filter(schema),
     )
+}
+
+/// One attempt of an object-statistics fallback chain: a log label, the SQL to
+/// run, and whether an empty (but successful) result should be accepted instead
+/// of falling through to the next attempt.
+type ObjectStatisticsAttempt = (&'static str, String, bool);
+
+fn oracle_object_statistics_query_plan(schema: &str) -> Vec<ObjectStatisticsAttempt> {
+    vec![
+        ("all-segments", oracle_object_statistics_sql(schema), true),
+        ("dba-segments", oracle_object_statistics_dba_segments_sql(schema), true),
+        ("user-segments", oracle_object_statistics_user_segments_sql(schema), false),
+        ("rows-only", oracle_object_statistics_rows_only_sql(schema), true),
+    ]
+}
+
+fn dameng_object_statistics_query_plan(schema: &str) -> Vec<ObjectStatisticsAttempt> {
+    vec![
+        ("dba-segments", dameng_object_statistics_dba_segments_sql(schema), true),
+        ("user-segments", dameng_object_statistics_user_segments_sql(schema), false),
+        ("rows-only", dameng_object_statistics_rows_only_sql(schema), true),
+    ]
 }
 
 fn gbase8a_object_statistics_sql(database: &str) -> String {
@@ -2071,44 +2087,54 @@ async fn load_oracle_table_comments_for_objects(
     Ok(())
 }
 
+/// Runs an object-statistics fallback chain against an arbitrary query
+/// transport, so the agent drivers and generic JDBC connections
+/// (`PoolKind::ExternalDriver`) can share the same vendor SQL and the same
+/// "try the next catalog view" behaviour.
+async fn object_statistics_from_query_plan<F, Fut>(
+    vendor: &str,
+    schema: &str,
+    plan: Vec<ObjectStatisticsAttempt>,
+    mut run: F,
+) -> Result<Vec<db::ObjectStatistics>, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<db::QueryResult, String>>,
+{
+    let mut last_error = None;
+    for (source, sql, accept_empty) in plan {
+        match run(sql).await {
+            Ok(result) if accept_empty || !result.rows.is_empty() => {
+                return Ok(oracle_object_statistics_from_query_result(result));
+            }
+            Ok(_) => {
+                log::debug!("[schema][{vendor}:list_object_statistics:empty-fallback] schema={schema} source={source}");
+            }
+            Err(error) => {
+                log::debug!(
+                    "[schema][{vendor}:list_object_statistics:fallback-failed] schema={schema} source={source} error={error}"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("{vendor} object statistics are unavailable")))
+}
+
 async fn oracle_agent_list_object_statistics(
     client: Arc<db::agent_driver::PooledAgentClient>,
     database: &str,
     schema: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectStatistics>, String> {
-    let mut client = client.lock().await;
-    let queries = [
-        ("all-segments", oracle_object_statistics_sql(schema), true),
-        ("dba-segments", oracle_object_statistics_dba_segments_sql(schema), true),
-        ("user-segments", oracle_object_statistics_user_segments_sql(schema), false),
-        ("rows-only", oracle_object_statistics_rows_only_sql(schema), true),
-    ];
-    let mut last_error = None;
-    for (source, sql, accept_empty) in queries {
-        match agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await {
-            Ok(result) if accept_empty || !result.rows.is_empty() => {
-                return Ok(oracle_object_statistics_from_query_result(result));
-            }
-            Ok(_) => {
-                log::debug!(
-                    "[schema][oracle:list_object_statistics:empty-fallback] schema={} source={}",
-                    schema,
-                    source
-                );
-            }
-            Err(error) => {
-                log::debug!(
-                    "[schema][oracle:list_object_statistics:fallback-failed] schema={} source={} error={}",
-                    schema,
-                    source,
-                    error
-                );
-                last_error = Some(error);
-            }
+    object_statistics_from_query_plan("Oracle", schema, oracle_object_statistics_query_plan(schema), |sql| {
+        let client = client.clone();
+        async move {
+            let mut client = client.lock().await;
+            agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await
         }
-    }
-    Err(last_error.unwrap_or_else(|| "Oracle object statistics are unavailable".to_string()))
+    })
+    .await
 }
 
 async fn dameng_agent_list_object_statistics(
@@ -2117,37 +2143,14 @@ async fn dameng_agent_list_object_statistics(
     schema: &str,
     timeout_duration: Option<Duration>,
 ) -> Result<Vec<db::ObjectStatistics>, String> {
-    let mut client = client.lock().await;
-    let queries = [
-        ("dba-segments", dameng_object_statistics_dba_segments_sql(schema), true),
-        ("user-segments", dameng_object_statistics_user_segments_sql(schema), false),
-        ("rows-only", dameng_object_statistics_rows_only_sql(schema), true),
-    ];
-    let mut last_error = None;
-    for (source, sql, accept_empty) in queries {
-        match agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await {
-            Ok(result) if accept_empty || !result.rows.is_empty() => {
-                return Ok(oracle_object_statistics_from_query_result(result));
-            }
-            Ok(_) => {
-                log::debug!(
-                    "[schema][dameng:list_object_statistics:empty-fallback] schema={} source={}",
-                    schema,
-                    source
-                );
-            }
-            Err(error) => {
-                log::debug!(
-                    "[schema][dameng:list_object_statistics:fallback-failed] schema={} source={} error={}",
-                    schema,
-                    source,
-                    error
-                );
-                last_error = Some(error);
-            }
+    object_statistics_from_query_plan("Dameng", schema, dameng_object_statistics_query_plan(schema), |sql| {
+        let client = client.clone();
+        async move {
+            let mut client = client.lock().await;
+            agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await
         }
-    }
-    Err(last_error.unwrap_or_else(|| "Dameng object statistics are unavailable".to_string()))
+    })
+    .await
 }
 
 async fn agent_list_object_statistics(
@@ -2160,6 +2163,101 @@ async fn agent_list_object_statistics(
     let mut client = client.lock().await;
     let result = agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await?;
     Ok(oracle_object_statistics_from_query_result(result))
+}
+
+/// Vendors whose object statistics can be collected over a generic JDBC
+/// connection (`PoolKind::ExternalDriver`).
+///
+/// The bundled JDBC plugin exposes no `listObjectStatistics` RPC, but the
+/// vendor statistics SQL is plain SQL that runs fine through `executeQuery`, so
+/// the only missing piece is recognising which database sits behind the JDBC
+/// URL. The prefixes mirror `DbxJdbcPlugin.driverQuirks`, which picks its own
+/// metadata dialect the same way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExternalDriverStatisticsDialect {
+    Oracle,
+    Dameng,
+    Kingbase,
+}
+
+fn external_driver_statistics_dialect(config: &ConnectionConfig) -> Option<ExternalDriverStatisticsDialect> {
+    // `is_oracle_external_driver_config` (added alongside the JDBC Oracle DDL
+    // fix) checks both the `jdbc:oracle:` URL prefix and the driver class, so
+    // it recognises more real-world configs than a URL-only sniff would.
+    if config.db_type == DatabaseType::Oracle || is_oracle_external_driver_config(config) {
+        return Some(ExternalDriverStatisticsDialect::Oracle);
+    }
+    match config.db_type {
+        DatabaseType::Dameng => return Some(ExternalDriverStatisticsDialect::Dameng),
+        DatabaseType::Kingbase => return Some(ExternalDriverStatisticsDialect::Kingbase),
+        // Generic JDBC connections carry no vendor in `db_type`; sniff the URL.
+        DatabaseType::Jdbc => {}
+        _ => return None,
+    }
+    let url = config.connection_string.as_deref().map(str::trim).filter(|url| !url.is_empty())?.to_ascii_lowercase();
+    if url.starts_with("jdbc:dm:") {
+        Some(ExternalDriverStatisticsDialect::Dameng)
+    } else if url.starts_with("jdbc:kingbase") {
+        Some(ExternalDriverStatisticsDialect::Kingbase)
+    } else {
+        None
+    }
+}
+
+fn external_driver_statistics_query_plan(
+    dialect: ExternalDriverStatisticsDialect,
+    schema: &str,
+) -> Vec<ObjectStatisticsAttempt> {
+    match dialect {
+        ExternalDriverStatisticsDialect::Oracle => oracle_object_statistics_query_plan(schema),
+        ExternalDriverStatisticsDialect::Dameng => dameng_object_statistics_query_plan(schema),
+        ExternalDriverStatisticsDialect::Kingbase => {
+            vec![("catalog", kingbase::object_statistics_sql(schema), true)]
+        }
+    }
+}
+
+fn external_driver_statistics_vendor(dialect: ExternalDriverStatisticsDialect) -> &'static str {
+    match dialect {
+        ExternalDriverStatisticsDialect::Oracle => "Oracle",
+        ExternalDriverStatisticsDialect::Dameng => "Dameng",
+        ExternalDriverStatisticsDialect::Kingbase => "Kingbase",
+    }
+}
+
+async fn external_driver_list_object_statistics(
+    session: Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    dialect: ExternalDriverStatisticsDialect,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<db::ObjectStatistics>, String> {
+    let timeout_duration = agent_metadata_timeout(Some(config));
+    object_statistics_from_query_plan(
+        external_driver_statistics_vendor(dialect),
+        schema,
+        external_driver_statistics_query_plan(dialect, schema),
+        |sql| {
+            let session = session.clone();
+            async move {
+                session
+                    .invoke_with_timeout(
+                        "executeQuery",
+                        serde_json::json!({
+                            "connection": config,
+                            "database": database,
+                            "schema": schema,
+                            "sql": sql,
+                            "maxRows": 10_000,
+                            "fetchSize": 1000,
+                        }),
+                        timeout_duration,
+                    )
+                    .await
+            }
+        },
+    )
+    .await
 }
 
 async fn agent_object_statistics_query(
@@ -2548,6 +2646,11 @@ async fn list_tables_once(
                 ) =>
         {
             db::dolt::list_system_tables(p, mysql_table_metadata_catalog(database, schema), filter)
+                .await
+                .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter))
+        }
+        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(db::oceanbase_mysql::is_config) => {
+            db::oceanbase_mysql::list_tables(p, mysql_table_metadata_catalog(database, schema))
                 .await
                 .map(|tables| filter_table_infos(tables, filter, limit, offset, object_types, table_name_filter))
         }
@@ -3056,12 +3159,13 @@ mod tests {
     use super::{
         clickhouse_metadata_database, dameng_object_statistics_dba_segments_sql,
         dameng_object_statistics_rows_only_sql, dameng_object_statistics_user_segments_sql, deduplicate_column_infos,
-        ephemeral_agent_metadata_session_id, external_driver_uses_mysql_ddl, filter_mongodb_agent_collections,
+        ephemeral_agent_metadata_session_id, external_driver_statistics_dialect, external_driver_statistics_query_plan,
+        external_driver_uses_generic_ddl, external_driver_uses_mysql_ddl, filter_mongodb_agent_collections,
         filter_mysql_system_databases_for_config, filter_object_infos, filter_table_infos, filter_visible_schema_names,
         finalize_object_source, gaussdb_m_view_object_source_sql, gbase8a_object_statistics_sql,
-        is_agent_postgres_metadata_fallback_config, is_mysql_external_driver_config, is_retryable_metadata_error,
-        metadata_error_action, metadata_name_or_comment_matches, mysql_database_list_timeout,
-        mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
+        is_agent_postgres_metadata_fallback_config, is_mysql_external_driver_config, is_oracle_external_driver_config,
+        is_retryable_metadata_error, metadata_error_action, metadata_name_or_comment_matches,
+        mysql_database_list_timeout, mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
         mysql_object_source_ddl_column_index, mysql_object_source_sql, mysql_table_list_source_for_config,
         mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
         oracle_columns_sql, oracle_columns_sql_for_resolved_owner, oracle_current_schema_from_query_result,
@@ -3074,9 +3178,10 @@ mod tests {
         reference_key_columns_from_indexes, reference_keys_from_indexes, replace_metadata_runtime,
         should_query_oracle_columns_via_sql_first, table_comments_from_query_result, table_name_filter_matches,
         tdengine_table_comment_like_pattern, tdengine_table_comment_sql, tdengine_table_comments_sql,
-        uses_mongodb_agent_collection_listing, visible_schema_filter, MetadataErrorAction, MysqlTableListSource,
-        OracleObjectRef, OracleSynonymResolver, ReferenceKeyInfo, TableNameFilter, ORACLE_CURRENT_SCHEMA_SQL,
-        ORACLE_SYNONYM_MAX_DEPTH, TDENGINE_COMMENT_SEARCH_TIMEOUT, TDENGINE_LIKE_PATTERN_MAX_BYTES,
+        uses_mongodb_agent_collection_listing, visible_schema_filter, ExternalDriverStatisticsDialect,
+        MetadataErrorAction, MysqlTableListSource, OracleObjectRef, OracleSynonymResolver, ReferenceKeyInfo,
+        TableNameFilter, ORACLE_CURRENT_SCHEMA_SQL, ORACLE_SYNONYM_MAX_DEPTH, TDENGINE_COMMENT_SEARCH_TIMEOUT,
+        TDENGINE_LIKE_PATTERN_MAX_BYTES,
     };
     use super::{list_databases_core, list_tables_core};
     use super::{
@@ -3086,6 +3191,10 @@ mod tests {
 
     use crate::connection::{AppState, PoolKind};
     use crate::models::connection::{ConnectionConfig, DatabaseConnectionInfo, DatabaseType};
+    #[cfg(unix)]
+    use crate::plugins::{
+        InstalledPlugin, PluginDriverManifest, PluginDriverSession, PluginManifest, PluginRuntimeEnv,
+    };
     use crate::storage::Storage;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -3102,6 +3211,9 @@ mod tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         };
         let mut filtered = index("uq_active_code", &["active_code"], true, false);
         filtered.filter = Some("active = true".to_string());
@@ -3291,6 +3403,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -3458,6 +3571,9 @@ mod tests {
         config.connection_string = Some(" jdbc:mysql://127.0.0.1:3306/demo ".to_string());
         assert!(is_mysql_external_driver_config(&config));
 
+        config.jdbc_driver_class = Some("com.example.AoeMysqlDriver".to_string());
+        assert!(!is_mysql_external_driver_config(&config));
+
         config.connection_string = Some("jdbc:mariadb://127.0.0.1:3306/demo".to_string());
         config.jdbc_driver_class = Some("com.mysql.cj.jdbc.Driver".to_string());
         assert!(!is_mysql_external_driver_config(&config));
@@ -3467,6 +3583,182 @@ mod tests {
 
         config.jdbc_driver_class = Some("org.mariadb.jdbc.Driver".to_string());
         assert!(!is_mysql_external_driver_config(&config));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mysql_external_driver_ddl_falls_back_to_generic_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("dbx-mysql-wrapper-ddl-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let executable = dir.join("plugin.sh");
+        let calls = dir.join("calls.log");
+        std::fs::write(
+            &executable,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -E 's/.*"id":([0-9]+).*/\1/')
+  case "$line" in
+    *'"method":"executeQuery"'*)
+      echo executeQuery >> '{}'
+      printf '{{"id":%s,"error":{{"message":"SHOW CREATE TABLE is not supported"}}}}\n' "$id"
+      ;;
+    *'"method":"getObjectSource"'*)
+      echo getObjectSource >> '{}'
+      printf '{{"id":%s,"result":{{"source":"CREATE TABLE fallback_ddl"}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+                calls.display(),
+                calls.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let plugin = InstalledPlugin {
+            manifest: PluginManifest {
+                id: "jdbc".to_string(),
+                name: "JDBC".to_string(),
+                version: "test".to_string(),
+                protocol_version: 1,
+                description: String::new(),
+                executable: Some("plugin.sh".to_string()),
+                drivers: vec![PluginDriverManifest {
+                    id: "jdbc".to_string(),
+                    label: "JDBC".to_string(),
+                    kind: "external".to_string(),
+                    database_type: Some("jdbc".to_string()),
+                }],
+            },
+            path: dir.clone(),
+        };
+        let session = std::sync::Arc::new(
+            PluginDriverSession::start_for_test(plugin, "jdbc".to_string(), PluginRuntimeEnv::default()).await.unwrap(),
+        );
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.id = "mysql-wrapper".to_string();
+        config.database = Some("demo".to_string());
+        config.connection_string = Some("jdbc:mysql://127.0.0.1:3306/demo".to_string());
+        config.jdbc_driver_class = Some("com.example.AoeMysqlDriver".to_string());
+        state.configs.write().await.insert(config.id.clone(), config.clone());
+        state
+            .update_connection_pools(|connections| {
+                connections.insert(
+                    "mysql-wrapper".to_string(),
+                    PoolKind::ExternalDriver {
+                        driver_id: "jdbc".to_string(),
+                        config: std::sync::Arc::new(config),
+                        session,
+                    },
+                );
+            })
+            .await;
+
+        let ddl = super::get_table_ddl_core(&state, "mysql-wrapper", "demo", "", "orders", None)
+            .await
+            .expect("generic DDL should be returned after SHOW CREATE TABLE fails");
+
+        assert_eq!(ddl, "CREATE TABLE fallback_ddl");
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "executeQuery\ngetObjectSource\n");
+
+        state.shutdown(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oracle_external_driver_detection_only_accepts_standard_jdbc_signals() {
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.connection_string = Some(" jdbc:oracle:thin:@//127.0.0.1:1521/ORCL ".to_string());
+        assert!(is_oracle_external_driver_config(&config));
+
+        config.connection_string = Some("jdbc:postgresql://127.0.0.1:5432/demo".to_string());
+        config.jdbc_driver_class = Some("oracle.jdbc.OracleDriver".to_string());
+        assert!(!is_oracle_external_driver_config(&config));
+
+        config.connection_string = None;
+        config.jdbc_driver_class = Some(" oracle.jdbc.driver.OracleDriver ".to_string());
+        assert!(is_oracle_external_driver_config(&config));
+
+        config.connection_string = Some("jdbc:oracle:thin:@//127.0.0.1:1521/ORCL".to_string());
+        config.jdbc_driver_class = Some("com.mysql.cj.jdbc.Driver".to_string());
+        assert!(!is_oracle_external_driver_config(&config));
+
+        config.db_type = DatabaseType::Oracle;
+        assert!(!is_oracle_external_driver_config(&config));
+    }
+
+    #[test]
+    fn external_driver_generic_ddl_applies_to_unmatched_jdbc_connections() {
+        // JDBCX-style wrappers match no vendor DDL dialect and fall back to the
+        // plugin's generic DatabaseMetaData renderer.
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.connection_string = Some("jdbcx:wrap-jdbc:jdbc:mysql://127.0.0.1:3306/demo".to_string());
+        config.jdbc_driver_class = Some("io.github.jdbcx.WrappedDriver".to_string());
+        assert!(external_driver_uses_generic_ddl(&config));
+        assert!(!external_driver_uses_mysql_ddl(&config));
+        assert!(!is_oracle_external_driver_config(&config));
+
+        // Vendor dialects keep their dedicated SQL paths.
+        config.connection_string = Some("jdbc:mysql://127.0.0.1:3306/demo".to_string());
+        config.jdbc_driver_class = None;
+        assert!(!external_driver_uses_generic_ddl(&config));
+
+        config.connection_string = Some("jdbc:oracle:thin:@//127.0.0.1:1521/ORCL".to_string());
+        assert!(!external_driver_uses_generic_ddl(&config));
+
+        // Vendor-typed database never routes through the generic renderer.
+        let oracle = test_connection_config(DatabaseType::Oracle);
+        assert!(!external_driver_uses_generic_ddl(&oracle));
+    }
+
+    #[test]
+    fn external_driver_statistics_dialect_matches_jdbc_url_vendor() {
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.connection_string = Some(" JDBC:Oracle:thin:@127.0.0.1:1521:XE ".to_string());
+        assert_eq!(external_driver_statistics_dialect(&config), Some(ExternalDriverStatisticsDialect::Oracle));
+
+        config.connection_string = Some("jdbc:dm://127.0.0.1:5236".to_string());
+        assert_eq!(external_driver_statistics_dialect(&config), Some(ExternalDriverStatisticsDialect::Dameng));
+
+        config.connection_string = Some("jdbc:kingbase8://127.0.0.1:54321/app".to_string());
+        assert_eq!(external_driver_statistics_dialect(&config), Some(ExternalDriverStatisticsDialect::Kingbase));
+
+        // Vendors without statistics SQL keep the previous "no statistics" behaviour.
+        config.connection_string = Some("jdbc:hive2://127.0.0.1:10000/default".to_string());
+        assert_eq!(external_driver_statistics_dialect(&config), None);
+
+        config.connection_string = None;
+        assert_eq!(external_driver_statistics_dialect(&config), None);
+
+        // A vendor-typed connection routed through an external driver keeps its dialect.
+        let oracle = test_connection_config(DatabaseType::Oracle);
+        assert_eq!(external_driver_statistics_dialect(&oracle), Some(ExternalDriverStatisticsDialect::Oracle));
+    }
+
+    #[test]
+    fn external_driver_statistics_query_plan_reuses_vendor_sql() {
+        let oracle = external_driver_statistics_query_plan(ExternalDriverStatisticsDialect::Oracle, "dbx_test");
+        assert_eq!(
+            oracle.iter().map(|(source, ..)| *source).collect::<Vec<_>>(),
+            vec!["all-segments", "dba-segments", "user-segments", "rows-only"]
+        );
+        assert_eq!(oracle[0].1, oracle_object_statistics_sql("dbx_test"));
+        assert!(oracle[0].1.contains("t.OWNER = 'DBX_TEST'"));
+
+        let dameng = external_driver_statistics_query_plan(ExternalDriverStatisticsDialect::Dameng, "dbx_test");
+        assert_eq!(dameng[0].1, dameng_object_statistics_dba_segments_sql("dbx_test"));
+
+        let kingbase = external_driver_statistics_query_plan(ExternalDriverStatisticsDialect::Kingbase, "public");
+        assert_eq!(kingbase.len(), 1);
+        assert!(kingbase[0].1.contains("sys_catalog.sys_class"));
     }
 
     #[test]
@@ -3896,7 +4188,7 @@ mod tests {
 
         replace_metadata_runtime(&state, "conn", Some("analytics"), None).await;
 
-        assert!(!state.pool_handle("conn:analytics:role:metadata").await.is_some());
+        assert!(state.pool_handle("conn:analytics:role:metadata").await.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3925,7 +4217,7 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), "Agent RPC call timed out (30s)");
         assert_eq!(attempts, 1);
-        assert!(!state.pool_handle("conn:role:metadata").await.is_some());
+        assert!(state.pool_handle("conn:role:metadata").await.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -3958,7 +4250,7 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), quarantine);
         assert_eq!(attempts, 2);
-        assert!(!state.pool_handle("conn").await.is_some());
+        assert!(state.pool_handle("conn").await.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4034,7 +4326,7 @@ for line in sys.stdin:
             Some(crate::db::agent_driver::AgentErrorCategory::Timeout)
         );
         assert_eq!(std::fs::read_to_string(call_count_path).unwrap(), "1");
-        assert!(!state.pool_handle(pool_key).await.is_some());
+        assert!(state.pool_handle(pool_key).await.is_none());
         runtime.kill();
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5046,17 +5338,16 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn oracle_session_completion_queries_synonym_aware_columns_sql_first() {
-        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", Some("tab-1")));
-        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "   ", Some("tab-1")));
+    fn oracle_columns_sql_first_handles_current_schema_editor_sessions() {
+        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("tab-1")));
     }
 
     #[test]
-    fn oracle_columns_sql_first_is_limited_to_current_schema_editor_sessions() {
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "DBX_TEST", Some("tab-1")));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", None));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, "", Some("  ")));
-        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Postgres, "", Some("tab-1")));
+    fn oracle_columns_sql_first_handles_explicit_schema_editor_sessions() {
+        assert!(should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("tab-1")));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, None));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Oracle, Some("  ")));
+        assert!(!should_query_oracle_columns_via_sql_first(&DatabaseType::Postgres, Some("tab-1")));
     }
 
     #[test]
@@ -5715,6 +6006,15 @@ async fn list_object_statistics_once(
     let db_config = connection_config(state, connection_id).await;
     let pool_handle = state.pool_handle(&pool_key).await;
     try_sqlserver!(pool_handle, list_object_statistics, schema);
+    if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
+        // Generic JDBC connections have no `listObjectStatistics` RPC, so the
+        // vendor statistics SQL is issued over the plugin's query channel.
+        if let Some(dialect) = external_driver_statistics_dialect(config.as_ref()) {
+            let config = config.clone();
+            let session = session.clone();
+            return external_driver_list_object_statistics(session, config.as_ref(), dialect, database, schema).await;
+        }
+    }
     if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
         if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Oracle) {
             return oracle_agent_list_object_statistics(
@@ -5984,6 +6284,8 @@ async fn list_objects_once(
                 db::manticoresearch::list_objects(p, database).await.map(unpaged_object_list)
             } else if db_config.as_ref().is_some_and(db::starrocks::is_config) {
                 db::starrocks::list_table_objects(p, database).await.map(unpaged_object_list)
+            } else if db_config.as_ref().is_some_and(db::oceanbase_mysql::is_config) {
+                db::oceanbase_mysql::list_objects(p, database).await.map(unpaged_object_list)
             } else if db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata) {
                 db::mysql::list_table_objects_show(p, database).await.map(unpaged_object_list)
             } else if mysql_table_list_source_for_config(db_config.as_ref()) == MysqlTableListSource::ShowFullTables {
@@ -6451,7 +6753,7 @@ async fn get_columns_core_for_session_inner(
                     return external_driver_presto_like_columns(session, config.as_ref(), database, schema, table).await;
                 }
                 let query_oracle_columns_first =
-                    should_query_oracle_columns_via_sql_first(&config.db_type, schema, context_session_id);
+                    should_query_oracle_columns_via_sql_first(&config.db_type, context_session_id);
                 if query_oracle_columns_first {
                     match external_driver_oracle_columns_via_sql(
                         session.clone(),
@@ -6554,7 +6856,7 @@ async fn get_columns_core_for_session_inner(
                 let fallback_config = db_config.clone();
                                 let mut client = client.lock().await;
                 let oracle_sql_config = fallback_config.as_ref().filter(|config| {
-                    should_query_oracle_columns_via_sql_first(&config.db_type, schema, context_session_id)
+                    should_query_oracle_columns_via_sql_first(&config.db_type, context_session_id)
                 });
                 let query_oracle_columns_first = oracle_sql_config.is_some();
                 if let Some(config) = oracle_sql_config {
@@ -7607,10 +7909,26 @@ async fn get_table_ddl_once(
     {
         let pool_handle = state.pool_handle(&pool_key).await;
         if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
-            if external_driver_uses_mysql_ddl(config.as_ref()) {
+            if is_oracle_external_driver_config(config.as_ref()) {
                 let config = config.clone();
                 let session = session.clone();
-                return external_driver_mysql_ddl(session, config.as_ref(), database, schema, table).await;
+                return external_driver_oracle_ddl(session, config.as_ref(), database, schema, table).await;
+            }
+            if external_driver_uses_mysql_ddl(config.as_ref())
+                || (config.db_type == DatabaseType::Jdbc && mysql_external_driver_url(config.as_ref()) == Some(true))
+            {
+                let config = config.clone();
+                let session = session.clone();
+                let result = external_driver_mysql_ddl(session.clone(), config.as_ref(), database, schema, table).await;
+                if result.is_err() && config.db_type == DatabaseType::Jdbc {
+                    return external_driver_jdbc_ddl(session, config.as_ref(), database, schema, table).await;
+                }
+                return result;
+            }
+            if external_driver_uses_generic_ddl(config.as_ref()) {
+                let config = config.clone();
+                let session = session.clone();
+                return external_driver_jdbc_ddl(session, config.as_ref(), database, schema, table).await;
             }
         }
         #[cfg(feature = "duckdb-sidecar")]
@@ -7898,12 +8216,40 @@ fn is_mysql_external_driver_config(config: &ConnectionConfig) -> bool {
         return false;
     }
 
-    let connection_string = config.connection_string.as_deref().map(str::trim).filter(|value| !value.is_empty());
     let driver_class = config.jdbc_driver_class.as_deref().map(str::trim).filter(|value| !value.is_empty());
-    let mysql_url = connection_string.map(|value| value.to_ascii_lowercase().starts_with("jdbc:mysql:"));
+    let mysql_url = mysql_external_driver_url(config);
     let mysql_driver = driver_class.map(|value| matches!(value, "com.mysql.cj.jdbc.Driver" | "com.mysql.jdbc.Driver"));
 
     match (mysql_url, mysql_driver) {
+        (Some(url_matches), Some(driver_matches)) => url_matches && driver_matches,
+        (Some(url_matches), None) => url_matches,
+        (None, Some(driver_matches)) => driver_matches,
+        (None, None) => false,
+    }
+}
+
+fn mysql_external_driver_url(config: &ConnectionConfig) -> Option<bool> {
+    config
+        .connection_string
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase().starts_with("jdbc:mysql:"))
+}
+
+fn is_oracle_external_driver_config(config: &ConnectionConfig) -> bool {
+    if config.db_type != DatabaseType::Jdbc {
+        return false;
+    }
+
+    let connection_string = config.connection_string.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let driver_class = config.jdbc_driver_class.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let oracle_url = connection_string.map(|value| value.to_ascii_lowercase().starts_with("jdbc:oracle:"));
+    let oracle_driver = driver_class.map(|value| {
+        matches!(value.to_ascii_lowercase().as_str(), "oracle.jdbc.oracledriver" | "oracle.jdbc.driver.oracledriver")
+    });
+
+    match (oracle_url, oracle_driver) {
         (Some(url_matches), Some(driver_matches)) => url_matches && driver_matches,
         (Some(url_matches), None) => url_matches,
         (None, Some(driver_matches)) => driver_matches,
@@ -7999,6 +8345,9 @@ async fn external_driver_gaussdb_m_indexes(
                     included_columns: None,
                     comment: current_comment.clone(),
                     key_is_expression: current_is_expression.clone(),
+                    column_opclasses: vec![],
+                    key_options: Vec::new(),
+                    constraint_backed: false,
                 });
             }
             // Start new index
@@ -8068,6 +8417,9 @@ async fn external_driver_gaussdb_m_indexes(
             included_columns: None,
             comment: current_comment,
             key_is_expression: current_is_expression,
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         });
     }
 
@@ -8228,6 +8580,37 @@ fn opengauss_sequence_object_source_sql(schema: &str, name: &str, include_cache:
          ORDER BY c.oid LIMIT 1",
         schema = sql_string(schema),
         name = sql_string(name)
+    )
+}
+
+/// Servers without `pg_get_function_identity_arguments` (Redshift-compatible,
+/// some legacy PostgreSQL forks like TBase) have their object *list* signature
+/// built with the older `pg_get_function_arguments` formatter instead, which
+/// includes `DEFAULT ...` clauses for parameters with default values. Matching
+/// that signature against `pg_get_function_identity_arguments` (which never
+/// includes `DEFAULT` clauses) then always misses for routines with default
+/// parameters. This mirrors the signature filter but uses the same legacy
+/// formatter so it matches what the list query actually produced.
+fn postgres_function_object_source_sql_with_legacy_signature(
+    schema: &str,
+    name: &str,
+    kind: &db::ObjectSourceKind,
+    signature: Option<&str>,
+) -> String {
+    let prokind = if matches!(kind, db::ObjectSourceKind::Procedure) { "p" } else { "f" };
+    let signature_filter = signature
+        .map(|value| format!(" AND pg_get_function_arguments(p.oid) = {}", sql_string(value)))
+        .unwrap_or_default();
+    format!(
+        "SELECT pg_get_functiondef(p.oid) \
+         FROM pg_proc p \
+         JOIN pg_namespace n ON n.oid = p.pronamespace \
+         WHERE n.nspname = {} AND p.proname = {} AND p.prokind = '{}'{} \
+         ORDER BY p.oid LIMIT 1",
+        sql_string(schema),
+        sql_string(name),
+        prokind,
+        signature_filter
     )
 }
 
@@ -9363,6 +9746,19 @@ async fn postgres_object_source(
                 .and_then(first_string_cell)
                 .map_err(|fallback_err| format!("{primary_err}; prokind fallback failed: {fallback_err}"))
         }
+        Err(primary_err)
+            if !unwrap_opengauss_record
+                && primary_err == "Object source not found"
+                && signature.is_some()
+                && matches!(object_type, db::ObjectSourceKind::Procedure | db::ObjectSourceKind::Function) =>
+        {
+            let fallback_sql =
+                postgres_function_object_source_sql_with_legacy_signature(schema, name, object_type, signature);
+            db::postgres::execute_query(pool, &fallback_sql)
+                .await
+                .and_then(first_string_cell)
+                .map_err(|fallback_err| format!("{primary_err}; legacy signature fallback failed: {fallback_err}"))
+        }
         Err(primary_err) if matches!(object_type, db::ObjectSourceKind::View) => {
             let fallback_sql = postgres_view_source_fallback_sql_inner(schema, name, isolate_view_search_path);
             db::postgres::execute_query(pool, &fallback_sql)
@@ -9466,6 +9862,16 @@ mod object_source_tests {
         assert_eq!(
             postgres_object_source_sql("public", "recalc_score", &ObjectSourceKind::Function, Some("integer, integer")),
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'f' AND pg_get_function_identity_arguments(p.oid) = 'integer, integer' ORDER BY p.oid LIMIT 1"
+        );
+
+        assert_eq!(
+            postgres_function_object_source_sql_with_legacy_signature(
+                "public",
+                "recalc_score",
+                &ObjectSourceKind::Procedure,
+                Some("i_id numeric DEFAULT 0, OUT o_code integer"),
+            ),
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = 'recalc_score' AND p.prokind = 'p' AND pg_get_function_arguments(p.oid) = 'i_id numeric DEFAULT 0, OUT o_code integer' ORDER BY p.oid LIMIT 1"
         );
 
         let opengauss_view_sql = opengauss_object_source_sql("public", "active_users", &ObjectSourceKind::View, None);
@@ -10056,6 +10462,37 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_table_ddl_appends_opclass_to_expression_index_key() {
+        // The per-column `pg_get_indexdef(indexrelid, colno, pretty)` returns only the
+        // bare expression (PostgreSQL sets `attrsOnly = (colno != 0)`, so the opclass
+        // block is skipped — see `ruleutils.c`). The opclass is read separately from
+        // `indclass` into `column_opclasses`, so table DDL must append it to an
+        // expression key just like a real column.
+        let id = column("id", "integer");
+        let indexes = vec![db::IndexInfo {
+            name: "users_lower_email_trgm_idx".to_string(),
+            columns: vec!["lower(email)".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: Some("gin".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![true],
+            column_opclasses: vec![Some("gin_trgm_ops".to_string())],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }];
+
+        let ddl = render_postgres_table_ddl("public", "users", &[id], &indexes, &[], None);
+
+        assert!(
+            ddl.contains("USING gin (lower(email) gin_trgm_ops)"),
+            "expected expression key with appended opclass, got: {ddl}"
+        );
+    }
+
+    #[test]
     fn postgres_table_ddl_renders_partition_children_and_subpartitions() {
         let mut id = column("id", "integer");
         id.is_primary_key = true;
@@ -10069,6 +10506,9 @@ mod ddl_tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         }];
         let partition_info = db::postgres::PostgresTablePartitionInfo {
             is_partition: true,
@@ -10119,6 +10559,9 @@ mod ddl_tests {
             included_columns: None,
             comment: None,
             key_is_expression: Vec::new(),
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         }];
         let partition_info = db::postgres::PostgresTablePartitionInfo {
             is_partition: true,
@@ -10456,6 +10899,40 @@ mod ddl_tests {
     }
 
     #[test]
+    fn opengauss_ddl_comment_normalization_escapes_unescaped_quotes() {
+        // openGauss 6.x pg_get_tabledef concatenates the stored comment into
+        // the COMMENT ON literal verbatim; embedded single quotes make the
+        // statement invalid. Everything downstream (transfer table creation,
+        // export, UI display) executes this DDL, so the quotes must be doubled.
+        let ddl = concat!(
+            "SET search_path = public;\n",
+            "CREATE TABLE \"public\".\"dpms_doctor_surgery_record\" (\"del_flag\" char(1));\n",
+            "COMMENT ON COLUMN \"public\".\"dpms_doctor_surgery_record\".\"del_flag\" IS '逻辑删除标志：'0'-未删除，'1'-已删除';"
+        );
+
+        assert_eq!(
+            normalize_opengauss_table_ddl_comments(ddl),
+            concat!(
+                "SET search_path = public;\n",
+                "CREATE TABLE \"public\".\"dpms_doctor_surgery_record\" (\"del_flag\" char(1));\n",
+                "COMMENT ON COLUMN \"public\".\"dpms_doctor_surgery_record\".\"del_flag\" IS '逻辑删除标志：''0''-未删除，''1''-已删除';"
+            )
+        );
+    }
+
+    #[test]
+    fn opengauss_ddl_comment_normalization_leaves_valid_ddl_unchanged() {
+        let ddl = concat!(
+            "SET search_path = public;\n",
+            "CREATE TABLE \"public\".\"notes\" (\"body\" text DEFAULT 'O''Hara');\n",
+            "COMMENT ON TABLE \"public\".\"notes\" IS 'owner''s note';\n",
+            "GRANT SELECT ON TABLE \"public\".\"notes\" TO \"auditor's role\";"
+        );
+
+        assert_eq!(normalize_opengauss_table_ddl_comments(ddl), ddl);
+    }
+
+    #[test]
     fn mysql_display_ddl_gets_statement_terminator() {
         let ddl = "CREATE TABLE `users` (\n  `id` int NOT NULL\n) ENGINE=InnoDB";
 
@@ -10726,6 +11203,72 @@ async fn external_driver_mysql_ddl(
         )
         .await?;
     mysql_external_driver_ddl_from_query_result(result, "Create Table")
+}
+
+async fn external_driver_oracle_ddl(
+    session: std::sync::Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, String> {
+    let result: serde_json::Value = session
+        .invoke_with_timeout(
+            "getObjectSource",
+            serde_json::json!({
+                "connection": config,
+                "database": database,
+                "schema": schema,
+                "name": table,
+                "object_type": "TABLE",
+            }),
+            agent_metadata_timeout(Some(config)),
+        )
+        .await?;
+    result
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .filter(|source| !source.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "JDBC Oracle plugin returned no table DDL".to_string())
+}
+
+/// External JDBC connections that match no vendor DDL dialect (JDBCX wrappers,
+/// custom protocol drivers, …) have table DDL rendered by the plugin from
+/// plain `DatabaseMetaData` via `getObjectSource`, mirroring the agent-side
+/// `DdlBuilder` output.
+fn external_driver_uses_generic_ddl(config: &ConnectionConfig) -> bool {
+    config.db_type == DatabaseType::Jdbc
+        && !is_oracle_external_driver_config(config)
+        && !external_driver_uses_mysql_ddl(config)
+}
+
+async fn external_driver_jdbc_ddl(
+    session: std::sync::Arc<crate::plugins::PluginDriverSession>,
+    config: &ConnectionConfig,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, String> {
+    let result: serde_json::Value = session
+        .invoke_with_timeout(
+            "getObjectSource",
+            serde_json::json!({
+                "connection": config,
+                "database": database,
+                "schema": schema,
+                "name": table,
+                "object_type": "TABLE",
+            }),
+            agent_metadata_timeout(Some(config)),
+        )
+        .await?;
+    result
+        .get("source")
+        .and_then(serde_json::Value::as_str)
+        .filter(|source| !source.trim().is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "JDBC plugin returned no table DDL".to_string())
 }
 
 fn normalize_mysql_display_ddl(sql: String) -> String {
@@ -11265,12 +11808,139 @@ pub async fn opengauss_table_ddl(pool: &deadpool_postgres::Pool, schema: &str, t
         db::postgres::list_trigger_definitions(pool, schema, table),
     )?;
 
+    // Repair the server's comment literals before anything downstream executes
+    // this DDL: every consumer (transfer table creation, export, UI display)
+    // must receive executable SQL, not the raw pg_get_tabledef output.
+    let ddl = normalize_opengauss_table_ddl_comments(&ddl);
     Ok(append_opengauss_trigger_definitions(ddl, &trigger_definitions))
 }
 
 pub fn opengauss_table_ddl_sql(schema: &str, table: &str) -> String {
     let qualified_name = format!("{}.{}", pg_ident(schema), pg_ident(table));
     format!("SELECT pg_get_tabledef({})", sql_string(&qualified_name))
+}
+
+/// openGauss 6.x `pg_get_tabledef` can concatenate comment text into a
+/// `COMMENT ON` literal without escaping embedded single quotes. Normalize
+/// only those generated comment statements; all other DDL text remains
+/// untouched.
+pub(crate) fn normalize_opengauss_table_ddl_comments(ddl: &str) -> String {
+    let mut normalized = String::with_capacity(ddl.len());
+    for line in ddl.split_inclusive('\n') {
+        let (line_body, line_ending) = match line.strip_suffix('\n') {
+            Some(body) => match body.strip_suffix('\r') {
+                Some(body) => (body, "\r\n"),
+                None => (body, "\n"),
+            },
+            None => (line, ""),
+        };
+        let leading = line_body.len() - line_body.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
+        let statement = &line_body[leading..];
+        if let Some(statement) = normalize_opengauss_comment_statement(statement) {
+            normalized.push_str(&line_body[..leading]);
+            normalized.push_str(&statement);
+        } else {
+            normalized.push_str(line_body);
+        }
+        normalized.push_str(line_ending);
+    }
+    normalized
+}
+
+fn normalize_opengauss_comment_statement(statement: &str) -> Option<String> {
+    let uppercase = statement.to_ascii_uppercase();
+    if !uppercase.starts_with("COMMENT ON ") {
+        return None;
+    }
+
+    let is_pos = find_opengauss_comment_is_keyword(statement, &uppercase)?;
+    let value_start = is_pos + " IS ".len();
+    let value = &statement[value_start..];
+    let value_leading = value.len() - value.trim_start_matches(|ch: char| ch.is_ascii_whitespace()).len();
+    let value = &value[value_leading..];
+    let quote_offset = match value.as_bytes() {
+        [b'\'', ..] => 0,
+        [b'e' | b'E', b'\'', ..] => 1,
+        _ => return None,
+    };
+    let opening_quote = value_start + value_leading + quote_offset;
+    let statement_end = statement.trim_end().len();
+    let literal_end = statement[..statement_end]
+        .strip_suffix(';')
+        .map_or(statement_end, |without_terminator| without_terminator.len());
+    if opening_quote >= literal_end {
+        return None;
+    }
+
+    let closing_quote = statement[..literal_end].rfind('\'')?;
+    if closing_quote <= opening_quote || !statement[closing_quote + 1..literal_end].trim().is_empty() {
+        return None;
+    }
+    let literal = &statement[opening_quote..=closing_quote];
+    if opengauss_comment_literal_is_valid(literal) {
+        return Some(statement.to_string());
+    }
+
+    let raw_comment = &statement[opening_quote + 1..closing_quote];
+    let escaped_comment = raw_comment.replace('\'', "''");
+    let mut normalized = String::with_capacity(statement.len() + escaped_comment.len() - raw_comment.len());
+    normalized.push_str(&statement[..opening_quote + 1]);
+    normalized.push_str(&escaped_comment);
+    normalized.push_str(&statement[closing_quote..]);
+    Some(normalized)
+}
+
+fn find_opengauss_comment_is_keyword(statement: &str, uppercase: &str) -> Option<usize> {
+    let mut cursor = "COMMENT ON ".len();
+    while cursor + " IS ".len() <= statement.len() {
+        if statement.as_bytes().get(cursor) == Some(&b'"') {
+            cursor = skip_opengauss_quoted_identifier(statement, cursor);
+            continue;
+        }
+        if uppercase.get(cursor..cursor + " IS ".len()) == Some(" IS ") {
+            return Some(cursor);
+        }
+        cursor += statement[cursor..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn skip_opengauss_quoted_identifier(sql: &str, start: usize) -> usize {
+    let bytes = sql.as_bytes();
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'"' {
+            if bytes.get(cursor + 1) == Some(&b'"') {
+                cursor += 2;
+            } else {
+                return cursor + 1;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn opengauss_comment_literal_is_valid(literal: &str) -> bool {
+    let bytes = literal.as_bytes();
+    if bytes.len() < 2 || bytes.first() != Some(&b'\'') || bytes.last() != Some(&b'\'') {
+        return false;
+    }
+
+    let mut cursor = 1;
+    while cursor < bytes.len() - 1 {
+        if bytes[cursor] == b'\'' {
+            if cursor + 1 < bytes.len() - 1 && bytes[cursor + 1] == b'\'' {
+                cursor += 2;
+            } else {
+                return false;
+            }
+        } else {
+            cursor += 1;
+        }
+    }
+    true
 }
 
 fn append_postgres_trigger_definitions(mut ddl: String, trigger_definitions: &[String]) -> String {
@@ -11680,7 +12350,28 @@ fn render_postgres_table_ddl_with_partition_info(
             continue;
         }
         let unique = if idx.is_unique { "UNIQUE " } else { "" };
-        let cols = idx.columns.iter().map(|c| pg_ident(c)).collect::<Vec<_>>().join(", ");
+        let cols = idx
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                // A real column is quoted via `pg_ident`; an expression/functional key part
+                // arrives as raw expression text (the per-column `pg_get_indexdef` omits the
+                // opclass — see `crates/dbx-core/src/db/postgres.rs`), so quoting the whole
+                // thing as an identifier would turn it into a nonexistent column reference
+                // (#6295).
+                let is_expr = idx.key_is_expression.get(i).copied().unwrap_or(false);
+                let mut col = if is_expr { c.clone() } else { pg_ident(c) };
+                // The opclass is read separately from `pg_index.indclass` for every key
+                // position (including expression keys) and appended uniformly — it never
+                // lives inside the expression text, so there is no duplication risk.
+                if let Some(opclass) = idx.column_opclasses.get(i).and_then(|o| o.as_deref()) {
+                    col.push_str(&format!(" {opclass}"));
+                }
+                col
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let using = idx.index_type.as_deref().map(|t| format!(" USING {t}")).unwrap_or_default();
         let include = idx
             .included_columns

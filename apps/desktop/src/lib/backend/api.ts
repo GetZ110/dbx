@@ -316,6 +316,8 @@ export const saveDesktopSettings = forward("saveDesktopSettings");
 export const loadMcpGlobalPolicy = forward("loadMcpGlobalPolicy");
 export const saveMcpGlobalPolicy = forward("saveMcpGlobalPolicy");
 export const loadMaxAgentTurns = forward("loadMaxAgentTurns");
+export const loadSqlFileUploadMaxBytes = forward("loadSqlFileUploadMaxBytes");
+export const saveSqlFileUploadMaxMb = forward("saveSqlFileUploadMaxMb");
 export const saveMaxAgentTurns = forward("saveMaxAgentTurns");
 export const loadMaxRetries = forward("loadMaxRetries");
 export const saveMaxRetries = forward("saveMaxRetries");
@@ -329,6 +331,10 @@ export const loadPinnedTreeNodeIds = forward("loadPinnedTreeNodeIds");
 export const savePinnedTreeNodeIds = forward("savePinnedTreeNodeIds");
 export const loadEditorSettings = forward("loadEditorSettings");
 export const saveEditorSettings = forward("saveEditorSettings");
+export const saveBackgroundImage = forward("saveBackgroundImage");
+export const clearBackgroundImage = forward("clearBackgroundImage");
+export const readBackgroundImage = forward("readBackgroundImage");
+export const checkBackgroundImage = forward("checkBackgroundImage");
 export const loadOpenTabsState = forward("loadOpenTabsState");
 export const saveOpenTabsState = forward("saveOpenTabsState");
 export const saveDetachedTabHandoff = forward("saveDetachedTabHandoff");
@@ -460,6 +466,7 @@ export const beginDatabaseBackupSnapshot = forward("beginDatabaseBackupSnapshot"
 export const exportDatabaseSql = forward("exportDatabaseSql");
 export const cancelDatabaseExport = forward("cancelDatabaseExport");
 export const clearDatabaseExportCancellation = forward("clearDatabaseExportCancellation");
+export const databaseExportDestinationNeedsConfirmation = forward("databaseExportDestinationNeedsConfirmation");
 export const recordDatabaseExportDestination = forward("recordDatabaseExportDestination");
 export const exportQueryResultCsv = forward("exportQueryResultCsv");
 export const exportTableDataCsv = forward("exportTableDataCsv");
@@ -829,6 +836,8 @@ export const fetchChangelog = forward("fetchChangelog");
 export const getSystemProxyUrl = forward("getSystemProxyUrl");
 export const downloadUpdate = forward("downloadUpdate");
 export const cancelUpdateDownload = forward("cancelUpdateDownload");
+export const getDownloadedUpdate = forward("getDownloadedUpdate");
+export const discardDownloadedUpdate = forward("discardDownloadedUpdate");
 export const installDownloadedUpdate = forward("installDownloadedUpdate");
 export const getAppVersion = forward("getAppVersion");
 export const getAppSupportInfo = forward("getAppSupportInfo");
@@ -887,6 +896,7 @@ export type {
   McpHttpServerStatus,
   WebMcpHttpStatus,
   UpdateInfo,
+  DownloadedUpdate,
   RedisBlob,
   RedisCollectionPage,
   RedisDatabaseInfo,

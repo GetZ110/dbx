@@ -17,7 +17,7 @@ The MCP protocol, connection loading, SQL safety, schema access, Redis support, 
 
 ## Features
 
-- **17 MCP tools** for connection and database discovery, schemas, SQL, Redis, sessions, messages, and DBX UI integration
+- **18 MCP tools** for connection and database discovery, schemas, SQL, Redis, sessions, messages, and DBX UI integration
 - **Precompiled native binaries** with no local Rust, Cargo, Python, or C/C++ build requirement
 - **No `better-sqlite3` runtime dependency** and no Node native-addon ABI coupling
 - **Local, Web, and Docker modes** using the same tool interface
@@ -153,14 +153,18 @@ Ask the MCP client to:
 | `dbx_get_routine_source` | Return the source of a stored procedure or function by name, with an optional `signature` for overloaded names |
 | `dbx_get_schema_context` | Return compact schema context suitable for an AI model |
 | `dbx_execute_query` | Execute SQL or a supported MongoDB shell command, returning at most 100 rows |
+| `dbx_execute_batch` | Execute a SQL script containing multiple statements in one call, returning a result per statement (or a single merged result with `use_transaction` on a multi-statement script) |
 | `dbx_open_session` | Open a stateful SQL query session pinned to one backend connection |
 | `dbx_close_session` | Close a session and release its pinned connection resources |
 | `dbx_execute_redis_command` | Execute a Redis command |
+| `dbx_peek_messages` | Read Kafka messages without committing consumer offsets |
 | `dbx_send_message` | Send a message to a supported message queue topic |
 | `dbx_open_table` | Open a table in the running DBX desktop application |
 | `dbx_execute_and_show` | Execute a query and display the result in the DBX desktop application |
 
 When connection scoping is enabled, mutating connection tools and desktop UI tools are hidden.
+
+`dbx_peek_messages` reads a Kafka topic in local or Web mode when `mq-admin` is enabled. Pass `connection_id` or `connection_name`, `topic`, optional `count` (1–100, default 20), `start_position` (`latest` by default, `earliest`, or `offset`), and optional non-negative `partition`. A non-negative `offset` is required only in offset mode; without a partition it applies to all partitions. The JSON response preserves base64 payloads and metadata, reports broker partial reads via `incomplete`, and reports whole-message omissions under a 256 KiB output budget via `outputTruncated`. It respects connection/tool scopes and permits read-only and production reads without committing consumer offsets. It does not support other MQ types or continuous subscriptions.
 
 `dbx_list_databases` returns only database names allowed by the selected connection's MCP database scope. `dbx_send_message` is available when message-queue support is included in the server build.
 
@@ -435,7 +439,7 @@ MCP 协议、连接读取、SQL 安全检查、Schema、Redis、MongoDB、Web �
 
 ### 主要能力
 
-- 17 个 MCP 工具，涵盖连接和数据库发现、Schema、SQL、Redis、会话、消息队列和 DBX 桌面集成
+- 18 个 MCP 工具，涵盖连接和数据库发现、Schema、SQL、Redis、会话、消息队列和 DBX 桌面集成
 - 不依赖 `better-sqlite3`，没有 Node 原生模块 ABI 问题
 - 支持本地 DBX、DBX Web 和 Docker
 - 可选 Streamable HTTP 传输，使用 Bearer Token 保护；stdio 仍为默认方式
@@ -526,12 +530,16 @@ MCP 配置：
 | `dbx_describe_table` | 获取字段和表结构 |
 | `dbx_get_schema_context` | 获取适合 AI 使用的紧凑 Schema 上下文 |
 | `dbx_execute_query` | 执行 SQL 或支持的 MongoDB Shell 命令，最多返回 100 行 |
+| `dbx_execute_batch` | 一次执行包含多条语句的 SQL 脚本，按语句返回结果（多语句脚本搭配 `use_transaction` 时返回单个合并结果） |
 | `dbx_open_session` | 为 SQL 连接打开固定后端连接的有状态查询会话 |
 | `dbx_close_session` | 关闭会话并释放固定连接资源 |
 | `dbx_execute_redis_command` | 执行 Redis 命令 |
+| `dbx_peek_messages` | 读取 Kafka 消息，不提交消费位点 |
 | `dbx_send_message` | 向支持的消息队列 Topic 发送消息 |
 | `dbx_open_table` | 在 DBX 桌面端打开表 |
 | `dbx_execute_and_show` | 执行查询并在 DBX 桌面端展示结果 |
+
+启用 `mq-admin` 后，`dbx_peek_messages` 可在本地和 Web 模式下读取 Kafka Topic。参数为 `connection_id` 或 `connection_name`、`topic`、可选 `count`（1–100，默认 20）、`start_position`（默认 `latest`，也支持 `earliest`、`offset`）及可选的非负 `partition`。仅 offset 模式必须且允许指定非负 `offset`，未指定分区时该位点应用于所有分区。JSON 结果保留 base64 消息体和元数据，通过 `incomplete` 标记底层不完整读取，通过 `outputTruncated` 标记因 256 KiB 输出预算而省略整条消息。工具遵守连接和工具范围，允许只读与生产连接读取，不提交消费位点，不支持其他 MQ 类型或持续订阅。
 
 `dbx_list_databases` 只返回该连接 MCP 数据库范围内允许访问的名称。`dbx_send_message` 仅在 Server 构建时包含消息队列支持时可用。
 

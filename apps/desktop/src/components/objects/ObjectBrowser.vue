@@ -8,6 +8,7 @@ import {
   ArrowRightLeft,
   ArrowUp,
   Braces,
+  Check,
   CheckSquare,
   Clock,
   Clipboard,
@@ -41,7 +42,9 @@ import {
   Search,
   ScrollText,
   ShieldCheck,
+  Sparkles,
   Square,
+  Table,
   Table2,
   TableProperties,
   TerminalSquare,
@@ -56,6 +59,9 @@ import { translateBackendError } from "@/i18n/backend-errors";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SearchableSelect } from "@/components/ui/searchable-select";
+import { DropdownMenuCheckboxItem, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger } from "@/components/ui/dropdown-menu";
+import ToolbarOverflowMenu from "@/components/ui/ToolbarOverflowMenu.vue";
+import { useToolbarOverflow } from "@/composables/useToolbarOverflow";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
@@ -65,8 +71,8 @@ import * as api from "@/lib/backend/api";
 import type { ColumnInfo, ConnectionConfig, ConstraintInfo, ForeignKeyInfo, IndexInfo, ObjectBrowserViewMode, ObjectBrowserViewport, ObjectInfo, ObjectSourceKind, ObjectStatistics, TableInfoTab, TreeNode, TriggerInfo } from "@/types/database";
 import { sortTablesByFkDependency, type TableWithFk } from "@/lib/table/tableDependencySort";
 import { isSchemaAware, supportsTableVacuum, supportsTransfer } from "@/lib/database/databaseCapabilities";
-import { supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/database/databaseFeatureSupport";
-import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { supportsAiAssistantContext, supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/database/databaseFeatureSupport";
+import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, objectListSchemaForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { getTableMetadataCapabilities, type TableMetadataCapabilities } from "@/lib/table/tableMetadataCapabilities";
 import { constraintsForConstraintsTab } from "@/lib/table/constraintPresentation";
 import { buildTableSelectSql } from "@/lib/table/tableSelectSql";
@@ -88,6 +94,7 @@ import { buildRenameObjectSql, supportsObjectRename } from "@/lib/table/objectRe
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { generateDatabaseExportId } from "@/lib/export/databaseExport";
 import { buildXlsxHeaderOverrides, hasXlsxHeaderComments, type XlsxExportOptions, type XlsxHeaderMode } from "@/lib/export/xlsxHeader";
+import { showSqlInsertModeDialog, type SqlInsertMode } from "@/lib/export/sqlInsertMode";
 import { copyToClipboard, eventTargetAllowsAppClipboardShortcut } from "@/lib/common/clipboard";
 import {
   defaultPasteTableMode,
@@ -103,6 +110,7 @@ import {
 } from "@/lib/table/tableClipboard";
 import { buildSingleDdlExportFileContent } from "@/lib/export/ddlExport";
 import { fetchTableDataForExport } from "@/lib/table/tableDataExport";
+import { forceCsvTextForTemporalColumns } from "@/lib/dataGrid/columnFormatter";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { treeNodePinIdentity, type PinnedTreeNodeIdentity } from "@/lib/app/pinnedItems";
 import { useExportTracker, type ExportTask } from "@/composables/useExportTracker";
@@ -111,6 +119,7 @@ import { useQueryStore } from "@/stores/queryStore";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
 import MySqlEventEditor from "@/components/objects/MySqlEventEditor.vue";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
+import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { isCancelSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
@@ -148,7 +157,7 @@ import { createSidePanelRequestGuard } from "@/lib/table/sidePanelRequestGuard";
 import { runBatchTableTruncate } from "@/lib/table/batchTableTruncate";
 import { tableColumnDefaultDisplayValue } from "@/lib/table/tableColumnDefaultPresentation";
 import { gaussdbMTypeDisplayName } from "@/lib/table/postgresDataTypeHelp";
-import { cacheObjectBrowserRows, createObjectBrowserRowsCacheWriteToken, getCachedObjectBrowserRows, type ObjectBrowserRowsCacheScope, type ObjectBrowserRowsCacheWriteToken } from "@/lib/table/objectBrowserRowsCache";
+import { cacheObjectBrowserRows, createObjectBrowserRowsCacheWriteToken, getCachedObjectBrowserRowsForScaffold, type ObjectBrowserRowsCacheScope, type ObjectBrowserRowsCacheWriteToken } from "@/lib/table/objectBrowserRowsCache";
 import { createObjectBrowserRowsLoadGuard, type ObjectBrowserRowsLoadHandle } from "@/lib/table/objectBrowserRowsLoadGuard";
 import { loadObjectDdl, type ObjectDdlRequest } from "@/lib/metadata/objectDdlCache";
 import { loadObjectMetadataFacet } from "@/lib/metadata/objectMetadataCache";
@@ -171,13 +180,18 @@ const props = defineProps<{
   /** 显式"新建事件"请求号：每次菜单点击递增，用于打开/重新进入 CREATE 编辑器 */
   initialEventCreateRequestId?: number;
   initialObjectFilter?: "tables" | "events";
+  selectedObjectFilter?: ObjectFilter;
+  initialSearchQuery?: string;
   viewport?: ObjectBrowserViewport;
 }>();
 
 const emit = defineEmits<{
-  openTable: [target: { tableName: string; schema?: string; tableType?: string; catalog?: string }];
+  openTable: [target: { tableName: string; schema?: string; tableType?: string; catalog?: string; comment?: string | null }];
   schemaChange: [schema: string | undefined];
   viewportChange: [viewport: ObjectBrowserViewport];
+  searchChange: [query: string];
+  filterChange: [filter: ObjectFilter];
+  addToAi: [tables: Array<{ name: string; schema?: string }>];
 }>();
 
 const { t } = useI18n();
@@ -195,13 +209,15 @@ const schemas = ref<string[]>([]);
 const selectedSchema = ref<string | undefined>(props.schema);
 const rows = ref<ObjectBrowserRow[]>([]);
 const rootRef = ref<HTMLElement>();
-const search = ref("");
+const search = ref(props.initialSearchQuery ?? "");
 const objectFilter = ref<ObjectFilter>("all");
 const userHasSelectedFilter = ref(false);
 const sortKey = ref<ObjectBrowserSortKey>("name");
 const sortDirection = ref<ObjectBrowserSortDirection>("asc");
 const loadingSchemas = ref(false);
 const loadingObjects = ref(false);
+const refreshingObjects = ref(false);
+const scaffoldRefreshError = ref("");
 const sourceLoading = ref(false);
 const sourceContent = ref("");
 const sourceError = ref("");
@@ -388,6 +404,17 @@ const objectFilters = computed<ObjectFilter[]>(() =>
     .map(([filter]) => filter),
 );
 const showObjectFilter = computed(() => objectFilters.value.length > 2);
+// Measured condensation for the header row: tier 1 moves the sort/view/checkbox
+// controls into the overflow menu, tier 2 additionally moves the object type
+// filter there and drops the database chip. See useToolbarOverflow for the
+// tier contract.
+const toolbarRef = ref<HTMLElement | null>(null);
+const { tier: toolbarTier } = useToolbarOverflow(toolbarRef, [() => props.database, () => selectedSchema.value, () => needsSchema.value, () => showObjectFilter.value]);
+const showToolbarOverflow = computed(() => toolbarTier.value >= 1);
+const showInlineSortAndView = computed(() => toolbarTier.value < 1);
+const showInlineCheckboxToggle = computed(() => toolbarTier.value < 1);
+const showInlineObjectFilter = computed(() => toolbarTier.value < 2);
+const showDatabaseChip = computed(() => toolbarTier.value < 2);
 const hasCreatedAt = computed(() => rows.value.some((row) => row.created_at?.trim()));
 const hasUpdatedAt = computed(() => rows.value.some((row) => row.updated_at?.trim()));
 const hasAnyComment = computed(() => rows.value.some((row) => row.comment?.trim()));
@@ -518,7 +545,10 @@ watch([sortKey, sortDirection], () => scrollObjectsToTop());
 
 // Also jump to the top when the search query or object-type filter changes —
 // filtered results bear no relation to the previous scroll position.
-watch(search, () => scrollObjectsToTop());
+watch(search, (value) => {
+  scrollObjectsToTop();
+  emit("searchChange", value);
+});
 watch(objectFilter, () => {
   if (preserveObjectFilterScrollOnce) {
     preserveObjectFilterScrollOnce = false;
@@ -679,7 +709,7 @@ function iconFor(row: ObjectBrowserRow) {
   if (row.type === "SEQUENCE") return ListTree;
   if (row.type === "PACKAGE" || row.type === "PACKAGE_BODY") return Package;
   if (row.type === "TYPE" || row.type === "TYPE_BODY") return Braces;
-  return Table2;
+  return Table;
 }
 
 function typeLabel(row: ObjectBrowserRow) {
@@ -888,7 +918,8 @@ function groupedFilteredRows() {
 }
 
 function iconClass(type: ObjectBrowserRow["type"]) {
-  if (type === "VIEW" || type === "MATERIALIZED_VIEW") return "text-purple-500";
+  if (type === "VIEW") return "text-purple-500";
+  if (type === "MATERIALIZED_VIEW") return "text-indigo-500";
   if (type === "PROCEDURE") return "text-blue-500";
   if (type === "FUNCTION") return "text-amber-500";
   if (type === "TRIGGER") return "text-rose-500";
@@ -944,7 +975,7 @@ function executeRowAction(row: ObjectBrowserRow, action: ObjectBrowserRowAction)
       void openTypeInfo(row);
       break;
     case "open-table":
-      emit("openTable", { tableName: row.name, schema: row.schema, tableType: objectBrowserOpenTableType(row), catalog: props.catalog });
+      emit("openTable", { tableName: row.name, schema: row.schema, tableType: objectBrowserOpenTableType(row), catalog: props.catalog, comment: row.comment });
       break;
     case "open-source":
       void (row.type === "EVENT" ? openEventEditor(row) : openSource(row));
@@ -1127,7 +1158,8 @@ async function fetchTableDdl(force = settingsStore.editorSettings.refreshDdlOnOp
   try {
     const { ddl } = await loadObjectDdl(tableMetadataRequest(row), { force });
     if (sidePanelGuard.isStale(epoch)) return;
-    tableDdlContent.value = ddl;
+    const formatDialect = sqlFormatDialectForDbType(effectiveDatabaseType.value);
+    tableDdlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? ddl : omitDdlIdentifierQuotes(ddl, formatDialect);
     loadedSuccessfully = true;
   } catch (e: any) {
     if (sidePanelGuard.isStale(epoch)) return;
@@ -1714,7 +1746,7 @@ function objectBrowserOpenTableType(row: ObjectBrowserRow): string {
 }
 
 function openViewData(row: ObjectBrowserRow) {
-  emit("openTable", { tableName: row.name, schema: row.schema, tableType: objectBrowserOpenTableType(row), catalog: props.catalog });
+  emit("openTable", { tableName: row.name, schema: row.schema, tableType: objectBrowserOpenTableType(row), catalog: props.catalog, comment: row.comment });
 }
 
 function openStructureEditor(row: ObjectBrowserRow) {
@@ -2076,8 +2108,13 @@ async function exportDataLegacy(row: ObjectBrowserRow, format: "json") {
 }
 
 async function exportData(row: ObjectBrowserRow, format: "csv" | "json" | "sql") {
-  if (format === "json") await exportDataLegacy(row, format);
-  else await exportTableData(row, format);
+  if (format === "json") {
+    await exportDataLegacy(row, format);
+    return;
+  }
+  const insertMode = format === "sql" ? await showSqlInsertModeDialog() : undefined;
+  if (format === "sql" && insertMode === null) return;
+  await exportTableData(row, format, undefined, "name", true, insertMode ?? "batch");
 }
 
 function showObjectBrowserXlsxHeaderDialog(hasComments: boolean): Promise<XlsxExportOptions | null> {
@@ -2120,7 +2157,7 @@ async function exportDataXlsx(row: ObjectBrowserRow) {
   await exportTableData(row, "xlsx", columnInfos, exportOptions.headerMode, exportOptions.autoFilter);
 }
 
-async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "sql", columnInfos?: ColumnInfo[], headerMode: XlsxHeaderMode = "name", autoFilter = true) {
+async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "sql", columnInfos?: ColumnInfo[], headerMode: XlsxHeaderMode = "name", autoFilter = true, insertMode: SqlInsertMode = "batch") {
   const schema = row.schema || selectedSchema.value;
 
   // Save dialog first
@@ -2156,11 +2193,11 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
         executePage: (sql) => api.executeQuery(props.connection.id, props.database, sql),
       });
       if (format === "csv") {
-        await api.exportQueryResultCsv(filePath, result.columns, result.rows, settingsStore.editorSettings.csvQuoteMode);
+        await api.exportQueryResultCsv(filePath, result.columns, forceCsvTextForTemporalColumns(result.rows, result.column_types ?? []), settingsStore.editorSettings.csvQuoteMode);
       } else {
         const comments = result.columns.map((name) => columnInfos?.find((column) => column.name.toLocaleLowerCase() === name.toLocaleLowerCase())?.comment);
         const headerOverrides = buildXlsxHeaderOverrides(result.columns, comments, headerMode);
-        await api.exportQueryResultXlsx(filePath, row.name, result.columns, result.column_types ?? result.columns.map(() => ""), headerOverrides, result.rows, undefined, autoFilter);
+        await api.exportQueryResultXlsx(filePath, row.name, result.columns, result.column_types ?? result.columns.map(() => ""), headerOverrides, result.rows, undefined, autoFilter, settingsStore.editorSettings.globalDateTimeExportFormat || undefined);
       }
       toast(t("grid.exported"));
       return;
@@ -2194,6 +2231,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
       tableName: row.name,
       filePath,
       format,
+      ...(format === "sql" ? { insertMode } : {}),
       csvQuoteMode: settingsStore.editorSettings.csvQuoteMode,
       columns,
       columnComments: format === "xlsx" ? columnComments : undefined,
@@ -2769,7 +2807,7 @@ function openInitialEventIfNeeded() {
 
 function finishObjectBrowserRowsLoad() {
   loadingObjects.value = false;
-  const preferredFilter = props.initialObjectFilter ?? (props.initialEventName || props.initialEventCreateRequestId !== undefined ? "events" : "tables");
+  const preferredFilter = props.initialEventName || props.initialEventCreateRequestId !== undefined ? "events" : (props.selectedObjectFilter ?? props.initialObjectFilter ?? "tables");
   if (!userHasSelectedFilter.value && objectCounts.value[preferredFilter] > 0) {
     // The default table filter is a presentation choice, not a user query
     // change, so preserve the tab's saved scroll offset across remounts.
@@ -2781,26 +2819,67 @@ function finishObjectBrowserRowsLoad() {
 }
 
 watch([() => props.initialEventName, () => props.initialEventOpenRequestId, () => props.initialEventCreateRequestId], ([name, requestId, createRequestId], [previousName, previousRequestId, previousCreateRequestId]) => {
-  if (name !== previousName || requestId !== previousRequestId || createRequestId !== previousCreateRequestId) openedInitialEvent.value = "";
+  if (name !== previousName || requestId !== previousRequestId || createRequestId !== previousCreateRequestId) {
+    openedInitialEvent.value = "";
+    if (name || createRequestId !== undefined) objectFilter.value = "events";
+  }
   openInitialEventIfNeeded();
 });
 
-async function loadObjects(options?: { allowCached?: boolean }) {
+// 达梦的对象列表 SQL 固定 `WHERE o.OWNER = ?`（DamengAgent），空 schema 必然
+// 匹配 0 行；schema 解析失败（loadSchemas 抛错或返回空列表）时标签会整体空白
+// (#8301)。经 objectListSchemaForConnection 回退到连接用户名（大写），仅限
+// 达梦；oracle/oceanbase-oracle 维持空 schema 由后端解析当前 schema。
+async function loadObjects(options?: { allowCached?: boolean; preserveExistingRows?: boolean }) {
   error.value = "";
-  const schema = needsSchema.value ? selectedSchema.value || "" : props.database;
+  // A new load supersedes any in-flight one, so reset the transient refresh flags
+  // on entry. A superseded request's finally() can no longer run (the guard's
+  // epoch moved on) and would otherwise leave refreshingObjects stuck spinning
+  // the toolbar icon — the newest request owns the spinner state from here.
+  loadingObjects.value = false;
+  refreshingObjects.value = false;
+  scaffoldRefreshError.value = "";
+  // True when we are revalidating on top of visible rows (a stale-cache scaffold, or a
+  // same-instance refresh) — a failure then keeps the rows and raises a non-blocking
+  // banner instead of replacing the whole list with a full-area error.
+  let scaffoldRefresh = false;
+  const schema = needsSchema.value ? objectListSchemaForConnection(props.connection, selectedSchema.value) : props.database;
   const request = objectBrowserRowsLoadGuard.start(objectBrowserRowsCacheScope(schema));
   const cacheWriteToken = createObjectBrowserRowsCacheWriteToken(request.scope);
-  if (options?.allowCached) {
-    const cachedRows = getCachedObjectBrowserRows(request.scope);
-    if (cachedRows) {
-      applyObjectBrowserRows(cachedRows);
-      finishObjectBrowserRowsLoad();
-      return;
+
+  // finishObjectBrowserRowsLoad() is idempotent, but keep the default-filter /
+  // viewport restores to a single run per load so the events-preferred-filter case
+  // doesn't leave preserveObjectFilterScrollOnce latched across an extra call.
+  let finished = false;
+  const finishOnce = () => {
+    if (finished) return;
+    finished = true;
+    finishObjectBrowserRowsLoad();
+  };
+
+  const cached = options?.allowCached ? getCachedObjectBrowserRowsForScaffold(request.scope) : undefined;
+  if (cached) {
+    // Restore the last-known rows when remounting this tab. The cached list is
+    // authoritative for navigation restores, including entries older than the
+    // freshness TTL; re-querying here makes every tab switch look like a refresh.
+    // Explicit refresh and metadata invalidation still bypass this branch.
+    applyObjectBrowserRows(cached.rows);
+    finishOnce();
+    return;
+  } else {
+    // No scaffold: first load in this scope, cache invalidated by a DDL mutation,
+    // or the caller wants a true reload. If the caller explicitly asked to keep the
+    // current rows (same-instance refresh) and rows exist, refresh without blanking.
+    const keepExisting = options?.preserveExistingRows && rows.value.length > 0;
+    if (keepExisting) {
+      scaffoldRefresh = true;
+      refreshingObjects.value = true;
+    } else {
+      loadingObjects.value = true;
+      rows.value = [];
     }
   }
 
-  loadingObjects.value = true;
-  rows.value = [];
   try {
     const nextRows = props.connection.db_type === "mongodb" ? await loadMongoObjectBrowserRows(request.scope.connectionId, request.scope.database) : await loadSqlObjectBrowserRows(request);
     if (!objectBrowserRowsLoadGuard.isCurrent(request)) return;
@@ -2809,9 +2888,19 @@ async function loadObjects(options?: { allowCached?: boolean }) {
     if (props.connection.db_type !== "mongodb") void loadObjectStatistics(request, cacheWriteToken, cachedAt);
   } catch (e: any) {
     if (!objectBrowserRowsLoadGuard.isCurrent(request)) return;
-    error.value = translateBackendError(t, e);
+    // Keep visible rows on a background revalidate failure — surface a lightweight
+    // banner rather than replacing the scaffold (or same-instance refresh) list.
+    if (scaffoldRefresh) {
+      scaffoldRefreshError.value = translateBackendError(t, e);
+    } else {
+      error.value = translateBackendError(t, e);
+    }
   } finally {
-    if (objectBrowserRowsLoadGuard.isCurrent(request)) finishObjectBrowserRowsLoad();
+    if (objectBrowserRowsLoadGuard.isCurrent(request)) {
+      loadingObjects.value = false;
+      refreshingObjects.value = false;
+      finishOnce();
+    }
   }
 }
 
@@ -2864,15 +2953,23 @@ function normalizeStatisticNumber(value: number | null | undefined): number | nu
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-async function reload(options?: { allowCachedObjects?: boolean; contextEpoch?: number }) {
+async function reload(options?: { allowCachedObjects?: boolean; contextEpoch?: number; preserveExistingRows?: boolean }) {
   const epoch = options?.contextEpoch ?? objectBrowserRowsLoadGuard.invalidate();
-  if (!(await loadSchemas(epoch))) return;
+  try {
+    if (!(await loadSchemas(epoch))) return;
+  } catch (e) {
+    // listSchemas 失败（如共享连接上 SET SCHEMA 后的二次元数据请求）时，
+    // loadSchemas 不会触碰 selectedSchema，这里也不清空它：保留 props.schema
+    // 或用户已选值，继续尝试加载对象列表（达梦走用户名回退），避免标签静默
+    // 空白 (#8301)。对象列表若同样失败，loadObjects 自身的 catch 会展示错误。
+    console.warn("[ObjectBrowser] loadSchemas failed, keeping selected schema for", props.connection.id, e);
+  }
   if (!objectBrowserRowsLoadGuard.isEpochCurrent(epoch)) return;
-  await loadObjects({ allowCached: options?.allowCachedObjects });
+  await loadObjects({ allowCached: options?.allowCachedObjects, preserveExistingRows: options?.preserveExistingRows });
 }
 
 function refresh(): boolean {
-  void reload();
+  void reload({ preserveExistingRows: true });
   void refreshActiveTableInfo();
   return true;
 }
@@ -2915,6 +3012,12 @@ function filterLabel(filter: ObjectFilter) {
                         ? "tree.types"
                         : "objects.all";
   return `${t(key)} ${filterCount(filter)}`;
+}
+
+function selectObjectFilter(filter: ObjectFilter) {
+  userHasSelectedFilter.value = true;
+  objectFilter.value = filter;
+  emit("filterChange", filter);
 }
 
 function getSearchInput(): HTMLInputElement | null {
@@ -3017,6 +3120,22 @@ function isSelectedBatchTableContext(item: ObjectBrowserRow): boolean {
   return item.type === "TABLE" && selectedTableCount.value > 1 && selectedTableIds.value.has(item.id);
 }
 
+function addToAiMenuItem(item: ObjectBrowserRow): ContextMenuItem {
+  const useBatch = isSelectedBatchTableContext(item);
+  const count = selectedTableCount.value;
+  // Schema stays per-row: the consumer (App.vue addToAi) resolves the final
+  // schema with its own fallback chain (table.schema || tab.schema — no
+  // database fallback, mirroring the sidebar tree path). ObjectBrowser is a
+  // single-schema view, but keeping row-level schemas makes the payload honest
+  // and future-proof if multi-schema selection ever appears.
+  const targets = useBatch ? selectedTableRows.value.map((row) => ({ name: row.name, schema: row.schema })) : [{ name: item.name, schema: item.schema }];
+  return {
+    label: useBatch ? t("contextMenu.addToAiMultiple", { count }) : t("contextMenu.addToAi"),
+    action: () => emit("addToAi", targets),
+    icon: Sparkles,
+  };
+}
+
 function selectedBatchTableCountLabel(key: "batchDrop" | "batchTruncate" | "batchEmpty"): string {
   return t(`contextMenu.${key}`, { count: selectedTableCount.value });
 }
@@ -3026,6 +3145,7 @@ function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     return [
       { label: t("contextMenu.viewData"), action: () => openViewData(item), icon: Table2 },
       { label: t("contextMenu.newQuery"), action: () => openNewQuery(item), icon: TerminalSquare },
+      ...(supportsAiAssistantContext(effectiveDatabaseType.value) ? [addToAiMenuItem(item)] : []),
       { label: "", separator: true },
       exportDataSubmenu(item),
       { label: "", separator: true },
@@ -3069,6 +3189,7 @@ function getTableMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     ...(canOpenStructureEditor.value ? [{ label: t("contextMenu.editStructure"), action: () => openStructureEditor(item), icon: PencilRuler }] : []),
     ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
     { label: t("contextMenu.newQuery"), action: () => openNewQuery(item), icon: TerminalSquare },
+    ...(supportsAiAssistantContext(effectiveDatabaseType.value) ? [addToAiMenuItem(item)] : []),
     ...(canOpenDiagram.value ? [{ label: t("diagram.open"), action: () => openDiagram(item), icon: Network }] : []),
     ...(canOpenTableImport.value ? [{ label: t("contextMenu.importData"), action: () => openTableImport(item), icon: Download }] : []),
     { label: t("dataCompare.title"), action: () => openDataCompare(item), icon: ArrowRightLeft },
@@ -3194,16 +3315,16 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 
 <template>
   <div ref="rootRef" data-object-browser-root class="flex h-full min-h-0 min-w-0 flex-col bg-background outline-none" tabindex="0" @keydown="onObjectBrowserKeydown">
-    <div v-if="!isEventEditor" class="flex h-10 shrink-0 items-center gap-2 border-b px-3">
-      <div class="flex min-w-0 items-center gap-2">
+    <div v-if="!isEventEditor" ref="toolbarRef" class="flex h-10 shrink-0 items-center gap-2 overflow-hidden border-b px-3">
+      <div class="flex min-w-12 items-center gap-2">
         <span class="inline-flex max-w-[14rem] min-w-0 items-center rounded border border-border bg-muted/50 px-2 py-0.5 text-xs font-medium truncate" :title="selectedSchema || props.database">
           {{ selectedSchema || props.database }}
         </span>
-        <span v-if="selectedSchema" class="inline-flex max-w-[14rem] min-w-0 items-center rounded border border-border bg-muted/30 px-2 py-0.5 text-xs text-muted-foreground truncate" :title="props.database">
+        <span v-if="selectedSchema && showDatabaseChip" class="inline-flex max-w-[14rem] min-w-0 items-center rounded border border-border bg-muted/30 px-2 py-0.5 text-xs text-muted-foreground truncate" :title="props.database">
           {{ props.database }}
         </span>
       </div>
-      <div class="flex min-w-0 flex-1 items-center gap-2">
+      <div class="flex min-w-24 flex-1 items-center gap-2">
         <div class="relative min-w-0 flex-1">
           <Search class="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input v-model="search" data-object-search-input class="h-7 pl-8 pr-6 text-xs" :placeholder="isMongodb ? t('objects.searchCollections') : t('objects.search')" @keydown="onSearchKeydown" />
@@ -3211,18 +3332,8 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <X class="h-3 w-3" />
           </button>
         </div>
-        <div v-if="showObjectFilter" class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
-          <button
-            v-for="filter in objectFilters"
-            :key="filter"
-            type="button"
-            class="h-6 rounded-sm px-2 text-xs text-muted-foreground transition-colors hover:text-foreground"
-            :class="{ 'bg-background text-foreground shadow-sm': objectFilter === filter }"
-            @click="
-              userHasSelectedFilter = true;
-              objectFilter = filter;
-            "
-          >
+        <div v-if="showObjectFilter && showInlineObjectFilter" class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
+          <button v-for="filter in objectFilters" :key="filter" type="button" class="h-6 rounded-sm px-2 text-xs text-muted-foreground transition-colors hover:text-foreground" :class="{ 'bg-background text-foreground shadow-sm': objectFilter === filter }" @click="selectObjectFilter(filter)">
             {{ filterLabel(filter) }}
           </button>
         </div>
@@ -3243,7 +3354,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         @update:model-value="onSchemaChange"
       />
       <!-- Sort selector -->
-      <div class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
+      <div v-if="showInlineSortAndView" class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
         <select
           class="h-6 cursor-pointer appearance-none rounded-sm bg-transparent px-1.5 text-xs text-muted-foreground outline-none hover:text-foreground focus:text-foreground"
           :value="sortKey"
@@ -3259,7 +3370,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <ArrowDown v-else class="h-3 w-3" />
         </button>
       </div>
-      <div class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
+      <div v-if="showInlineSortAndView" class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
         <button type="button" class="flex h-6 w-6 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground" :class="{ 'bg-background text-foreground shadow-sm': isListView }" :title="t('objects.viewList')" @click="setViewMode('list')">
           <List class="h-3.5 w-3.5" />
         </button>
@@ -3267,17 +3378,50 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <LayoutGrid class="h-3.5 w-3.5" />
         </button>
       </div>
-      <Button variant="ghost" size="icon" class="h-7 w-7" :class="{ 'text-primary': settingsStore.editorSettings.objectBrowserShowCheckbox }" :title="t('objects.toggleCheckbox')" @click="toggleCheckboxColumn">
+      <Button v-if="showInlineCheckboxToggle" variant="ghost" size="icon" class="h-7 w-7" :class="{ 'text-primary': settingsStore.editorSettings.objectBrowserShowCheckbox }" :title="t('objects.toggleCheckbox')" @click="toggleCheckboxColumn">
         <CheckSquare v-if="settingsStore.editorSettings.objectBrowserShowCheckbox" class="h-3.5 w-3.5" />
         <Square v-else class="h-3.5 w-3.5" />
       </Button>
       <Button variant="ghost" size="icon" class="h-7 w-7" :title="refreshTooltip" :disabled="loadingObjects" @click="refresh">
-        <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingObjects }" />
+        <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingObjects || refreshingObjects }" />
       </Button>
       <Button v-if="canPasteTableClipboard()" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openPasteTableDialog">
         <Clipboard class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.pasteTableSelected") }}
       </Button>
+      <ToolbarOverflowMenu v-if="showToolbarOverflow" :label="t('toolbar.moreActions')" button-class="h-7 w-7">
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger>
+            <ArrowDown class="h-3.5 w-3.5" />
+            {{ t("objects.sortBy") }}
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent>
+            <DropdownMenuItem v-for="key in sortKeyOptions" :key="key" @select="onSortKeyChange(key)">
+              <Check v-if="sortKey === key" class="h-3.5 w-3.5" />
+              {{ sortKeyLabel(key) }}
+            </DropdownMenuItem>
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+        <DropdownMenuItem @select="sortDirection = sortDirection === 'asc' ? 'desc' : 'asc'">
+          <ArrowUp v-if="sortDirection === 'asc'" class="h-3.5 w-3.5" />
+          <ArrowDown v-else class="h-3.5 w-3.5" />
+          {{ sortDirection === "asc" ? t("objects.sortDesc") : t("objects.sortAsc") }}
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        <DropdownMenuItem @select="setViewMode('list')">
+          <List class="h-3.5 w-3.5" />
+          {{ t("objects.viewList") }}
+        </DropdownMenuItem>
+        <DropdownMenuItem @select="setViewMode('grid')">
+          <LayoutGrid class="h-3.5 w-3.5" />
+          {{ t("objects.viewGrid") }}
+        </DropdownMenuItem>
+        <DropdownMenuCheckboxItem :model-value="settingsStore.editorSettings.objectBrowserShowCheckbox" @select.prevent @update:model-value="toggleCheckboxColumn()">{{ t("objects.toggleCheckbox") }}</DropdownMenuCheckboxItem>
+        <template v-if="showObjectFilter && toolbarTier >= 2">
+          <DropdownMenuSeparator />
+          <DropdownMenuCheckboxItem v-for="filter in objectFilters" :key="filter" :model-value="objectFilter === filter" @select.prevent @update:model-value="selectObjectFilter(filter)">{{ filterLabel(filter) }}</DropdownMenuCheckboxItem>
+        </template>
+      </ToolbarOverflowMenu>
     </div>
     <div v-if="selectedTableCount > 0" class="flex h-9 shrink-0 items-center gap-2 overflow-x-auto border-b bg-muted/30 px-3 text-xs">
       <div class="min-w-0 flex-1 truncate text-muted-foreground">
@@ -3309,6 +3453,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       </Button>
     </div>
 
+    <div v-if="scaffoldRefreshError" role="status" class="flex h-8 shrink-0 items-center gap-2 border-b border-destructive/30 bg-destructive/5 px-3 text-xs text-destructive">
+      <RefreshCw class="h-3 w-3 shrink-0" />
+      <span class="min-w-0 truncate">{{ scaffoldRefreshError }}</span>
+    </div>
     <div v-if="loadingObjects" class="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
       <Loader2 class="h-4 w-4 animate-spin" />
       {{ t("objects.loading") }}
@@ -3521,7 +3669,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         </div>
       </div>
       <!-- Right-side panel: table info or source -->
-      <div v-if="sidePanelRow || isEventEditor" class="object-browser-side-panel relative flex min-h-0 shrink-0 flex-col border-l bg-background" :class="{ 'side-panel-resizing': isResizingSidePanel }" :style="{ width: `${sidePanelWidth}px` }">
+      <div v-if="sidePanelRow || isEventEditor" class="object-browser-side-panel relative flex min-h-0 min-w-0 shrink-0 flex-col border-l bg-background" :class="{ 'side-panel-resizing': isResizingSidePanel }" :style="{ width: `min(${sidePanelWidth}px, 100%)` }">
         <div class="absolute left-0 top-0 bottom-0 z-20 w-1.5 -translate-x-1/2 cursor-col-resize hover:bg-primary/30" @mousedown.prevent="onSidePanelResizeStart" />
         <!-- Table info mode -->
         <template v-if="sidePanelMode === 'table-info'">
@@ -3533,8 +3681,9 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                 <Copy class="w-3 h-3" />
                 <span class="table-info-action-label">{{ t("grid.copyDdl") }}</span>
               </Button>
-              <Button variant="ghost" size="icon" class="h-6 w-6" :class="{ 'bg-accent': settingsStore.editorSettings.tableDdlWordWrap }" @click="toggleTableDdlWordWrap">
+              <Button variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :class="{ 'bg-accent': settingsStore.editorSettings.tableDdlWordWrap }" :title="t('settings.wordWrap')" :aria-label="t('settings.wordWrap')" @click="toggleTableDdlWordWrap">
                 <WrapText class="w-3 h-3" />
+                <span class="table-info-action-label">{{ t("settings.wordWrap") }}</span>
               </Button>
             </div>
             <Button v-if="canOpenTableStructureEditor" variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :title="t('contextMenu.editStructure')" :aria-label="t('contextMenu.editStructure')" @click="openTableStructureEditor">

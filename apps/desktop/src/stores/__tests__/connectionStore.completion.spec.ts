@@ -1,7 +1,7 @@
 import { createPinia, setActivePinia } from "pinia";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getSqlCompletionContext } from "@/lib/sql/sqlCompletion";
-import type { ConnectionConfig } from "@/types/database";
+import type { ConnectionConfig, TreeNode } from "@/types/database";
 
 function installLocalStorage() {
   const data = new Map<string, string>();
@@ -57,6 +57,19 @@ function oracleConnection(): ConnectionConfig {
     port: 1521,
     username: "APP",
     database: "ORCL",
+  } as ConnectionConfig;
+}
+
+function jdbcOracleConnection(): ConnectionConfig {
+  return {
+    ...postgresConnection(),
+    id: "jdbc-oracle-1",
+    name: "Oracle via JDBC",
+    db_type: "jdbc",
+    port: 1521,
+    username: "APP",
+    database: "ORCL",
+    connection_string: "jdbc:oracle:thin:@127.0.0.1:1521/ORCL",
   } as ConnectionConfig;
 }
 
@@ -390,6 +403,34 @@ describe("connectionStore completion assistant", () => {
     expect(tables).toEqual([{ name: "accounts", schema: "public", type: "table", detail: "→ Customer accounts" }]);
   });
 
+  it("verifies selected-schema tables when the completion index is stale", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [],
+      incomplete: false,
+      fallback_used: false,
+    });
+    const listTables = vi.fn().mockResolvedValue([{ name: "accounts", table_type: "BASE TABLE", comment: "Customer accounts" }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      listSchemas: vi.fn().mockResolvedValue(["reporting"]),
+      listTables,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [postgresConnection()];
+    store.connectedIds.add("pg-1");
+
+    const tables = await store.listCompletionTables("pg-1", "app", "accounts", 200, "reporting", false, "reporting", undefined, { verifySchemaMetadata: true });
+
+    expect(completionAssistantSearch).toHaveBeenCalledOnce();
+    expect(listTables).toHaveBeenCalledWith("pg-1", "app", "reporting", "accounts", 200);
+    expect(tables).toEqual([{ name: "accounts", schema: "reporting", type: "table", detail: "→ Customer accounts" }]);
+  });
+
   it("keeps schema-qualified local table completion scoped to the selected schema", async () => {
     const completionAssistantSearch = vi.fn().mockRejectedValue(new Error("assistant unavailable"));
     const listTables = vi.fn(async (_connectionId: string, _database: string, schema: string, filter: string) => {
@@ -471,6 +512,85 @@ describe("connectionStore completion assistant", () => {
     expect(store.lookupLocalCompletionTables("oracle-1", "ORCL", "", 20, "scott")).toEqual(tables);
   });
 
+  it("reconciles a non-empty filtered cache with a table added to the sidebar tree", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [{ name: "REPORT_0001", kind: "table", schema: "APP" }],
+      incomplete: false,
+      fallback_used: false,
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const first = await store.listCompletionTables("oracle-1", "ORCL", "REPORT", 200, "APP");
+    const assistantCallsBeforeSidebarLoad = completionAssistantSearch.mock.calls.length;
+    store.treeNodes = [
+      {
+        id: "oracle-1:ORCL:APP:tables",
+        label: "Tables",
+        type: "group-tables",
+        connectionId: "oracle-1",
+        database: "ORCL",
+        schema: "APP",
+        children: [
+          { id: "report-0001", label: "REPORT_0001", type: "table", connectionId: "oracle-1", database: "ORCL", schema: "APP" },
+          { id: "report-1001", label: "REPORT_1001", type: "table", connectionId: "oracle-1", database: "ORCL", schema: "APP" },
+          { id: "other-schema", label: "REPORT_1001", type: "table", connectionId: "oracle-1", database: "ORCL", schema: "OTHER" },
+        ],
+      },
+    ] as TreeNode[];
+
+    const merged = await store.listCompletionTables("oracle-1", "ORCL", "REPORT", 200, "APP");
+
+    expect(first).toEqual([expect.objectContaining({ name: "REPORT_0001", schema: "APP" })]);
+    expect(merged.map((table) => table.name)).toEqual(["REPORT_0001", "REPORT_1001"]);
+    expect(merged.every((table) => table.schema === "APP")).toBe(true);
+    expect(completionAssistantSearch).toHaveBeenCalledTimes(assistantCallsBeforeSidebarLoad);
+  });
+
+  it("reconciles an empty filtered cache after the sidebar loads a late table", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({ candidates: [], incomplete: false, fallback_used: false });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const first = await store.listCompletionTables("oracle-1", "ORCL", "REPORT_1001", 200, "APP");
+    const assistantCallsBeforeSidebarLoad = completionAssistantSearch.mock.calls.length;
+    store.treeNodes = [
+      {
+        id: "oracle-1:ORCL:APP:tables",
+        label: "Tables",
+        type: "group-tables",
+        connectionId: "oracle-1",
+        database: "ORCL",
+        schema: "APP",
+        children: [{ id: "report-1001", label: "REPORT_1001", type: "table", connectionId: "oracle-1", database: "ORCL", schema: "APP" }],
+      },
+    ] as TreeNode[];
+
+    const merged = await store.listCompletionTables("oracle-1", "ORCL", "REPORT_1001", 200, "APP");
+
+    expect(first).toEqual([]);
+    expect(merged).toEqual([expect.objectContaining({ name: "REPORT_1001", schema: "APP", type: "table" })]);
+    expect(completionAssistantSearch).toHaveBeenCalledTimes(assistantCallsBeforeSidebarLoad);
+  });
+
   it("maps global Oracle tables with safe qualification and schema priority", async () => {
     const completionAssistantSearch = vi.fn().mockResolvedValue({
       candidates: [
@@ -532,6 +652,36 @@ describe("connectionStore completion assistant", () => {
     expect(getColumns).toHaveBeenCalledWith("oracle-1", "ORCL", "", "ORDERS", undefined, "tab-a");
     expect(columns).toEqual([expect.objectContaining({ name: "REPORT_ID", table: "ORDERS", schema: undefined, dataType: "NUMBER" })]);
     expect(store.lookupLocalCompletionColumns("oracle-1", "ORCL", "ORDERS")).toEqual([]);
+  });
+
+  it("lets a JDBC connection to Oracle resolve CURRENT_SCHEMA for unqualified column completion, same as the native Oracle driver", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [],
+      incomplete: false,
+      fallback_used: false,
+    });
+    const getColumns = vi.fn().mockResolvedValue([{ name: "REPORT_ID", data_type: "NUMBER", is_nullable: false, column_default: null, is_primary_key: true, extra: null, comment: null }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      getColumns,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [jdbcOracleConnection()];
+    store.connectedIds.add("jdbc-oracle-1");
+
+    // No schema is selected (undefined) — before the fix this fell through
+    // both the Oracle current-schema completion path and the schema-required
+    // guard, silently returning [] without ever calling getColumns.
+    const columns = await store.listCompletionColumns("jdbc-oracle-1", "ORCL", "ORDERS", undefined, { clientSessionId: "tab-a", version: 0 });
+
+    expect(completionAssistantSearch).not.toHaveBeenCalled();
+    expect(getColumns).toHaveBeenCalledWith("jdbc-oracle-1", "ORCL", "", "ORDERS", undefined, "tab-a");
+    expect(columns).toEqual([expect.objectContaining({ name: "REPORT_ID", table: "ORDERS", schema: undefined, dataType: "NUMBER" })]);
   });
 
   it("uses the Dameng login schema for unqualified column completion", async () => {

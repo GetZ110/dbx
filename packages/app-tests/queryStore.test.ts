@@ -515,7 +515,9 @@ test("hydrating saved SQL content preserves its restored runtime target", async 
     store.createTab("current-connection", "runtime_database", "current.sql", "query", "runtime_schema");
     const tabId = store.openSavedSql(file);
     const tab = store.tabs.find((item) => item.id === tabId)!;
+    // Clean restored tabs omit both fields until their saved file is hydrated.
     tab.sql = "";
+    tab.originalSql = undefined;
 
     await store.hydrateSavedSqlTabs();
 
@@ -3624,7 +3626,7 @@ test("expands single-table alias star projections for editable query metadata", 
   }
 });
 
-test("keeps joined query read-only when multiple source tables are writable candidates", async () => {
+test("keeps per-table write targets when multiple source tables are writable candidates", async () => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
@@ -3711,10 +3713,15 @@ test("keeps joined query read-only when multiple source tables are writable cand
     await store.executeTabSql(tabId, sql);
 
     const tab = store.tabs.find((item) => item.id === tabId);
-    await waitFor(() => columnRequests.length === 2 && tab?.queryEditabilityReason === "complex-source");
-    assert.equal(tab?.queryAnalysis, undefined);
-    assert.equal(tab?.tableMeta, undefined);
-    assert.equal(tab?.querySourceColumns, undefined);
+    await waitFor(() => columnRequests.length === 2 && tab?.queryWriteTargets?.length === 2);
+    assert.equal(tab?.queryEditabilityReason, undefined);
+    assert.equal(tab?.queryAnalysis?.allowDelete, false);
+    assert.equal(tab?.queryAnalysis?.allowInsert, false);
+    assert.deepEqual(
+      tab?.queryWriteTargets?.map((target) => target.tableMeta.tableName),
+      ["users", "orders"],
+    );
+    assert.deepEqual(tab?.querySourceColumns, ["id", "name", "id", "total"]);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -7505,7 +7512,7 @@ test("query execution is scoped to the tab client session", async () => {
     await store.executeTabSql(tabId, "select 1");
 
     assert.equal(executeBody.clientSessionId, tabId);
-    assert.equal(executeBody.timeoutSecs, 30);
+    assert.equal(executeBody.timeoutSecs, 60);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();
@@ -7558,15 +7565,19 @@ test("Spark query execution applies the selected database as schema context", as
   }
 });
 
-test("Kingbase query execution sends the selected schema context", async () => {
+test.each([
+  { label: "PostgreSQL", connection: conn("postgres-1"), connectionId: "postgres-1" },
+  { label: "GaussDB", connection: clearableQuerySchemaConn("gaussdb-1", "gaussdb"), connectionId: "gaussdb-1" },
+  { label: "Kingbase", connection: kingbaseConn("kingbase-1"), connectionId: "kingbase-1" },
+])("$label query execution sends the selected schema context", async ({ connection, connectionId }) => {
   const restoreStorage = installMemoryStorage();
   setActivePinia(createPinia());
   const connectionStore = useConnectionStore();
   const store = useQueryStore();
   const originalFetch = globalThis.fetch;
 
-  connectionStore.addEphemeralConnection(kingbaseConn("kingbase-1"));
-  const tabId = store.createTab("kingbase-1", "qinzhou", "Query", "query", "sdy_smartsite");
+  connectionStore.addEphemeralConnection(connection);
+  const tabId = store.createTab(connectionId, "qinzhou", "Query", "query", "sdy_smartsite");
   let executeBody: any;
 
   globalThis.fetch = withConnectionHealthMock(async (input, init) => {
@@ -7724,7 +7735,7 @@ test("data tab execution uses a tab-scoped client session", async () => {
     await store.executeTabSql(tabId, "select * from users");
 
     assert.equal(executeBody.clientSessionId, tabId);
-    assert.equal(executeBody.timeoutSecs, 30);
+    assert.equal(executeBody.timeoutSecs, 60);
   } finally {
     globalThis.fetch = originalFetch;
     restoreStorage();

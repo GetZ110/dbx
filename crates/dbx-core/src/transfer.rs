@@ -4,6 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[cfg(test)]
+#[path = "transfer/rebuild_tests.rs"]
+mod rebuild_tests;
+
+mod ddl_plan;
+
 use crate::connection::{config_for_pool_key, AppState, PoolKind};
 use crate::db;
 use crate::db::agent_driver::AgentTableReadStartParams;
@@ -11,7 +17,8 @@ use crate::db::mongo_driver::MongoDocumentResult;
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::object_source_sql::{build_executable_object_source_statements, EditableObjectSourceSqlInput};
 use crate::query::{
-    agent_execute_query_params, pool_error_action, PoolErrorAction, QueryExecutionOptions, AGENT_PROTOCOL_MAX_ROWS,
+    agent_execute_query_params, is_dbx_query_timeout_error, pool_error_action, query_timeout_duration,
+    wait_for_query_opt, PoolErrorAction, QueryExecutionOptions, AGENT_PROTOCOL_MAX_ROWS,
 };
 use crate::sql::{split_sql_statements, split_sql_statements_for_database};
 use crate::sql_dialect::{
@@ -200,6 +207,14 @@ pub struct TransferRequest {
     #[serde(default)]
     pub ownership_policy: TransferOwnershipPolicy,
     pub batch_size: usize,
+    /// When true, rename the target table to a backup before creating it from the
+    /// source structure. Only after the transfer succeeds is the backup dropped.
+    /// Requires `create_table = true` and `content != DataOnly`.
+    #[serde(default)]
+    pub drop_target_before_create: bool,
+    /// Production database confirmation for drop_target_before_create.
+    #[serde(default)]
+    pub drop_target_confirmed: bool,
 }
 
 fn default_quote_target_column_names() -> bool {
@@ -211,6 +226,28 @@ fn default_quote_target_column_names() -> bool {
 pub struct TransferOwnershipPreview {
     pub missing_owners: Vec<String>,
     pub target_owner: String,
+    pub rebuild: Option<TransferRebuildPreview>,
+}
+
+/// SQL plan preview for a `drop_target_before_create` (rebuild) transfer.
+///
+/// Built without executing any DDL: it reuses the same resolution and DDL planning the
+/// actual pass runs, so the confirmation dialog shows the real rename/create/cleanup
+/// statements and the real source→target→backup mapping.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferRebuildPreview {
+    pub sql: String,
+    pub tables: Vec<TransferRebuildPreviewTable>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferRebuildPreviewTable {
+    pub source_table: String,
+    pub target_table: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_table: Option<String>,
 }
 
 impl TransferRequest {
@@ -729,6 +766,13 @@ pub fn validate_transfer_request(request: &TransferRequest) -> Result<(), String
     if matches!(request.content, TransferContent::DataOnly) && !request.objects.is_empty() {
         return Err("仅数据模式不传输非表对象".to_string());
     }
+    if request.drop_target_before_create
+        && (matches!(request.content, TransferContent::DataOnly) || !request.create_table)
+    {
+        return Err("drop_target_before_create requires structure transfer (create_table and content != DataOnly). \
+             Data-only mode does not create tables, so a dropped target would not be rebuilt."
+            .to_string());
+    }
     for selection in &request.objects {
         if selection.names.is_empty() {
             return Err(format!("Object selection for {:?} is empty", selection.object_type));
@@ -855,6 +899,20 @@ async fn list_transfer_tables_isolated(
     });
     let _abort_on_drop = AbortTransferTaskOnDrop(task.abort_handle());
     task.await.map_err(|error| format!("Transfer table metadata task failed: {error}"))?
+}
+
+async fn get_transfer_table_comment_isolated(
+    state: Arc<AppState>,
+    connection_id: String,
+    database: String,
+    schema: String,
+    table: String,
+) -> Result<Option<String>, String> {
+    let task = tokio::spawn(async move {
+        crate::schema::get_table_comment_core(&state, &connection_id, &database, &schema, &table).await
+    });
+    let _abort_on_drop = AbortTransferTaskOnDrop(task.abort_handle());
+    task.await.map_err(|error| format!("Transfer table comment task failed: {error}"))?
 }
 
 async fn resolve_transfer_target_table_name(
@@ -1274,17 +1332,6 @@ fn postgres_schema_exists_sql(schema: &str) -> String {
 
 fn query_result_has_rows(result: &db::QueryResult) -> bool {
     !result.rows.is_empty()
-}
-
-fn is_simple_identifier(value: &str) -> bool {
-    let mut chars = value.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first == '_' || first.is_ascii_alphabetic()) {
-        return false;
-    }
-    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn is_postgres_compat_transfer(source_db: &DatabaseType, target_db: &DatabaseType) -> bool {
@@ -2014,11 +2061,31 @@ fn sqlserver_row_number_page_sql(
     )
 }
 
-fn postgres_index_column_sql(column: &str) -> String {
-    if is_simple_identifier(column) {
-        quote_identifier(column, &DatabaseType::Postgres)
-    } else {
-        column.to_string()
+fn postgres_index_column_sql(
+    column: &str,
+    is_expression: bool,
+    opclass: Option<&str>,
+    key_options: Option<i16>,
+) -> String {
+    // The base key text: a real column is quoted as an identifier; an expression/functional
+    // key part arrives as raw expression text (the per-column `pg_get_indexdef` omits the
+    // opclass — see `crates/dbx-core/src/db/postgres.rs`), so quoting the whole thing as
+    // an identifier would turn it into a nonexistent column reference (#6295).
+    let base = if is_expression { column.to_string() } else { quote_identifier(column, &DatabaseType::Postgres) };
+    // The opclass is read separately from `pg_index.indclass` for every key position
+    // (including expression keys) and appended uniformly — it never lives inside the
+    // expression text, so there is no duplication risk.
+    let with_opclass = match opclass.filter(|o| !o.is_empty()) {
+        Some(opc) => format!("{base} {opc}"),
+        None => base,
+    };
+    match key_options {
+        Some(options) => format!(
+            "{with_opclass} {} NULLS {}",
+            if options & 1 != 0 { "DESC" } else { "ASC" },
+            if options & 2 != 0 { "FIRST" } else { "LAST" }
+        ),
+        None => with_opclass,
     }
 }
 
@@ -2037,8 +2104,22 @@ fn generate_postgres_index_ddl(indexes: &[db::IndexInfo], table: &str, schema: &
             .filter(|value| !value.is_empty())
             .map(|value| format!(" USING {value}"))
             .unwrap_or_default();
-        let columns =
-            index.columns.iter().map(|column| postgres_index_column_sql(column)).collect::<Vec<_>>().join(", ");
+        let columns = index
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| {
+                let is_expr = index.key_is_expression.get(i).copied().unwrap_or(false);
+                let opclass = index.column_opclasses.get(i).and_then(|o| o.as_deref());
+                let key_options = index
+                    .index_type
+                    .as_deref()
+                    .filter(|index_type| index_type.eq_ignore_ascii_case("btree"))
+                    .and_then(|_| index.key_options.get(i).copied());
+                postgres_index_column_sql(column, is_expr, opclass, key_options)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         let include_clause = index
             .included_columns
             .as_ref()
@@ -2275,6 +2356,7 @@ struct PostgresTransferSequence {
     cycle: bool,
     cache_value: String,
     last_value: Option<String>,
+    is_called: Option<bool>,
 }
 
 fn postgres_sequence_qualified_name(schema: &str, sequence_name: &str) -> String {
@@ -2308,8 +2390,9 @@ fn generate_postgres_transfer_sequence_setval_sql(sequence: &PostgresTransferSeq
     if last_value.is_empty() {
         return None;
     }
+    let is_called = sequence.is_called.unwrap_or(true);
     Some(format!(
-        "SELECT setval({}, {last_value}, true)",
+        "SELECT setval({}, {last_value}, {is_called})",
         quote_postgres_string_literal(&postgres_sequence_qualified_name(schema, &sequence.name))
     ))
 }
@@ -3066,19 +3149,47 @@ fn is_timezone_suffix(value: &str) -> bool {
     )
 }
 
-fn transfer_length_params(source_type: &str, target_db: &DatabaseType) -> String {
+fn transfer_length_params(source_type: &str, source_db: &DatabaseType, target_db: &DatabaseType) -> String {
     let params = &source_type[source_type.find('(').expect("caller checked length parameters")..];
     if matches!(target_db, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng) {
-        params.to_string()
-    } else {
-        // Oracle length-unit qualifiers are invalid for non-Oracle-family
-        // targets, which only accept the numeric length.
-        normalize_len_params(params)
+        if matches!(source_db, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng) {
+            // Oracle-family sources carry their own qualifier (or default to
+            // the source's BYTE/CHAR semantics); copy verbatim so the unit
+            // intent survives the transfer.
+            return params.to_string();
+        }
+        // Character-counting sources (MySQL/Postgres/SQLite/SQL Server …)
+        // must pin the unit: a bare length is read in bytes when the target
+        // runs byte semantics (Oracle NLS_LENGTH_SEMANTICS=BYTE, Dameng
+        // LENGTH_IN_CHAR=0), so multi-byte text that fit the source column
+        // would overflow the target byte length (#8101).
+        return oracle_char_length_params(params);
     }
+    // Oracle length-unit qualifiers are invalid for non-Oracle-family
+    // targets, which only accept the numeric length.
+    normalize_len_params(params)
 }
 
-pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: &DatabaseType) -> String {
-    if _source_db == target_db {
+/// Pins a numeric length as characters for Oracle-family targets:
+/// `(20)` becomes `(20 CHAR)`. Params that already carry a qualifier, a
+/// precision/scale pair, or anything non-numeric pass through unchanged.
+fn oracle_char_length_params(params: &str) -> String {
+    let trimmed = params.trim();
+    let Some(inner) = trimmed.strip_prefix('(') else {
+        return params.to_string();
+    };
+    let Some(digits) = inner.strip_suffix(')') else {
+        return params.to_string();
+    };
+    let digits = digits.trim();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return params.to_string();
+    }
+    format!("({digits} CHAR)")
+}
+
+pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &DatabaseType) -> String {
+    if source_db == target_db {
         return source_type.to_string();
     }
     let t = source_type.to_lowercase();
@@ -3160,7 +3271,7 @@ pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: 
         }
         "varchar" | "nvarchar" | "character varying" | "varchar2" => {
             if t.contains('(') {
-                let len_part = transfer_length_params(&t, target_db);
+                let len_part = transfer_length_params(&t, source_db, target_db);
                 match target_db {
                     target_db if is_postgres_transfer_dialect(target_db) => format!("VARCHAR{len_part}"),
                     DatabaseType::Mysql => format!("VARCHAR{len_part}"),
@@ -3173,7 +3284,7 @@ pub fn map_column_type(source_type: &str, _source_db: &DatabaseType, target_db: 
         }
         "char" | "nchar" | "character" => {
             if t.contains('(') {
-                let len_part = transfer_length_params(&t, target_db);
+                let len_part = transfer_length_params(&t, source_db, target_db);
                 format!("CHAR{len_part}")
             } else {
                 "CHAR(1)".into()
@@ -3406,6 +3517,12 @@ fn generate_create_table_ddl_with_column_quoting(
     ddl
 }
 
+/// Dialects that apply table/column comments via `COMMENT ON` statements:
+/// PostgreSQL/Kingbase plus Oracle-compatible Dameng.
+fn supports_comment_on_transfer_ddl(target_db: &DatabaseType) -> bool {
+    is_postgres_transfer_dialect(target_db) || matches!(target_db, DatabaseType::Oracle | DatabaseType::Dameng)
+}
+
 /// Generate COMMENT ON COLUMN / ALTER TABLE COMMENT COLUMN / COMMENT ON TABLE
 /// statements for databases that don't support inline comments in CREATE TABLE.
 /// MySQL family uses inline syntax (handled in generate_create_table_ddl).
@@ -3427,21 +3544,19 @@ fn generate_comment_ddl_with_column_quoting(
     table_comment: Option<&str>,
     quote_target_column_names: bool,
 ) -> Vec<String> {
-    if !(is_postgres_transfer_dialect(target_db)
-        || matches!(target_db, DatabaseType::Oracle | DatabaseType::ClickHouse))
-    {
+    if !(supports_comment_on_transfer_ddl(target_db) || matches!(target_db, DatabaseType::ClickHouse)) {
         return Vec::new();
     }
 
     let full_table = qualified_table(table, schema, target_db, None);
     let mut statements = Vec::new();
 
-    // Table-level comment first (PostgreSQL/Oracle only; ClickHouse doesn't support COMMENT ON TABLE)
-    if is_postgres_transfer_dialect(target_db) || matches!(target_db, DatabaseType::Oracle) {
+    // Table-level comment first (ClickHouse doesn't support COMMENT ON TABLE)
+    if supports_comment_on_transfer_ddl(target_db) {
         if let Some(comment) = table_comment {
             let trimmed = comment.trim();
             if !trimmed.is_empty() {
-                let escaped = trimmed.replace('\'', "''");
+                let escaped = comment.replace('\'', "''");
                 statements.push(format!("COMMENT ON TABLE {full_table} IS '{escaped}'"));
             }
         }
@@ -3453,11 +3568,11 @@ fn generate_comment_ddl_with_column_quoting(
             if trimmed.is_empty() {
                 continue;
             }
-            let escaped = trimmed.replace('\'', "''");
+            let escaped = comment.replace('\'', "''");
             let qcol = transfer_column_identifier(&c.name, target_db, quote_target_column_names);
 
             match target_db {
-                target_db if is_postgres_transfer_dialect(target_db) || matches!(target_db, DatabaseType::Oracle) => {
+                target_db if supports_comment_on_transfer_ddl(target_db) => {
                     statements.push(format!("COMMENT ON COLUMN {full_table}.{qcol} IS '{escaped}'"));
                 }
                 DatabaseType::ClickHouse => {
@@ -4029,6 +4144,36 @@ fn rewrite_transfer_source_table_ddl(
     } else {
         sql.to_string()
     }
+}
+
+fn rewrite_postgres_serial_columns_for_transfer(
+    sql: &str,
+    sequences: &[PostgresOwnedSequence],
+    target_schema: &str,
+) -> String {
+    let mut rewritten = sql.to_string();
+    for sequence in sequences {
+        let quoted_column = quote_identifier(&sequence.owner_column, &DatabaseType::Postgres);
+        let qualified_sequence = postgres_sequence_qualified_name(target_schema, &sequence.name);
+        let default_clause =
+            format!("DEFAULT nextval({}::regclass)", quote_postgres_string_literal(&qualified_sequence));
+        for (serial_type, concrete_type) in
+            [("smallserial", "smallint"), ("serial", "integer"), ("bigserial", "bigint")]
+        {
+            let needle = format!("{quoted_column} {serial_type}");
+            let replacement = format!("{quoted_column} {concrete_type} {default_clause}");
+            if rewritten.contains(&needle) {
+                rewritten = rewritten.replacen(&needle, &replacement, 1);
+                break;
+            }
+            let uppercase_needle = format!("{quoted_column} {}", serial_type.to_ascii_uppercase());
+            if rewritten.contains(&uppercase_needle) {
+                rewritten = rewritten.replacen(&uppercase_needle, &replacement, 1);
+                break;
+            }
+        }
+    }
+    rewritten
 }
 
 fn mysql_spatial_transfer_select_sql(
@@ -4683,6 +4828,129 @@ fn value_to_sql_literal(value: &serde_json::Value, _db_type: &DatabaseType) -> S
     }
 }
 
+/// Source dialects whose transfer read loop may page with a keyset cursor
+/// (`WHERE (pk...) > <last page's keys>`) instead of `LIMIT n OFFSET m`.
+/// Keyset paging renders the cursor values as SQL text literals, so a dialect
+/// is only enabled once that rendering has been audited for it; the Postgres
+/// family shares quoting and implicit-cast rules and is covered first. Other
+/// dialects keep OFFSET paging (each page rescans and discards the rows before
+/// it, which is quadratic in table size) until their literal rules are audited.
+fn transfer_keyset_pagination_supported(db_type: &DatabaseType) -> bool {
+    matches!(db_type, DatabaseType::Postgres | DatabaseType::OpenGauss | DatabaseType::Gaussdb | DatabaseType::Kingbase)
+}
+
+/// Column types whose keyset cursor value round-trips through a SQL text
+/// literal in a `>` comparison. Exotic types (arrays, interval, bytea, money,
+/// network/range types...) keep OFFSET paging: their JSON form does not
+/// reliably re-parse as the same value, and a failed cast aborting the
+/// transfer mid-way is worse than a slow scan.
+fn postgres_keyset_column_type_supported(data_type: &str) -> bool {
+    let normalized = data_type.trim().to_ascii_lowercase();
+    let base = normalized.split('(').next().unwrap_or("").trim();
+    if base.is_empty() || base.contains('[') || base.contains("range") || base.starts_with("interval") {
+        return false;
+    }
+    const SUPPORTED_PREFIXES: &[&str] = &[
+        "int",
+        "bigint",
+        "smallint",
+        "serial",
+        "bigserial",
+        "smallserial",
+        "numeric",
+        "decimal",
+        "real",
+        "float",
+        "double",
+        "text",
+        "varchar",
+        "char",
+        "bpchar",
+        "name",
+        "bool",
+        "date",
+        "time",
+        "timestamp",
+        "uuid",
+    ];
+    SUPPORTED_PREFIXES.iter().any(|prefix| base.starts_with(prefix))
+}
+
+/// Resolves the source primary key columns to their positions in the selected
+/// column list. Returns None — meaning the read loop keeps OFFSET paging — when
+/// the dialect is not keyset-capable, when a key column is not among the
+/// transferred columns (its cursor value could not be read back), or when a key
+/// column's type cannot round-trip through a text literal.
+fn transfer_keyset_column_indexes(
+    columns: &[db::ColumnInfo],
+    primary_keys: &[String],
+    db_type: &DatabaseType,
+) -> Option<Vec<usize>> {
+    if primary_keys.is_empty() || !transfer_keyset_pagination_supported(db_type) {
+        return None;
+    }
+    primary_keys
+        .iter()
+        .map(|pk| {
+            let index = columns.iter().position(|column| column.name == *pk)?;
+            postgres_keyset_column_type_supported(&columns[index].data_type).then_some(index)
+        })
+        .collect()
+}
+
+/// Reads the keyset cursor (the primary key values ordering the pages) from the
+/// last row of a page. A NULL component means the metadata overstated the key
+/// (for example a nullable unique column reported as a key): the caller must
+/// fall back to OFFSET paging, which stays consistent because it keeps ordering
+/// by the same key columns.
+fn keyset_cursor_from_last_row(
+    rows: &[Vec<serde_json::Value>],
+    key_indexes: &[usize],
+) -> Option<Vec<serde_json::Value>> {
+    let last = rows.last()?;
+    key_indexes
+        .iter()
+        .map(|&index| {
+            let value = last.get(index).cloned().unwrap_or(serde_json::Value::Null);
+            (!value.is_null()).then_some(value)
+        })
+        .collect()
+}
+
+/// Outcome of advancing the keyset cursor from the page just read.
+enum KeysetAdvance {
+    /// The cursor moved to the page's last row; the next page continues after it.
+    Advanced,
+    /// A key component was NULL, so the key metadata does not allow keyset
+    /// paging (for example a nullable unique column reported as a key). The
+    /// caller falls back to OFFSET paging for the remaining pages, which stays
+    /// consistent because it keeps ordering by the same key columns.
+    FallBackToOffset,
+}
+
+/// Advances the keyset cursor from the page just read. Returns Err when the
+/// cursor did not move, which would re-read the same page forever.
+fn advance_keyset_cursor(
+    cursor: &mut Vec<serde_json::Value>,
+    rows: &[Vec<serde_json::Value>],
+    key_indexes: &[usize],
+    table: &str,
+) -> Result<KeysetAdvance, String> {
+    if rows.is_empty() {
+        return Ok(KeysetAdvance::Advanced);
+    }
+    match keyset_cursor_from_last_row(rows, key_indexes) {
+        Some(next) if next == *cursor => {
+            Err(format!("Transfer stalled for table '{table}': keyset pagination did not advance past key {next:?}"))
+        }
+        Some(next) => {
+            *cursor = next;
+            Ok(KeysetAdvance::Advanced)
+        }
+        None => Ok(KeysetAdvance::FallBackToOffset),
+    }
+}
+
 fn is_mongodb_transfer_type(db_type: &DatabaseType) -> bool {
     matches!(db_type, DatabaseType::MongoDb)
 }
@@ -5076,18 +5344,24 @@ fn transfer_pool_error_action(
 async fn transfer_pool_context(
     state: &AppState,
     pool_key: &str,
-) -> (Option<String>, Option<String>, Option<DatabaseType>) {
+) -> (Option<String>, Option<String>, Option<DatabaseType>, Option<u64>) {
     let configs = state.configs.read().await;
     let config = config_for_pool_key(pool_key, &configs);
     (
         config.map(|config| config.id.clone()),
         database_from_pool_key(pool_key).map(str::to_string),
         config.map(|config| config.db_type),
+        config.map(|config| config.effective_query_timeout_secs()),
     )
 }
 
 fn client_session_id_from_pool_key(pool_key: &str) -> Option<&str> {
     pool_key.split_once(":session:").map(|(_, session)| session).filter(|session| !session.is_empty())
+}
+
+fn is_transfer_query_timeout(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    is_dbx_query_timeout_error(&lower) || lower.contains("查询超时") || lower.contains("查詢逾時")
 }
 
 async fn execute_on_pool_with_options(
@@ -5097,7 +5371,7 @@ async fn execute_on_pool_with_options(
     max_rows: Option<usize>,
     safety: TransferExecutionSafety,
 ) -> Result<db::QueryResult, String> {
-    let (connection_id, database, db_type) = transfer_pool_context(state, pool_key).await;
+    let (connection_id, database, db_type, _query_timeout_secs) = transfer_pool_context(state, pool_key).await;
     let client_session_id = client_session_id_from_pool_key(pool_key).map(str::to_string);
     let mut current_pool_key = pool_key.to_string();
 
@@ -5111,6 +5385,33 @@ async fn execute_on_pool_with_options(
             PoolErrorAction::Keep => return result,
             PoolErrorAction::Discard => {
                 state.remove_pool_by_key(&current_pool_key).await;
+                // `WriteNoReplay` deliberately downgrades a recoverable connection
+                // error to `Discard` here so this specific write is never replayed
+                // (its outcome on the server is unknown). But leaving the pool
+                // torn down does not just affect this one statement: a bulk
+                // multi-table transfer keeps reusing this same `pool_key` for
+                // every remaining table, so once one table hits a transient
+                // connection drop (a momentary "too many connections"/"connection
+                // closed" from the target server under load), every later table
+                // immediately fails too with "Connection not found" / "Pool not
+                // found" -- turning one blip into a cascade for the rest of the
+                // run. Re-establish a fresh pool under the same key so the next
+                // caller isn't handed a known-dead connection; this never retries
+                // the failed statement above, only prepares the pool for
+                // whichever statement runs next.
+                if pool_error_action(db_type, error) == PoolErrorAction::ReconnectAndRetry {
+                    if let Some(connection_id) = connection_id.as_deref() {
+                        let catalog = catalog_from_pool_key(&current_pool_key).map(str::to_string);
+                        let _ = state
+                            .reconnect_pool_for_session_with_catalog(
+                                connection_id,
+                                database.as_deref(),
+                                catalog.as_deref(),
+                                client_session_id.as_deref(),
+                            )
+                            .await;
+                    }
+                }
                 return result;
             }
             PoolErrorAction::ReconnectAndRetry if attempt == 0 => {
@@ -5144,71 +5445,111 @@ async fn execute_on_pool_once(
     sql: &str,
     max_rows: Option<usize>,
 ) -> Result<db::QueryResult, String> {
-    // Read-only check: block transfer operations in readonly mode
+    let (_connection_id, _database, _db_type, query_timeout_secs) = transfer_pool_context(state, pool_key).await;
+    let query_timeout = query_timeout_duration(query_timeout_secs);
+
+    // Read-only check: block transfer operations in readonly mode.
     crate::query::check_read_only_for_connection(state, pool_key, sql).await?;
     let pool_handle = state.pool_handle(pool_key).await;
     let pool = pool_handle.as_ref().ok_or("Connection not found")?;
 
-    match pool {
+    let result = match pool {
         PoolKind::Mysql(p, mode) => {
             let p = p.clone();
             let bare = *mode == crate::connection::MysqlMode::Bare;
-            db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows, Default::default()).await
+            wait_for_query_opt(
+                None,
+                query_timeout,
+                db::mysql::execute_query_with_max_rows(&p, sql, bare, max_rows, Default::default()),
+            )
+            .await
         }
         PoolKind::Postgres(p) => {
             let p = p.clone();
-            db::postgres::execute_query_with_max_rows(&p, sql, max_rows).await
+            wait_for_query_opt(None, query_timeout, db::postgres::execute_query_with_max_rows(&p, sql, max_rows)).await
         }
         PoolKind::Sqlite(p) => {
             let p = p.clone();
-            db::sqlite::execute_query_with_max_rows(&p, sql, max_rows).await
+            wait_for_query_opt(None, query_timeout, db::sqlite::execute_query_with_max_rows(&p, sql, max_rows)).await
         }
         PoolKind::ClickHouse(client) => {
             let client = client.clone();
             let database = database_from_pool_key(pool_key).unwrap_or("default").to_string();
-            db::clickhouse_driver::execute_query_with_max_rows(&client, &database, sql, max_rows).await
+            wait_for_query_opt(
+                None,
+                query_timeout,
+                db::clickhouse_driver::execute_query_with_max_rows(&client, &database, sql, max_rows),
+            )
+            .await
+        }
+        PoolKind::InfluxDb(client) => {
+            let client = client.clone();
+            let database = database_from_pool_key(pool_key).unwrap_or("default").to_string();
+            wait_for_query_opt(None, query_timeout, db::influxdb_driver::execute_query(&client, &database, sql)).await
+        }
+        PoolKind::InfluxDb3(client) => {
+            let client = client.clone();
+            let database = database_from_pool_key(pool_key).unwrap_or("default").to_string();
+            wait_for_query_opt(
+                None,
+                query_timeout,
+                db::influxdb3_driver::execute_query(&client, &database, sql, max_rows),
+            )
+            .await
         }
         PoolKind::SqlServer(client) => {
             let client = client.clone();
             let mut client = client.lock().await;
-            let result = db::sqlserver::execute_query_with_max_rows(&mut client, sql, max_rows).await;
+            let result = wait_for_query_opt(
+                None,
+                query_timeout,
+                db::sqlserver::execute_query_with_max_rows(&mut client, sql, max_rows),
+            )
+            .await;
             drop(client);
             result
         }
         PoolKind::Agent(client) => {
             let client = client.clone();
             let database = database_from_pool_key(pool_key).map(str::to_string);
-            let sql = sql.to_string();
+            let options = QueryExecutionOptions {
+                max_rows,
+                fetch_size: max_rows,
+                timeout_secs: query_timeout_secs,
+                ..QueryExecutionOptions::default()
+            };
+            let params = agent_execute_query_params(sql, database.as_deref(), None, options);
             let mut client = client.lock().await;
-            let params = agent_execute_query_params(
-                &sql,
-                database.as_deref(),
-                None,
-                QueryExecutionOptions { max_rows, fetch_size: max_rows, ..QueryExecutionOptions::default() },
-            );
-            client.execute_query(params).await
+            client.execute_query_with_timeout(params, query_timeout).await
         }
         PoolKind::ExternalDriver { config, session, .. } => {
             let database = database_from_pool_key(pool_key)
                 .map(str::to_string)
                 .unwrap_or_else(|| config.effective_database().unwrap_or("").to_string());
-            let params = crate::query::external_driver_query_params(
-                config.as_ref(),
-                sql,
-                &database,
-                None,
-                &QueryExecutionOptions { max_rows, fetch_size: max_rows, ..QueryExecutionOptions::default() },
-            );
-            session.invoke_with_timeout("executeQuery", params, None).await
+            let options = QueryExecutionOptions {
+                max_rows,
+                fetch_size: max_rows,
+                timeout_secs: query_timeout_secs,
+                ..QueryExecutionOptions::default()
+            };
+            let params = crate::query::external_driver_query_params(config.as_ref(), sql, &database, None, &options);
+            session.invoke_with_timeout("executeQuery", params, query_timeout).await
         }
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
             let client = client.clone();
-            let sql = sql.to_string();
-            client.execute(None, sql, max_rows, None, None).await
+            client.execute(None, sql.to_string(), max_rows, None, query_timeout).await
         }
         _ => Err("Unsupported database type for transfer".to_string()),
+    };
+    drop(pool_handle);
+    if result.as_ref().is_err_and(|error| is_transfer_query_timeout(error)) {
+        // A timed-out native driver future may still own a checked-out
+        // connection. Discard the pool so a late server response cannot be
+        // reused by the next transfer statement.
+        state.remove_pool_by_key(pool_key).await;
     }
+    result
 }
 
 fn database_from_pool_key(pool_key: &str) -> Option<&str> {
@@ -5236,6 +5577,16 @@ fn effective_transfer_database_type(config: &ConnectionConfig) -> DatabaseType {
     }
     if config.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("gbase8s")) {
         return DatabaseType::Jdbc;
+    }
+
+    // Oracle behind a generic JDBC connection: Oracle rejects MySQL-style
+    // multi-row VALUES lists with ORA-00933, so reuse the native Oracle
+    // transfer dialect (INSERT ALL, TO_DATE literals, row-capped batches).
+    let is_oracle =
+        config.connection_string.as_deref().is_some_and(|url| url.to_ascii_lowercase().contains("jdbc:oracle:"))
+            || config.jdbc_driver_class.as_deref().is_some_and(|class| class.to_ascii_lowercase().contains("oracle"));
+    if is_oracle {
+        return DatabaseType::Oracle;
     }
 
     let jdbc_identity = [
@@ -5440,6 +5791,25 @@ async fn get_postgres_owned_sequences_for_transfer(
         .collect())
 }
 
+async fn get_postgres_sequence_names_for_transfer(
+    state: &AppState,
+    pool_key: &str,
+    schema: &str,
+) -> Result<Vec<String>, String> {
+    let sql = format!(
+        "SELECT c.relname FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'S' AND n.nspname = {} ORDER BY c.relname",
+        quote_string_literal(schema)
+    );
+    Ok(execute_on_pool(state, pool_key, &sql)
+        .await?
+        .rows
+        .into_iter()
+        .filter_map(|row| json_string_cell(&row, 0))
+        .collect())
+}
+
 const POSTGRES_OWNED_SEQUENCES_SQL: &str = "SELECT c.relname, \
               t.relname, \
               a.attname \
@@ -5527,7 +5897,7 @@ async fn get_postgres_selected_sequences_for_transfer(
     let Some(sql) = postgres_selected_sequences_sql(schema, names) else {
         return Ok(Vec::new());
     };
-    Ok(execute_on_pool(state, pool_key, &sql)
+    let mut sequences = execute_on_pool(state, pool_key, &sql)
         .await?
         .rows
         .into_iter()
@@ -5542,9 +5912,26 @@ async fn get_postgres_selected_sequences_for_transfer(
                 cycle: json_string_cell(&row, 6).as_deref() == Some("true"),
                 cache_value: json_string_cell(&row, 7)?,
                 last_value: json_string_cell(&row, 8),
+                is_called: None,
             })
         })
-        .collect())
+        .collect::<Vec<_>>();
+    for sequence in &mut sequences {
+        let sql = format!(
+            "SELECT last_value::text, is_called::text FROM {}",
+            postgres_sequence_qualified_name(schema, &sequence.name)
+        );
+        let row = execute_on_pool(state, pool_key, &sql).await?.rows.into_iter().next();
+        if let Some(row) = row {
+            sequence.last_value = json_string_cell(&row, 0).or(sequence.last_value.take());
+            sequence.is_called = json_string_cell(&row, 1).and_then(|value| match value.as_str() {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            });
+        }
+    }
+    Ok(sequences)
 }
 
 async fn get_existing_postgres_sequence_names_for_transfer(
@@ -5596,6 +5983,14 @@ async fn prepare_postgres_owned_sequences_for_transfer(
         return Ok(Vec::new());
     }
 
+    let sequence_names = owned_sequences.iter().map(|sequence| sequence.name.clone()).collect::<Vec<_>>();
+    let definitions =
+        get_postgres_selected_sequences_for_transfer(state, source_pool_key, &request.source_schema, &sequence_names)
+            .await?
+            .into_iter()
+            .map(|sequence| (sequence.name.clone(), sequence))
+            .collect::<HashMap<_, _>>();
+
     let existing_sequences =
         get_postgres_sequence_snapshots_for_transfer(state, target_pool_key, &request.target_schema)
             .await?
@@ -5610,8 +6005,10 @@ async fn prepare_postgres_owned_sequences_for_transfer(
             &request.target_schema,
         )?;
         if should_create {
-            let create_sql =
-                format!("CREATE SEQUENCE {}", postgres_sequence_qualified_name(&request.target_schema, &sequence.name));
+            let definition = definitions
+                .get(&sequence.name)
+                .ok_or_else(|| format!("PostgreSQL sequence definition not found: {}", sequence.name))?;
+            let create_sql = generate_postgres_transfer_sequence_create_ddl(definition, &request.target_schema);
             execute_on_pool(state, target_pool_key, &create_sql)
                 .await
                 .map_err(|e| format!("Failed to create PostgreSQL sequence for {target_table}: {e}"))?;
@@ -6227,8 +6624,38 @@ fn postgres_transfer_routines_sql(schema: &str, has_prokind: bool) -> String {
          FROM pg_catalog.pg_proc p \
          JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
          WHERE n.nspname = {schema} AND {routine_filter} \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_depend d \
+             JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+             WHERE d.classid = 'pg_catalog.pg_proc'::regclass \
+               AND d.objid = p.oid \
+               AND d.refclassid = 'pg_catalog.pg_extension'::regclass \
+               AND d.deptype = 'e' \
+               AND e.extnamespace = n.oid \
+           ) \
          ORDER BY CASE WHEN {routine_kind} = 'PROCEDURE' THEN 0 ELSE 1 END, p.proname, p.oid",
         schema = quote_string_literal(schema),
+    )
+}
+
+fn postgres_transfer_relation_sources_sql(schema: &str, relkind: char) -> String {
+    format!(
+        "SELECT c.relname, pg_get_viewdef(c.oid, true) \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = {} AND c.relkind = {} \
+           AND NOT EXISTS ( \
+             SELECT 1 FROM pg_catalog.pg_depend d \
+             JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid \
+             WHERE d.classid = 'pg_catalog.pg_class'::regclass \
+               AND d.objid = c.oid \
+               AND d.refclassid = 'pg_catalog.pg_extension'::regclass \
+               AND d.deptype = 'e' \
+               AND e.extnamespace = n.oid \
+           ) \
+         ORDER BY c.relname",
+        quote_string_literal(schema),
+        quote_string_literal(&relkind.to_string()),
     )
 }
 
@@ -6238,14 +6665,7 @@ async fn get_postgres_schema_object_sources_for_transfer(
     schema: &str,
     has_prokind: bool,
 ) -> Result<Vec<db::ObjectSource>, String> {
-    let views_sql = format!(
-        "SELECT c.relname, pg_get_viewdef(c.oid, true) \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {} AND c.relkind = 'v' \
-         ORDER BY c.relname",
-        quote_string_literal(schema)
-    );
+    let views_sql = postgres_transfer_relation_sources_sql(schema, 'v');
     let routines_sql = postgres_transfer_routines_sql(schema, has_prokind);
 
     let mut sources = Vec::new();
@@ -6292,14 +6712,7 @@ async fn get_postgres_materialized_view_sources_for_transfer(
     pool_key: &str,
     schema: &str,
 ) -> Result<Vec<PostgresMaterializedViewSource>, String> {
-    let sql = format!(
-        "SELECT c.relname, pg_get_viewdef(c.oid, true) \
-         FROM pg_catalog.pg_class c \
-         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = {} AND c.relkind = 'm' \
-         ORDER BY c.relname",
-        quote_string_literal(schema)
-    );
+    let sql = postgres_transfer_relation_sources_sql(schema, 'm');
     let rows = execute_on_pool(state, pool_key, &sql).await?.rows;
     Ok(rows
         .into_iter()
@@ -6593,39 +7006,148 @@ fn build_postgres_ownership_statement(statement: &PostgresOwnershipStatement, ow
     format!("{}{}", statement.sql_prefix, quote_identifier(owner, &DatabaseType::Postgres))
 }
 
+/// Build the SQL plan preview for a `drop_target_before_create` transfer.
+///
+/// Pure planning and deliberately lightweight: it resolves target names, derives backup
+/// names, and renders the rename/drop statements — but it does *not* read per-table column
+/// metadata or prepare the full CREATE DDL, so a large selection previews quickly and the
+/// confirmation dialog stays readable. The destructive steps (rename aside, drop the backup
+/// after success) are the ones shown; the CREATE step is summarized rather than expanded.
+async fn build_rebuild_preview(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    target_db_type: &DatabaseType,
+    target_pool_key: &str,
+) -> Result<TransferRebuildPreview, String> {
+    // Resolve target names first, exactly like the rename pre-pass, so the preview cannot
+    // disagree with execution about which table exists or what it will be renamed to.
+    let mut resolved: Vec<(String, String, bool)> = Vec::with_capacity(request.tables.len());
+    for table in &request.tables {
+        let ResolvedTransferTargetTable { name, preexisting } = resolve_transfer_target_table_name(
+            state,
+            request,
+            table,
+            target_pool_key,
+            target_db_type,
+            request.source_catalog.as_deref(),
+            request.target_catalog.as_deref(),
+        )
+        .await;
+        resolved.push((table.clone(), name, preexisting));
+    }
+
+    // Refuse the same dependencies the rename pre-pass refuses, before showing any plan.
+    let target_names = resolved.iter().map(|(_, name, _)| name.clone()).collect::<Vec<_>>();
+    crate::transfer_rebuild::ensure_no_external_table_dependencies(
+        state,
+        target_pool_key,
+        &request.target_database,
+        &request.target_schema,
+        &target_names,
+        *target_db_type,
+    )
+    .await?;
+
+    let mut tables = Vec::with_capacity(resolved.len());
+    let mut rename_statements: Vec<String> = Vec::new();
+    let mut drop_statements: Vec<String> = Vec::new();
+
+    for (table, target_table, preexisting) in &resolved {
+        let backup_table = if *preexisting {
+            let backup = crate::transfer_rebuild::backup_table_name(
+                *target_db_type,
+                &request.transfer_id,
+                &format!("{}.{}", request.source_schema, table),
+                target_table,
+            )?;
+            let rename_sql =
+                crate::db_admin_sql::build_rename_object_sql(crate::db_admin_sql::RenameObjectSqlOptions {
+                    database_type: Some(*target_db_type),
+                    object_type: crate::db_admin_sql::DatabaseObjectType::Table,
+                    schema: if request.target_schema.is_empty() { None } else { Some(request.target_schema.clone()) },
+                    old_name: target_table.clone(),
+                    new_name: backup.clone(),
+                })?;
+            rename_statements.push(rename_sql);
+            let drop_sql = crate::db_admin_sql::build_drop_table_sql(crate::db_admin_sql::TableAdminSqlOptions {
+                database_type: Some(*target_db_type),
+                schema: if request.target_schema.is_empty() { None } else { Some(request.target_schema.clone()) },
+                table_name: backup.clone(),
+                cascade: Some(true),
+                identifier_quote: None,
+            });
+            drop_statements.push(drop_sql);
+            Some(backup)
+        } else {
+            None
+        };
+
+        tables.push(TransferRebuildPreviewTable {
+            source_table: table.clone(),
+            target_table: target_table.clone(),
+            backup_table,
+        });
+    }
+
+    let mut phases: Vec<String> = Vec::new();
+    if !rename_statements.is_empty() {
+        phases.push(format!("-- 1. Backup existing target tables\n{}", rename_statements.join(";\n")));
+    }
+    phases.push(format!(
+        "-- 2. Recreate the {} selected table(s) from the source structure and transfer the selected data",
+        resolved.len()
+    ));
+    if !drop_statements.is_empty() {
+        phases.push(format!("-- 3. Drop backups after success\n{}", drop_statements.join(";\n")));
+    }
+
+    Ok(TransferRebuildPreview { sql: phases.join("\n\n"), tables })
+}
+
 pub async fn preview_transfer_ownership(
-    state: &AppState,
+    state: &Arc<AppState>,
     request: &TransferRequest,
     source_db_type: &DatabaseType,
     target_db_type: &DatabaseType,
     source_pool_key: &str,
     target_pool_key: &str,
 ) -> Result<TransferOwnershipPreview, String> {
-    if !request.create_table || !is_postgres_compat_transfer(source_db_type, target_db_type) {
-        return Ok(TransferOwnershipPreview { missing_owners: Vec::new(), target_owner: String::new() });
-    }
+    // PostgreSQL-compatible transfers report role ownership gaps for the confirmation flow.
+    let (missing_owners, target_owner) =
+        if request.create_table && is_postgres_compat_transfer(source_db_type, target_db_type) {
+            let has_prokind = postgres_transfer_catalog_capabilities(state, source_pool_key).await?.has_prokind;
+            let relation_names = postgres_transfer_relation_names(request);
+            let statements = get_postgres_ownership_statements_for_transfer(
+                state,
+                source_pool_key,
+                &request.source_schema,
+                &request.target_schema,
+                &relation_names,
+                has_prokind,
+            )
+            .await?;
+            let roles = distinct_postgres_ownership_roles(&statements);
+            let existing_roles = get_existing_postgres_roles(state, target_pool_key, &roles).await?;
+            let missing_owners = roles.into_iter().filter(|role| !existing_roles.contains(role)).collect::<Vec<_>>();
+            let target_owner = if missing_owners.is_empty() {
+                String::new()
+            } else {
+                get_postgres_current_user(state, target_pool_key).await?
+            };
+            (missing_owners, target_owner)
+        } else {
+            (Vec::new(), String::new())
+        };
 
-    let has_prokind = postgres_transfer_catalog_capabilities(state, source_pool_key).await?.has_prokind;
-    let relation_names = postgres_transfer_relation_names(request);
-    let statements = get_postgres_ownership_statements_for_transfer(
-        state,
-        source_pool_key,
-        &request.source_schema,
-        &request.target_schema,
-        &relation_names,
-        has_prokind,
-    )
-    .await?;
-    let roles = distinct_postgres_ownership_roles(&statements);
-    let existing_roles = get_existing_postgres_roles(state, target_pool_key, &roles).await?;
-    let missing_owners = roles.into_iter().filter(|role| !existing_roles.contains(role)).collect::<Vec<_>>();
-    let target_owner = if missing_owners.is_empty() {
-        String::new()
+    // Rebuild transfers additionally expose the rename/create/cleanup SQL plan so the
+    // confirmation dialog shows the real statements it is about to run.
+    let rebuild = if request.drop_target_before_create {
+        Some(build_rebuild_preview(state, request, target_db_type, target_pool_key).await?)
     } else {
-        get_postgres_current_user(state, target_pool_key).await?
+        None
     };
 
-    Ok(TransferOwnershipPreview { missing_owners, target_owner })
+    Ok(TransferOwnershipPreview { missing_owners, target_owner, rebuild })
 }
 
 fn postgres_transfer_grant_statements_sql(
@@ -6960,6 +7482,11 @@ where
     let mut sql_target_column_names: Vec<String> = Vec::new();
     let mut sql_target_column_types: Vec<Option<String>> = Vec::new();
     let mut sql_target_prepared = false;
+    // Keyset paging state for SQL sources: pages seek with
+    // `WHERE (pk...) > <cursor>` instead of OFFSET, which rescans and discards
+    // every previously read row (quadratic in table size).
+    let mut keyset_cursor: Vec<serde_json::Value> = Vec::new();
+    let mut keyset_usable = true;
 
     loop {
         if is_cancelled(&request.transfer_id).await {
@@ -7003,17 +7530,46 @@ where
             .await?;
             let col_names = columns.iter().map(|column| column.name.clone()).collect::<Vec<_>>();
             let primary_key_columns = transfer_key_columns(&columns, source_db_type);
-            let sql = pagination_sql_with_order(
-                &col_names,
-                table,
-                &request.source_schema,
-                source_db_type,
-                offset,
-                batch_size,
-                &primary_key_columns,
-                request.source_catalog.as_deref(),
-            );
+            let keyset_indexes = if keyset_usable {
+                transfer_keyset_column_indexes(&columns, &primary_key_columns, source_db_type)
+            } else {
+                None
+            };
+            let sql = if keyset_indexes.is_some() {
+                keyset_pagination_sql(
+                    &col_names,
+                    table,
+                    &request.source_schema,
+                    source_db_type,
+                    &primary_key_columns,
+                    &keyset_cursor,
+                    batch_size,
+                )
+            } else {
+                pagination_sql_with_order(
+                    &col_names,
+                    table,
+                    &request.source_schema,
+                    source_db_type,
+                    offset,
+                    batch_size,
+                    &primary_key_columns,
+                    request.source_catalog.as_deref(),
+                )
+            };
             let result = execute_on_pool(state, source_pool_key, &sql).await?;
+            if let Some(indexes) = keyset_indexes.as_deref() {
+                match advance_keyset_cursor(&mut keyset_cursor, &result.rows, indexes, table)? {
+                    KeysetAdvance::Advanced => {}
+                    KeysetAdvance::FallBackToOffset => {
+                        log::warn!(
+                            "[transfer] {table}: NULL value in a key column at row {offset}; \
+                             falling back to OFFSET paging for the remaining rows"
+                        );
+                        keyset_usable = false;
+                    }
+                }
+            }
             sql_rows_to_mongo_documents(&col_names, &result.rows)
         };
 
@@ -7267,8 +7823,520 @@ async fn close_hive_server_transfer_cursor(state: &AppState, pool_key: &str, cur
     }
 }
 
+/// Rename every existing target table to its backup name before the main
+/// create/insert pass.
+///
+/// Called only when `drop_target_before_create` is true. `tables` must already be in
+/// `parents_first = false` order (children first): MySQL `RENAME TABLE` and PostgreSQL
+/// `ALTER TABLE ... RENAME` keep incoming foreign keys attached to the renamed table,
+/// so renaming children first leaves each backup pair consistent with the other.
+///
+/// Two passes over `tables`, both before any DDL runs: resolve the target name and
+/// existence of each table (through the same `resolve_transfer_target_table_name` the
+/// main pass uses, so the two cannot disagree on which table is rebuilt), then refuse
+/// the whole transfer if a table outside the collection references one of them.
+///
+/// Returns a map from source table name to backup table name for the tables that were
+/// renamed. Tables absent from the target are skipped and absent from the map, which
+/// is what tells the main pass to create them without a backup to clean up.
+///
+/// SQL Server: the `sp_rename` object kind for a schema-unique backup object name that
+/// survived the table rename, so the pre-pass can rename it aside.
+#[derive(Clone, Copy)]
+enum SqlServerBackupObjectKind {
+    /// Primary-key / unique constraint: backed by a same-named index, so it is renamed as
+    /// `sp_rename 'schema.table.name', ..., 'INDEX'`.
+    KeyIndex,
+    /// Foreign-key / default / check constraint: renamed as `sp_rename 'schema.name', ..., 'OBJECT'`
+    /// (the object name is schema-qualified, NOT table-qualified — a table-qualified name
+    /// raises 15248 "ambiguous @objname").
+    Constraint,
+    /// Plain (non-constraint) index: `sp_rename 'schema.table.name', ..., 'INDEX'`.
+    Index,
+}
+
+/// SQL Server: list the schema-unique constraint and index names that survive a table
+/// rename, so the rebuild pre-pass can rename them aside and free the names.
+async fn get_sqlserver_backup_object_names(
+    state: &AppState,
+    pool_key: &str,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<(String, SqlServerBackupObjectKind)>, String> {
+    let object = if schema.is_empty() {
+        table.replace('\'', "''")
+    } else {
+        format!("{}.{}", schema.replace('\'', "''"), table.replace('\'', "''"))
+    };
+    let sql = format!(
+        "SELECT name, CAST(0 AS int) AS kind FROM sys.objects \
+         WHERE parent_object_id = OBJECT_ID('{object}') AND type IN ('PK','UQ') \
+         UNION ALL \
+         SELECT name, CAST(1 AS int) AS kind FROM sys.objects \
+         WHERE parent_object_id = OBJECT_ID('{object}') AND type IN ('F','D','C') \
+         UNION ALL \
+         SELECT i.name, CAST(2 AS int) AS kind FROM sys.indexes i \
+         WHERE i.object_id = OBJECT_ID('{object}') \
+           AND i.is_primary_key = 0 AND i.is_unique_constraint = 0 AND i.name IS NOT NULL",
+    );
+    let result = execute_read_on_pool(state, pool_key, &sql).await?;
+    let mut objects = Vec::new();
+    for row in &result.rows {
+        let Some(name) = row.first().and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let kind = match row.get(1).and_then(serde_json::Value::as_i64) {
+            Some(1) => SqlServerBackupObjectKind::Constraint,
+            Some(2) => SqlServerBackupObjectKind::Index,
+            _ => SqlServerBackupObjectKind::KeyIndex,
+        };
+        if !name.is_empty() {
+            objects.push((name.to_string(), kind));
+        }
+    }
+    Ok(objects)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn rename_tables_to_backup<F>(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    tables: &[String],
+    target_db_type: DatabaseType,
+    target_pool_key: &str,
+    mut progress_callback: F,
+) -> Result<HashMap<String, String>, String>
+where
+    F: FnMut(TransferProgress),
+{
+    let total_tables = tables.len();
+
+    // Resolve target names first so the fail-fast check below sees the names that will
+    // actually be renamed (target name casing and existing-table matching included).
+    let mut resolved: Vec<(String, String, bool)> = Vec::with_capacity(total_tables);
+    for table in tables {
+        if is_cancelled(&request.transfer_id).await {
+            return Err("Cancelled".to_string());
+        }
+        let ResolvedTransferTargetTable { name, preexisting } = resolve_transfer_target_table_name(
+            state,
+            request,
+            table,
+            target_pool_key,
+            &target_db_type,
+            request.source_catalog.as_deref(),
+            request.target_catalog.as_deref(),
+        )
+        .await;
+        resolved.push((table.clone(), name, preexisting));
+    }
+
+    // Refuse before the first rename: a foreign key from outside the collection would
+    // follow the rename onto the backup table, and a dependent view would be rewritten
+    // against the backup by the server itself — neither can be repaired later in the
+    // transfer.
+    let target_names = resolved.iter().map(|(_, name, _)| name.clone()).collect::<Vec<_>>();
+    crate::transfer_rebuild::ensure_no_external_table_dependencies(
+        state,
+        target_pool_key,
+        &request.target_database,
+        &request.target_schema,
+        &target_names,
+        target_db_type,
+    )
+    .await?;
+
+    // Preflight every backup name before renaming anything. Renames are not transactional
+    // across tables, so a collision discovered halfway through would leave the earlier
+    // tables already renamed aside — the failure the all-or-nothing check exists to prevent.
+    let mut plan: Vec<(String, String, String)> = Vec::new();
+    for (table, target_table, preexisting) in &resolved {
+        if !preexisting {
+            log::info!("[transfer] rename pre-pass: target table {target_table} does not exist, nothing to back up");
+            continue;
+        }
+        let backup_name = crate::transfer_rebuild::backup_table_name(
+            target_db_type,
+            &request.transfer_id,
+            &format!("{}.{}", request.source_schema, table),
+            target_table,
+        )?;
+
+        // The backup name is derived, not user-supplied, so a hit means an earlier run of
+        // this same transfer left one behind. Never overwrite it: it may be the only copy
+        // of the original table (mirrors sqlite_rebuild.rs:498-511).
+        let backup_exists = {
+            let lookup = list_transfer_tables_isolated(
+                state.clone(),
+                request.target_connection_id.clone(),
+                request.target_database.clone(),
+                request.target_schema.clone(),
+                request.target_catalog.clone(),
+                target_db_type,
+                backup_name.clone(),
+                1,
+            )
+            .await?;
+            !lookup.is_empty()
+        };
+        if backup_exists {
+            return Err(format!(
+                "Backup table name '{}' already exists in the target database. Cannot proceed with \
+                 drop_target_before_create; remove the existing backup manually or retry the transfer.",
+                backup_name
+            ));
+        }
+        plan.push((table.clone(), target_table.clone(), backup_name));
+    }
+
+    // Persist the recovery plan before the first mutation so a crash mid-rename still
+    // leaves enough information on disk to find every backup table.
+    crate::transfer_rebuild::persist_rebuild_plan(state, request, target_db_type, &plan).await?;
+
+    // Execute the renames. Any failure after the first successful rename leaves retained
+    // backups behind; the annotate pass below appends every one of them to the error.
+    let mut backup_names: HashMap<String, String> = HashMap::new();
+    let rename_pass = async {
+        for (i, (table, target_table, backup_name)) in plan.iter().enumerate() {
+            if is_cancelled(&request.transfer_id).await {
+                return Err("Cancelled".to_string());
+            }
+
+            progress_callback(TransferProgress {
+                transfer_id: request.transfer_id.clone(),
+                table: format!("rename: {table}"),
+                table_index: i,
+                total_tables,
+                rows_transferred: i as u64,
+                total_rows: Some(total_tables as u64),
+                status: TransferStatus::Running,
+                error: None,
+                terminal: false,
+            });
+
+            log::info!("[transfer] rename pre-pass: renaming {target_table} to backup {backup_name}");
+
+            let rename_sql =
+                crate::db_admin_sql::build_rename_object_sql(crate::db_admin_sql::RenameObjectSqlOptions {
+                    database_type: Some(target_db_type),
+                    object_type: crate::db_admin_sql::DatabaseObjectType::Table,
+                    schema: if request.target_schema.is_empty() { None } else { Some(request.target_schema.clone()) },
+                    old_name: target_table.clone(),
+                    new_name: backup_name.clone(),
+                })?;
+
+            execute_on_pool(state, target_pool_key, &rename_sql).await.map_err(|e| {
+                format!("Failed to rename target table '{target_table}' to backup '{backup_name}' in pre-pass: {e}")
+            })?;
+
+            backup_names.insert(table.clone(), backup_name.clone());
+
+            // PostgreSQL family: `ALTER TABLE ... RENAME TO` does NOT rename the table's
+            // indexes, constraints, or owned sequences. They keep their original
+            // schema-scoped identifiers, so the main pass's `CREATE INDEX IF NOT EXISTS`
+            // would silently no-op and a rebuilt serial column would share the backup's
+            // sequence. Rename them aside now; the hash covers each object's own identity,
+            // so indexes of the same name on different tables never collide.
+            if is_postgres_family_target(&target_db_type) {
+                let schema_prefix = if request.target_schema.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}.", quote_identifier(&request.target_schema, &DatabaseType::Postgres))
+                };
+                let mut renamed_objects = Vec::new();
+
+                let indexes = get_postgres_indexes_for_transfer(
+                    state,
+                    target_pool_key,
+                    &request.target_database,
+                    &request.target_schema,
+                    backup_name,
+                )
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to list indexes on backup table '{backup_name}': {e}. Renaming them is what frees \
+                         the original index names for the rebuilt table."
+                    )
+                })?;
+                for index in &indexes {
+                    if is_cancelled(&request.transfer_id).await {
+                        return Err("Cancelled".to_string());
+                    }
+                    let backup_index_name = crate::transfer_rebuild::backup_table_name(
+                        target_db_type,
+                        &request.transfer_id,
+                        &format!("{}.{}#index:{}", request.source_schema, table, index.name),
+                        &index.name,
+                    )?;
+                    let rename_index_sql = format!(
+                        "ALTER INDEX {}{} RENAME TO {}",
+                        schema_prefix,
+                        quote_identifier(&index.name, &DatabaseType::Postgres),
+                        quote_identifier(&backup_index_name, &DatabaseType::Postgres)
+                    );
+                    execute_on_pool(state, target_pool_key, &rename_index_sql).await.map_err(|e| {
+                        format!(
+                            "Failed to rename index '{index_name}' on backup table '{backup_name}' to '{backup_index_name}': {e}",
+                            index_name = index.name
+                        )
+                    })?;
+                    renamed_objects.push(format!("index {} -> {}", index.name, backup_index_name));
+                }
+
+                // Owned sequences (serial/identity) keep serving the backup table's column
+                // defaults after the rename. Renaming them aside makes the main pass create
+                // fresh sequences for the rebuilt table instead of silently reusing the
+                // backup's.
+                let owned_sequences = get_postgres_owned_sequences_for_transfer(
+                    state,
+                    target_pool_key,
+                    &request.target_schema,
+                    std::slice::from_ref(backup_name),
+                )
+                .await
+                .map_err(|e| format!("Failed to list owned sequences on backup table '{backup_name}': {e}"))?;
+                for sequence in &owned_sequences {
+                    if is_cancelled(&request.transfer_id).await {
+                        return Err("Cancelled".to_string());
+                    }
+                    let backup_sequence_name = crate::transfer_rebuild::backup_table_name(
+                        target_db_type,
+                        &request.transfer_id,
+                        &format!("{}.{}#sequence:{}", request.source_schema, table, sequence.name),
+                        &sequence.name,
+                    )?;
+                    let rename_sequence_sql = format!(
+                        "ALTER SEQUENCE {}{} RENAME TO {}",
+                        schema_prefix,
+                        quote_identifier(&sequence.name, &DatabaseType::Postgres),
+                        quote_identifier(&backup_sequence_name, &DatabaseType::Postgres)
+                    );
+                    execute_on_pool(state, target_pool_key, &rename_sequence_sql).await.map_err(|e| {
+                        format!(
+                            "Failed to rename sequence '{sequence_name}' on backup table '{backup_name}' to \
+                             '{backup_sequence_name}': {e}",
+                            sequence_name = sequence.name
+                        )
+                    })?;
+                    renamed_objects.push(format!("sequence {} -> {}", sequence.name, backup_sequence_name));
+                }
+
+                crate::transfer_rebuild::record_rebuild_step(state, &request.transfer_id, table, renamed_objects)
+                    .await?;
+            } else if target_db_type == DatabaseType::SqlServer {
+                // SQL Server: `sp_rename` on the table does NOT rename its schema-unique
+                // constraints or indexes. They keep their original names, so a rebuilt table
+                // reusing the source DDL would collide ("There is already an object named").
+                // Rename them aside now to free the names.
+                let objects =
+                    get_sqlserver_backup_object_names(state, target_pool_key, &request.target_schema, backup_name)
+                        .await
+                        .map_err(|e| {
+                            format!("Failed to list constraints and indexes on backup table '{backup_name}': {e}")
+                        })?;
+                let mut renamed_objects = Vec::new();
+                for (object_name, kind) in objects {
+                    if is_cancelled(&request.transfer_id).await {
+                        return Err("Cancelled".to_string());
+                    }
+                    let backup_object_name = crate::transfer_rebuild::backup_table_name(
+                        target_db_type,
+                        &request.transfer_id,
+                        &format!("{}.{}#object:{}", request.source_schema, table, object_name),
+                        &object_name,
+                    )?;
+                    // Key/plain indexes are table-qualified and renamed as INDEX; constraints
+                    // are schema-qualified (NOT table-qualified) and renamed as OBJECT.
+                    let (qualified_object, object_type, object_label) = match kind {
+                        SqlServerBackupObjectKind::KeyIndex | SqlServerBackupObjectKind::Index => {
+                            let qualified = if request.target_schema.is_empty() {
+                                format!("{backup_name}.{object_name}")
+                            } else {
+                                format!("{}.{backup_name}.{object_name}", request.target_schema)
+                            };
+                            (qualified, "INDEX", "index")
+                        }
+                        SqlServerBackupObjectKind::Constraint => {
+                            let qualified = if request.target_schema.is_empty() {
+                                object_name.clone()
+                            } else {
+                                format!("{}.{object_name}", request.target_schema)
+                            };
+                            (qualified, "OBJECT", "constraint")
+                        }
+                    };
+                    let rename_sql =
+                        format!("EXEC sp_rename N'{qualified_object}', N'{backup_object_name}', N'{object_type}';");
+                    execute_on_pool(state, target_pool_key, &rename_sql).await.map_err(|e| {
+                        format!(
+                            "Failed to rename {object_label} '{object_name}' on backup table '{backup_name}' to \
+                             '{backup_object_name}': {e}"
+                        )
+                    })?;
+                    renamed_objects.push(format!("{object_label} {object_name} -> {backup_object_name}"));
+                }
+                crate::transfer_rebuild::record_rebuild_step(state, &request.transfer_id, table, renamed_objects)
+                    .await?;
+            } else {
+                crate::transfer_rebuild::record_rebuild_step(state, &request.transfer_id, table, Vec::new()).await?;
+            }
+        }
+        Ok(())
+    };
+    if let Err(error) = rename_pass.await {
+        if error == "Cancelled" {
+            return Err(error);
+        }
+        // Every table already renamed stays as a backup. The message is the user's map
+        // back to their data, and the journal persisted above holds the same list on disk.
+        let mut annotated = error;
+        for backup_name in backup_names.values() {
+            let qualified = qualified_table(
+                backup_name,
+                &request.target_schema,
+                &target_db_type,
+                request.target_catalog.as_deref(),
+            );
+            annotated = crate::transfer_rebuild::annotate_error_with_retained_backup(annotated, &qualified);
+        }
+        return Err(annotated);
+    }
+
+    // MySQL family: free the constraint names the backups still hold before the caller
+    // runs the deferred foreign key ALTERs. Doing it here — inside the pre-pass, after
+    // every table is renamed — keeps the core API self-contained: both desktop and Web
+    // and any direct caller run the deferred ALTERs after this returns, and MySQL
+    // constraint names are unique per database, so an unreleased name would collide with
+    // the rebuilt table's re-created constraint.
+    free_backup_foreign_key_names(state, request, target_db_type, target_pool_key, &backup_names).await?;
+
+    Ok(backup_names)
+}
+
+/// Create (or skip) the target table for a single-table transfer.
+///
+/// Extracted from [`transfer_table_inner`] so the rebuild path can create the table from the
+/// source DDL *before* reading the source column list. When the source column read fails, a
+/// rebuild still leaves the freshly-created (empty) target table plus the retained backup
+/// behind — the recovery contract the failure path relies on (drop the empty table, rename
+/// the backup back).
+#[allow(clippy::too_many_arguments)]
+async fn create_transfer_target_table(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    table: &str,
+    target_table: &str,
+    source_db_type: &DatabaseType,
+    target_db_type: &DatabaseType,
+    source_pool_key: &str,
+    target_pool_key: &str,
+    known_foreign_keys: &HashMap<String, Vec<db::ForeignKeyInfo>>,
+    pending_fk_alters: &mut Vec<(String, String)>,
+    target_table_preexisting: &mut bool,
+    target_renamed_to_backup: bool,
+    columns: &[db::ColumnInfo],
+    table_comment: Option<&str>,
+    pg_compat_transfer: bool,
+    preserves_target_table_name: bool,
+) -> Result<(), String> {
+    if transfer_table_needs_inline_postgres_schema_ensure(source_db_type, target_db_type)
+        && !request.target_schema.trim().is_empty()
+    {
+        let create_schema_sql =
+            format!("CREATE SCHEMA IF NOT EXISTS {}", quote_identifier(&request.target_schema, target_db_type));
+        execute_on_pool(state, target_pool_key, &create_schema_sql)
+            .await
+            .map_err(|e| format!("Failed to ensure schema exists: {e}"))?;
+    }
+
+    // The pre-pass renamed the target away, so the name is free again. Resetting the
+    // flag is what keeps the index / foreign key / PG schema restore paths — all
+    // gated on `!target_table_preexisting` — from silently skipping.
+    if target_renamed_to_backup {
+        *target_table_preexisting = false;
+    }
+
+    if *target_table_preexisting {
+        log::info!("[transfer] target table {target_table} already exists, skipping create-table DDL");
+        return Ok(());
+    }
+
+    let owned_sequences = prepare_postgres_owned_sequences_for_transfer(
+        state,
+        request,
+        table,
+        target_table,
+        source_pool_key,
+        target_pool_key,
+        pg_compat_transfer,
+        preserves_target_table_name,
+        *target_table_preexisting,
+    )
+    .await?;
+    // Shared DDL planning: the same helper the ownership preview uses, so the
+    // confirmation dialog and the actual creation can never disagree on the DDL
+    // or the names inside it. Rebuild mode additionally fails closed here when
+    // source metadata cannot be trusted.
+    let prepared = ddl_plan::prepare_table_ddl(
+        state,
+        request,
+        table,
+        target_table,
+        source_db_type,
+        target_db_type,
+        source_pool_key,
+        columns,
+        table_comment,
+        known_foreign_keys,
+    )
+    .await?;
+    let reused_source_ddl = prepared.reused_source_ddl;
+    let ddl = prepared.ddl;
+    let ddl = if pg_compat_transfer && !owned_sequences.is_empty() {
+        rewrite_postgres_serial_columns_for_transfer(&ddl, &owned_sequences, &request.target_schema)
+    } else {
+        ddl
+    };
+    let deferred_fk_alters = prepared.deferred_fk_alters;
+    log::info!("[transfer] creating target table: {}", ddl.chars().take(200).collect::<String>());
+    let target_table_created = transfer_create_table_created(
+        execute_transfer_create_table_ddl_on_pool(state, target_pool_key, &ddl, target_db_type, reused_source_ddl)
+            .await,
+        "Failed to create table",
+    )?;
+    if target_table_created {
+        pending_fk_alters.extend(deferred_fk_alters.into_iter().map(|statement| (target_table.to_string(), statement)));
+        let comment_stmts = generate_comment_ddl_with_column_quoting(
+            columns,
+            target_table,
+            &request.target_schema,
+            target_db_type,
+            table_comment,
+            request.quote_target_column_names,
+        );
+        for stmt in &comment_stmts {
+            if let Err(e) = execute_on_pool(state, target_pool_key, stmt).await {
+                log::warn!("[transfer] failed to set column comment for {target_table}: {e}");
+            }
+        }
+        bind_postgres_owned_sequences_for_transfer(state, request, target_table, target_pool_key, &owned_sequences)
+            .await?;
+    } else {
+        // DDL may report the table already exists even when metadata
+        // lookup missed it (case/schema differences or localized errors).
+        *target_table_preexisting = true;
+    }
+    Ok(())
+}
+
 /// Transfer a single table. Returns rows transferred.
 /// `progress_callback` is invoked for progress updates.
+///
+/// `preexisting_backup_names` carries the output of [`rename_tables_to_backup`] and is
+/// required whenever `drop_target_before_create` is set — this pass only checks whether the
+/// table was renamed aside, and never renames or drops anything itself. Removing the backups
+/// is [`drop_backup_tables`], after every table has succeeded.
 #[allow(clippy::too_many_arguments)]
 async fn transfer_table_inner<F>(
     state: &Arc<AppState>,
@@ -7281,6 +8349,7 @@ async fn transfer_table_inner<F>(
     target_pool_key: &str,
     known_foreign_keys: &HashMap<String, Vec<db::ForeignKeyInfo>>,
     pending_fk_alters: &mut Vec<(String, String)>,
+    preexisting_backup_names: Option<&HashMap<String, String>>,
     mut progress_callback: F,
 ) -> Result<u64, String>
 where
@@ -7316,20 +8385,105 @@ where
         .await;
     let preserves_target_table_name = target_table == table;
 
-    // Get source columns (deduplicate by name)
-    let columns = {
-        let raw = get_columns_for_transfer(
-            state,
-            source_pool_key,
-            &request.source_connection_id,
-            &request.source_database,
-            &request.source_schema,
-            table,
-            request.source_catalog.as_deref(),
+    // Did the rename pre-pass move this table's target aside? False when the option is off,
+    // or when the target table did not exist, so nothing was renamed. Removing the backup is
+    // `drop_backup_tables`' job once the whole table loop has succeeded.
+    let target_renamed_to_backup =
+        match (request.drop_target_before_create, preexisting_backup_names) {
+            (false, _) => false,
+            (true, Some(backup_map)) => backup_map.contains_key(table),
+            // rename_tables_to_backup owns the rename; without it the target table would
+            // still be in place and this pass would quietly append into it.
+            (true, None) => return Err(
+                "drop_target_before_create requires the rename pre-pass: call rename_tables_to_backup and pass its \
+                 result to transfer_table."
+                    .to_string(),
+            ),
+        };
+
+    // PostgreSQL's table list filter is fuzzy, so it cannot identify the
+    // requested table's comment when similarly named tables exist.
+    let table_comment = if *source_db_type == DatabaseType::Postgres {
+        get_transfer_table_comment_isolated(
+            state.clone(),
+            request.source_connection_id.clone(),
+            request.source_database.clone(),
+            request.source_schema.clone(),
+            table.to_string(),
         )
-        .await?;
-        let mut seen = std::collections::HashSet::new();
-        raw.into_iter().filter(|c| seen.insert(c.name.clone())).collect::<Vec<_>>()
+        .await
+        .unwrap_or_default()
+    } else {
+        // Keep the list-tables metadata chain on its own task stack, just like
+        // the target-table lookup above.
+        list_transfer_tables_isolated(
+            state.clone(),
+            request.source_connection_id.clone(),
+            request.source_database.clone(),
+            request.source_schema.clone(),
+            request.source_catalog.clone(),
+            *source_db_type,
+            table.to_string(),
+            1,
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .next()
+        .and_then(|table| table.comment)
+    };
+
+    // Get source columns (deduplicate by name).
+    //
+    // A rebuild reads its CREATE DDL from the source connection (not the source pool), so a
+    // column-read failure must still create the target table first: that leaves the recovery
+    // contract intact — an empty new table plus the retained backup — so the user can drop the
+    // empty table and rename the backup back.
+    let columns: Vec<db::ColumnInfo> = match get_columns_for_transfer(
+        state,
+        source_pool_key,
+        &request.source_connection_id,
+        &request.source_database,
+        &request.source_schema,
+        table,
+        request.source_catalog.as_deref(),
+    )
+    .await
+    {
+        Ok(raw) => {
+            let mut seen = std::collections::HashSet::new();
+            raw.into_iter().filter(|c| seen.insert(c.name.clone())).collect()
+        }
+        Err(error) => {
+            if request.drop_target_before_create && target_renamed_to_backup {
+                let mut preexisting = target_table_preexisting;
+                if let Err(create_error) = create_transfer_target_table(
+                    state,
+                    request,
+                    table,
+                    &target_table,
+                    source_db_type,
+                    target_db_type,
+                    source_pool_key,
+                    target_pool_key,
+                    known_foreign_keys,
+                    pending_fk_alters,
+                    &mut preexisting,
+                    true,
+                    &[],
+                    table_comment.as_deref(),
+                    pg_compat_transfer,
+                    preserves_target_table_name,
+                )
+                .await
+                {
+                    return Err(format!(
+                        "{error} Additionally, the rebuild could not create the target table: {create_error}"
+                    ));
+                }
+            }
+            return Err(error);
+        }
     };
 
     if columns.is_empty() {
@@ -7347,24 +8501,6 @@ where
     if should_copy_data(&request.content) {
         log::info!("[transfer] {} has {} columns, counting rows...", table, columns.len());
     }
-
-    // Fetch source table comment. Keep this list-tables metadata chain on its
-    // own task stack, just like the target-table lookup above.
-    let table_comment = list_transfer_tables_isolated(
-        state.clone(),
-        request.source_connection_id.clone(),
-        request.source_database.clone(),
-        request.source_schema.clone(),
-        request.source_catalog.clone(),
-        *source_db_type,
-        table.to_string(),
-        1,
-    )
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .next()
-    .and_then(|table| table.comment);
 
     let source_indexes =
         if request.create_table && pg_compat_transfer && preserves_target_table_name && !target_table_preexisting {
@@ -7414,233 +8550,25 @@ where
 
     // Create table on target if requested
     if request.create_table {
-        if transfer_table_needs_inline_postgres_schema_ensure(source_db_type, target_db_type)
-            && !request.target_schema.trim().is_empty()
-        {
-            let create_schema_sql =
-                format!("CREATE SCHEMA IF NOT EXISTS {}", quote_identifier(&request.target_schema, target_db_type));
-            execute_on_pool(state, target_pool_key, &create_schema_sql)
-                .await
-                .map_err(|e| format!("Failed to ensure schema exists: {e}"))?;
-        }
-        if target_table_preexisting {
-            log::info!("[transfer] target table {} already exists, skipping create-table DDL", target_table);
-        } else {
-            let owned_sequences = prepare_postgres_owned_sequences_for_transfer(
-                state,
-                request,
-                table,
-                &target_table,
-                source_pool_key,
-                target_pool_key,
-                pg_compat_transfer,
-                preserves_target_table_name,
-                target_table_preexisting,
-            )
-            .await?;
-            let (source_driver_profile, target_driver_profile) = {
-                let configs = state.configs.read().await;
-                (
-                    configs.get(&request.source_connection_id).and_then(|config| config.driver_profile.clone()),
-                    configs.get(&request.target_connection_id).and_then(|config| config.driver_profile.clone()),
-                )
-            };
-            let can_reuse_source_ddl = can_reuse_source_table_ddl(
-                source_db_type,
-                target_db_type,
-                source_driver_profile.as_deref(),
-                target_driver_profile.as_deref(),
-                preserves_target_table_name,
-            ) && (request.quote_target_column_names
-                || !matches!(target_db_type, DatabaseType::Gaussdb | DatabaseType::OpenGauss));
-            let mut reused_source_ddl = false;
-            let ddl = if can_reuse_source_ddl {
-                let (source_ddl, source_ddl_was_read) = if let Some(catalog) =
-                    resolve_external_transfer_catalog(request.source_catalog.as_deref(), source_db_type)
-                {
-                    // Doris/StarRocks external catalog: read DDL directly via
-                    // SHOW CREATE TABLE catalog.database.table using the
-                    // existing source pool (bare MySQL — addresses any catalog).
-                    let pool = {
-                        let pool = state
-                            .pool_handle(source_pool_key)
-                            .await
-                            .ok_or_else(|| "Source pool not found".to_string())?;
-                        let PoolKind::Mysql(p, _) = &pool else {
-                            return Err("Source pool must be MySQL-family for catalog DDL".to_string());
-                        };
-                        p.clone()
-                    };
-                    match db::doris::get_catalog_table_ddl(&pool, catalog, &request.source_database, table).await {
-                        Ok(ddl) => (ddl, true),
-                        Err(err) => {
-                            log::warn!("[transfer] catalog DDL read failed for {table} in catalog '{catalog}': {err}; falling back to generated DDL");
-                            (
-                                generate_create_table_ddl_with_column_quoting(
-                                    &columns,
-                                    &target_table,
-                                    &request.source_schema,
-                                    &request.target_schema,
-                                    target_db_type,
-                                    source_db_type,
-                                    table_comment.as_deref(),
-                                    request.target_catalog.as_deref(),
-                                    request.quote_target_column_names,
-                                ),
-                                false,
-                            )
-                        }
-                    }
-                } else {
-                    match crate::schema::get_table_ddl_core(
-                        state,
-                        &request.source_connection_id,
-                        &request.source_database,
-                        &request.source_schema,
-                        table,
-                        None,
-                    )
-                    .await
-                    {
-                        Ok(ddl) => (ddl, true),
-                        Err(_) => (
-                            generate_create_table_ddl_with_column_quoting(
-                                &columns,
-                                &target_table,
-                                &request.source_schema,
-                                &request.target_schema,
-                                target_db_type,
-                                source_db_type,
-                                table_comment.as_deref(),
-                                request.target_catalog.as_deref(),
-                                request.quote_target_column_names,
-                            ),
-                            false,
-                        ),
-                    }
-                };
-                if contains_oceanbase_mysql_table_options(&source_ddl)
-                    && !db::oceanbase_mysql::is_profile(target_db_type, target_driver_profile.as_deref())
-                {
-                    generate_create_table_ddl_with_column_quoting(
-                        &columns,
-                        &target_table,
-                        &request.source_schema,
-                        &request.target_schema,
-                        target_db_type,
-                        source_db_type,
-                        table_comment.as_deref(),
-                        request.target_catalog.as_deref(),
-                        request.quote_target_column_names,
-                    )
-                } else {
-                    reused_source_ddl = source_ddl_was_read;
-                    rewrite_transfer_source_table_ddl(
-                        &source_ddl,
-                        &request.source_schema,
-                        &request.target_schema,
-                        source_db_type,
-                        target_db_type,
-                    )
-                }
-            } else {
-                generate_create_table_ddl_with_column_quoting(
-                    &columns,
-                    &target_table,
-                    &request.source_schema,
-                    &request.target_schema,
-                    target_db_type,
-                    source_db_type,
-                    table_comment.as_deref(),
-                    request.target_catalog.as_deref(),
-                    request.quote_target_column_names,
-                )
-            };
-            // MySQL-family targets: create the bare table first and add any foreign
-            // keys via ALTER TABLE afterward, instead of relying on inline
-            // `CREATE TABLE ... FOREIGN KEY` constraints. Inline FKs require every
-            // referenced table to already exist, which the dependency sort can't
-            // always guarantee (foreign key cycles have no valid creation order at
-            // all) — mirrors the same defer-FK-creation approach already used for
-            // Postgres transfers.
-            let mut ddl = ddl;
-            let mut deferred_fk_alters: Vec<String> = Vec::new();
-            if supports_deferred_mysql_foreign_keys(target_db_type) {
-                // Reuse the FK metadata `sort_tables_by_fk_dependency_with_foreign_keys`
-                // already fetched for the whole batch when the caller provided it;
-                // only fall back to a live query for callers that don't pre-fetch
-                // (tests, or a native-Postgres source where the sort path takes a
-                // different, cheaper route that doesn't build per-table FK lists).
-                let foreign_keys = if let Some(fks) = known_foreign_keys.get(table) {
-                    Ok(fks.clone())
-                } else {
-                    crate::schema::list_foreign_keys_core(
-                        state,
-                        &request.source_connection_id,
-                        &request.source_database,
-                        &request.source_schema,
-                        table,
-                    )
-                    .await
-                };
-                match foreign_keys {
-                    Ok(foreign_keys) if !foreign_keys.is_empty() => {
-                        ddl = strip_inline_foreign_key_constraint_lines(&ddl);
-                        deferred_fk_alters = generate_mysql_foreign_key_alter_statements(
-                            &foreign_keys,
-                            request,
-                            &target_table,
-                            target_db_type,
-                        );
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        log::warn!("[transfer] failed to inspect source foreign keys for {table}: {e}");
-                    }
-                }
-            }
-            log::info!("[transfer] creating target table: {}", ddl.chars().take(200).collect::<String>());
-            let target_table_created = transfer_create_table_created(
-                execute_transfer_create_table_ddl_on_pool(
-                    state,
-                    target_pool_key,
-                    &ddl,
-                    target_db_type,
-                    reused_source_ddl,
-                )
-                .await,
-                "Failed to create table",
-            )?;
-            if target_table_created {
-                pending_fk_alters
-                    .extend(deferred_fk_alters.into_iter().map(|statement| (target_table.clone(), statement)));
-                let comment_stmts = generate_comment_ddl_with_column_quoting(
-                    &columns,
-                    &target_table,
-                    &request.target_schema,
-                    target_db_type,
-                    table_comment.as_deref(),
-                    request.quote_target_column_names,
-                );
-                for stmt in &comment_stmts {
-                    if let Err(e) = execute_on_pool(state, target_pool_key, stmt).await {
-                        log::warn!("[transfer] failed to set column comment for {}: {}", target_table, e);
-                    }
-                }
-                bind_postgres_owned_sequences_for_transfer(
-                    state,
-                    request,
-                    &target_table,
-                    target_pool_key,
-                    &owned_sequences,
-                )
-                .await?;
-            } else {
-                // DDL may report the table already exists even when metadata
-                // lookup missed it (case/schema differences or localized errors).
-                target_table_preexisting = true;
-            }
-        }
+        create_transfer_target_table(
+            state,
+            request,
+            table,
+            &target_table,
+            source_db_type,
+            target_db_type,
+            source_pool_key,
+            target_pool_key,
+            known_foreign_keys,
+            pending_fk_alters,
+            &mut target_table_preexisting,
+            target_renamed_to_backup,
+            &columns,
+            table_comment.as_deref(),
+            pg_compat_transfer,
+            preserves_target_table_name,
+        )
+        .await?;
     }
 
     let should_restore_postgres_table_schema =
@@ -7718,7 +8646,11 @@ where
     // "skipping create-table DDL" above). If the untouched target structure
     // can't accept the planned insert, fail fast here instead of truncating
     // the target's existing data and then hitting an opaque driver error.
-    if request.create_table && target_table_preexisting {
+    //
+    // Skip this validation when drop_target_before_create is true: the original
+    // target table was renamed to a backup and a fresh table matching the source
+    // structure was just created, so structural incompatibility is not possible.
+    if request.create_table && target_table_preexisting && !request.drop_target_before_create {
         validate_preexisting_target_columns(
             &target_columns,
             &col_names,
@@ -7728,8 +8660,10 @@ where
         )?;
     }
 
-    // Truncate target if overwrite mode
-    if request.mode == TransferMode::Overwrite {
+    // Truncate target if overwrite mode (only when not rebuilding the table).
+    // When drop_target_before_create is true, the target table was just created
+    // and is already empty, so TRUNCATE is unnecessary.
+    if request.mode == TransferMode::Overwrite && !request.drop_target_before_create {
         let full_table =
             qualified_table(&target_table, &request.target_schema, target_db_type, request.target_catalog.as_deref());
         let truncate_sql = match target_db_type {
@@ -7777,6 +8711,13 @@ where
     let batch_size = if request.batch_size == 0 { 1000 } else { request.batch_size };
     let mut offset: u64 = 0;
     let mut total_transferred: u64 = 0;
+    // Keyset paging state: when the source can page by key cursor, each page
+    // seeks with `WHERE (pk...) > <cursor>` instead of OFFSET, which rescans
+    // and discards every previously read row (quadratic in table size). Falls
+    // back to OFFSET (keeping the same key ordering) when the key metadata
+    // does not hold up mid-table.
+    let mut keyset_indexes = transfer_keyset_column_indexes(&writable_columns, &primary_key_columns, source_db_type);
+    let mut keyset_cursor: Vec<serde_json::Value> = Vec::new();
     // A single Agent cursor keeps Kyuubi/Impala rows in one query execution.
     // Re-running LIMIT/OFFSET pages is unstable for tables without a unique key.
     let use_hive_server_cursor = matches!(source_db_type, DatabaseType::Kyuubi | DatabaseType::Impala);
@@ -7811,16 +8752,28 @@ where
                     false,
                 )
             } else {
-                let sql = pagination_sql_with_order(
-                    &col_names,
-                    table,
-                    &request.source_schema,
-                    source_db_type,
-                    offset,
-                    batch_size,
-                    &primary_key_columns,
-                    request.source_catalog.as_deref(),
-                );
+                let sql = if keyset_indexes.is_some() {
+                    keyset_pagination_sql(
+                        &col_names,
+                        table,
+                        &request.source_schema,
+                        source_db_type,
+                        &primary_key_columns,
+                        &keyset_cursor,
+                        batch_size,
+                    )
+                } else {
+                    pagination_sql_with_order(
+                        &col_names,
+                        table,
+                        &request.source_schema,
+                        source_db_type,
+                        offset,
+                        batch_size,
+                        &primary_key_columns,
+                        request.source_catalog.as_deref(),
+                    )
+                };
                 let (sql, mysql_spatial_markers) =
                     mysql_spatial_transfer_select_sql(sql, &col_names, &col_types, source_db_type, target_db_type);
                 (execute_on_pool(state, source_pool_key, &sql).await?, mysql_spatial_markers)
@@ -7830,6 +8783,19 @@ where
 
             if row_count == 0 {
                 break;
+            }
+
+            if let Some(indexes) = keyset_indexes.as_deref() {
+                match advance_keyset_cursor(&mut keyset_cursor, &result.rows, indexes, table)? {
+                    KeysetAdvance::Advanced => {}
+                    KeysetAdvance::FallBackToOffset => {
+                        log::warn!(
+                            "[transfer] {table}: NULL value in a key column at row {offset}; \
+                             falling back to OFFSET paging for the remaining rows"
+                        );
+                        keyset_indexes = None;
+                    }
+                }
             }
 
             let write_statements = generate_transfer_write_sql_batches_with_column_quoting(
@@ -7924,8 +8890,301 @@ where
     Ok(total_transferred)
 }
 
+/// Free the constraint names the backups are still holding (MySQL family).
+///
+/// MySQL constraint names are unique per database. The rebuilt tables re-create their
+/// foreign keys under the source constraint names through the deferred `ADD CONSTRAINT`
+/// statements, but every backup still holds a constraint with that exact name — the
+/// rename pre-pass moves tables, not constraint names. Each backup constraint is
+/// atomically replaced (single `ALTER` statement) with a derived backup name, keeping
+/// the referenced table — already redirected to the referenced backup by the rename —
+/// and the ON UPDATE/DELETE rules intact.
+///
+/// No-op for non-MySQL targets (constraint names are per-table there) and for pools the
+/// MySQL metadata reader cannot reach.
+pub async fn free_backup_foreign_key_names(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    target_db_type: DatabaseType,
+    target_pool_key: &str,
+    backup_names: &HashMap<String, String>,
+) -> Result<(), String> {
+    if backup_names.is_empty() || !supports_deferred_mysql_foreign_keys(&target_db_type) {
+        return Ok(());
+    }
+    let pool = {
+        let pool_handle = state.pool_handle(target_pool_key).await;
+        match pool_handle.as_ref() {
+            Some(PoolKind::Mysql(pool, _)) => pool.clone(),
+            _ => return Ok(()),
+        }
+    };
+    for backup_table in backup_names.values() {
+        if is_cancelled(&request.transfer_id).await {
+            return Err("Cancelled".to_string());
+        }
+        let foreign_keys = db::mysql::list_foreign_keys(&pool, &request.target_database, backup_table).await?;
+        for (name, group) in group_foreign_keys_by_constraint_name(&foreign_keys) {
+            if name.contains(crate::transfer_rebuild::BACKUP_TABLE_MARKER) {
+                // Already freed by an earlier attempt; re-reading metadata after a
+                // partial success must not try to free the derived name again.
+                continue;
+            }
+            let new_name = crate::transfer_rebuild::backup_table_name(
+                target_db_type,
+                &request.transfer_id,
+                &format!("{}{}#constraint:{}", request.source_schema, backup_table, name),
+                name,
+            )?;
+            let columns = group
+                .iter()
+                .map(|foreign_key| quote_identifier(&foreign_key.column, &target_db_type))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let ref_columns = group
+                .iter()
+                .map(|foreign_key| quote_identifier(&foreign_key.ref_column, &target_db_type))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let referenced_table = match group[0].ref_schema.as_deref() {
+                // Same-database reference: after the rename the referenced name already
+                // points at the referenced table's backup, so keep it as-is.
+                Some(ref_schema) if ref_schema == request.target_database => {
+                    quote_identifier(&group[0].ref_table, &target_db_type)
+                }
+                // Cross-database reference: nothing in this transfer renamed it.
+                Some(ref_schema) => {
+                    format!(
+                        "{}.{}",
+                        quote_identifier(ref_schema, &target_db_type),
+                        quote_identifier(&group[0].ref_table, &target_db_type)
+                    )
+                }
+                None => quote_identifier(&group[0].ref_table, &target_db_type),
+            };
+            let mut statement = format!(
+                "ALTER TABLE {} DROP FOREIGN KEY {}, ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+                quote_identifier(backup_table, &target_db_type),
+                quote_identifier(name, &target_db_type),
+                quote_identifier(&new_name, &target_db_type),
+                columns,
+                referenced_table,
+                ref_columns,
+            );
+            if let Some(on_delete) = group[0].on_delete.as_deref() {
+                statement.push_str(&format!(" ON DELETE {on_delete}"));
+            }
+            if let Some(on_update) = group[0].on_update.as_deref() {
+                statement.push_str(&format!(" ON UPDATE {on_update}"));
+            }
+            execute_on_pool(state, target_pool_key, &statement).await.map_err(|e| {
+                format!("Failed to free constraint name '{name}' on backup table '{backup_table}': {e}")
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Drop every foreign key constraint the backup tables still hold.
+///
+/// The rename pre-pass can move a foreign key cycle into the backup set, and a cycle has
+/// no valid sequential `DROP TABLE` order at all. Dropping the constraints on the backups
+/// breaks only backup-to-backup edges: the rebuilt tables' restored constraints and every
+/// external table are untouched. Individual failures are logged and skipped — the
+/// following drop loop reports the tables it could not remove.
+async fn break_backup_foreign_key_graph(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    target_db_type: DatabaseType,
+    target_pool_key: &str,
+    backup_names: &HashMap<String, String>,
+) {
+    // MySQL family: constraint names were already freed by [`free_backup_foreign_key_names`]
+    // when it ran; this re-lists whatever constraints remain (including renamed ones) and
+    // drops them outright, because the tables themselves are about to be dropped.
+    let mysql_pool = {
+        let pool_handle = state.pool_handle(target_pool_key).await;
+        match pool_handle.as_ref() {
+            Some(PoolKind::Mysql(pool, _)) => Some(pool.clone()),
+            _ => None,
+        }
+    };
+    let postgres_family = is_postgres_family_target(&target_db_type);
+    for backup_table in backup_names.values() {
+        if is_cancelled(&request.transfer_id).await {
+            return;
+        }
+        if let Some(pool) = &mysql_pool {
+            match db::mysql::list_foreign_keys(pool, &request.target_database, backup_table).await {
+                Ok(foreign_keys) => {
+                    for name in foreign_keys.iter().map(|fk| fk.name.as_str()).collect::<Vec<_>>() {
+                        let drop_fk = format!(
+                            "ALTER TABLE {} DROP FOREIGN KEY {}",
+                            quote_identifier(backup_table, &target_db_type),
+                            quote_identifier(name, &target_db_type)
+                        );
+                        if let Err(error) = execute_on_pool(state, target_pool_key, &drop_fk).await {
+                            log::warn!(
+                                "[transfer] failed to drop foreign key {name} on backup {backup_table}: {error}"
+                            );
+                        }
+                    }
+                }
+                Err(error) => log::warn!("[transfer] failed to list foreign keys on backup {backup_table}: {error}"),
+            }
+        } else if postgres_family {
+            let foreign_keys = match get_postgres_foreign_keys_for_transfer(
+                state,
+                target_pool_key,
+                &request.target_database,
+                &request.target_schema,
+                backup_table,
+            )
+            .await
+            {
+                Ok(foreign_keys) => foreign_keys,
+                Err(error) => {
+                    log::warn!("[transfer] failed to list foreign keys on backup {backup_table}: {error}");
+                    continue;
+                }
+            };
+            for name in foreign_keys.iter().map(|fk| fk.name.as_str()).collect::<Vec<_>>() {
+                let drop_fk = format!(
+                    "ALTER TABLE {} DROP CONSTRAINT {}",
+                    qualified_table(
+                        backup_table,
+                        &request.target_schema,
+                        &target_db_type,
+                        request.target_catalog.as_deref()
+                    ),
+                    quote_identifier(name, &target_db_type)
+                );
+                if let Err(error) = execute_on_pool(state, target_pool_key, &drop_fk).await {
+                    log::warn!(
+                        "[transfer] failed to drop foreign key constraint {name} on backup {backup_table}: {error}"
+                    );
+                }
+            }
+        } else if target_db_type == DatabaseType::SqlServer {
+            let sqlserver_client = {
+                let pool_handle = state.pool_handle(target_pool_key).await;
+                match pool_handle.as_ref() {
+                    Some(PoolKind::SqlServer(client)) => Some(client.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(client) = &sqlserver_client {
+                // Collect the foreign-key names while holding the client lock, then drop it
+                // before executing the ALTERs through `execute_on_pool` (which re-acquires it).
+                let foreign_keys = {
+                    let mut client = client.lock().await;
+                    match db::sqlserver::list_foreign_keys(&mut client, &request.target_schema, backup_table).await {
+                        Ok(foreign_keys) => foreign_keys,
+                        Err(error) => {
+                            log::warn!("[transfer] failed to list foreign keys on backup {backup_table}: {error}");
+                            continue;
+                        }
+                    }
+                };
+                for name in foreign_keys.iter().map(|fk| fk.name.as_str()).collect::<Vec<_>>() {
+                    let drop_fk = format!(
+                        "ALTER TABLE {} DROP CONSTRAINT {}",
+                        qualified_table(
+                            backup_table,
+                            &request.target_schema,
+                            &target_db_type,
+                            request.target_catalog.as_deref()
+                        ),
+                        quote_identifier(name, &target_db_type)
+                    );
+                    if let Err(error) = execute_on_pool(state, target_pool_key, &drop_fk).await {
+                        log::warn!(
+                            "[transfer] failed to drop foreign key constraint {name} on backup {backup_table}: {error}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Drop the backups left behind by [`rename_tables_to_backup`].
+///
+/// Two ordering rules make this a post-loop step rather than per-table cleanup, and neither
+/// shows up until a foreign key connects two selected tables:
+///
+/// - A backup can still be referenced by another backup. Renaming children first keeps each
+///   pair consistent, which also means `DROP TABLE parent_bak` fails while `child_bak` exists.
+///   So the drops run children first — and the backup-to-backup foreign key graph is broken
+///   first, because a foreign key cycle among the backups has no valid drop order at all.
+/// - The backups must be gone before the transfer reports success, but only after the
+///   deferred foreign key ALTERs and the selected schema objects have been restored: on
+///   MySQL the rebuilt tables cannot take over the source constraint names until
+///   [`free_backup_foreign_key_names`] has freed them from the backups.
+///
+/// `drop_order` is the children-first list handed to the rename pre-pass. A backup whose table
+/// is missing from it is still dropped, in name order, so none can leak.
+pub async fn drop_backup_tables(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    target_db_type: DatabaseType,
+    target_pool_key: &str,
+    backup_names: &HashMap<String, String>,
+    drop_order: &[String],
+) -> Result<(), String> {
+    let mut ordered: Vec<&String> = drop_order.iter().filter(|table| backup_names.contains_key(*table)).collect();
+    let mut leftovers: Vec<&String> = backup_names.keys().filter(|table| !drop_order.contains(*table)).collect();
+    leftovers.sort();
+    ordered.extend(leftovers);
+
+    break_backup_foreign_key_graph(state, request, target_db_type, target_pool_key, backup_names).await;
+
+    let mut retained: Vec<String> = Vec::new();
+    for table in ordered {
+        let Some(backup_name) = backup_names.get(table) else {
+            continue;
+        };
+        let drop_sql = crate::db_admin_sql::build_drop_table_sql(crate::db_admin_sql::TableAdminSqlOptions {
+            database_type: Some(target_db_type),
+            schema: if request.target_schema.is_empty() { None } else { Some(request.target_schema.clone()) },
+            table_name: backup_name.clone(),
+            // Rendered for the PostgreSQL family only — `build_drop_table_sql` drops the
+            // keyword everywhere else. The backup-to-backup foreign key graph has already
+            // been broken explicitly, so CASCADE is a narrow safety net for objects that
+            // metadata could not see, not the mechanism the cleanup relies on.
+            cascade: Some(true),
+            identifier_quote: None,
+        });
+        match execute_on_pool(state, target_pool_key, &drop_sql).await {
+            Ok(_) => log::info!("[transfer] dropped backup table {backup_name}"),
+            Err(error) => {
+                log::error!("[transfer] failed to drop backup table {backup_name}: {error}");
+                retained.push(format!("{backup_name} ({error})"));
+            }
+        }
+    }
+
+    if retained.is_empty() {
+        // The whole rebuild — backups, renamed objects, cleanup — succeeded. The recovery
+        // journal has nothing left to describe.
+        if let Err(error) = crate::transfer_rebuild::complete_rebuild_journal(state, &request.transfer_id).await {
+            log::warn!("[transfer] failed to remove the rebuild recovery journal: {error}");
+        }
+        return Ok(());
+    }
+    Err(format!(
+        "Transfer completed, but {} backup table(s) could not be dropped and still occupy space: {}. \
+         Remove them manually to finish cleanup.",
+        retained.len(),
+        retained.join(", ")
+    ))
+}
+
 /// Transfer one table on its own Tokio task so the large transfer future and
 /// nested driver metadata futures do not share a single worker stack.
+///
+/// Pass the [`rename_tables_to_backup`] result as `preexisting_backup_names` whenever
+/// `drop_target_before_create` is set; the transfer errors out without it.
 #[allow(clippy::too_many_arguments)]
 pub async fn transfer_table<F>(
     state: &Arc<AppState>,
@@ -7938,6 +9197,7 @@ pub async fn transfer_table<F>(
     target_pool_key: &str,
     known_foreign_keys: &HashMap<String, Vec<db::ForeignKeyInfo>>,
     pending_fk_alters: &mut Vec<(String, String)>,
+    preexisting_backup_names: Option<&HashMap<String, String>>,
     mut progress_callback: F,
 ) -> Result<u64, String>
 where
@@ -7954,6 +9214,15 @@ where
         .get(&table)
         .map(|foreign_keys| HashMap::from([(table.clone(), foreign_keys.clone())]))
         .unwrap_or_default();
+    let preexisting_backup_names = preexisting_backup_names.cloned();
+    // Kept outside the spawned task: `request` moves into it, and the error path below
+    // still needs the backup's qualified name to point the user at their data.
+    let backup_for_this_table = request
+        .drop_target_before_create
+        .then(|| preexisting_backup_names.as_ref().and_then(|names| names.get(&table).cloned()))
+        .flatten();
+    let request_target_schema = request.target_schema.clone();
+    let request_target_catalog = request.target_catalog.clone();
     let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(TRANSFER_PROGRESS_CHANNEL_CAPACITY);
 
     let mut task = tokio::spawn(async move {
@@ -7969,6 +9238,7 @@ where
             &target_pool_key,
             &known_foreign_keys,
             &mut task_pending_fk_alters,
+            preexisting_backup_names.as_ref(),
             move |progress| {
                 try_send_transfer_progress(&progress_tx, progress);
             },
@@ -7986,7 +9256,20 @@ where
                 let (result, task_pending_fk_alters) =
                     result.map_err(|error| format!("Transfer table task failed: {error}"))?;
                 pending_fk_alters.extend(task_pending_fk_alters);
-                return result;
+                // Every failure past the rename pre-pass leaves the original table under its
+                // backup name. This is the last place that still holds the name, so the note
+                // is attached here rather than at each of the inner `?` sites. Cancellation
+                // keeps its exact discriminator: the callers match on the bare "Cancelled"
+                // string to render a cancelled (not failed) terminal progress event.
+                return match (result, backup_for_this_table.as_deref()) {
+                    (Err(error), Some(backup_name)) if error != "Cancelled" => {
+                        Err(crate::transfer_rebuild::annotate_error_with_retained_backup(
+                            error,
+                            &qualified_table(backup_name, &request_target_schema, &target_db_type, request_target_catalog.as_deref()),
+                        ))
+                    }
+                    (result, _) => result,
+                };
             }
         }
     }
@@ -8028,7 +9311,11 @@ where
         get_postgres_extension_sources_for_transfer(state, source_pool_key, &request.source_schema).await?;
     let enum_types = get_postgres_enum_sources_for_transfer(state, source_pool_key, &request.source_schema).await?;
     let domains = get_postgres_domain_sources_for_transfer(state, source_pool_key, &request.source_schema).await?;
-    let selected_sequence_names = selected_postgres_sequence_names(request);
+    let selected_sequence_names = if request.objects.is_empty() {
+        get_postgres_sequence_names_for_transfer(state, source_pool_key, &request.source_schema).await?
+    } else {
+        selected_postgres_sequence_names(request)
+    };
     let selected_sequences = get_postgres_selected_sequences_for_transfer(
         state,
         source_pool_key,
@@ -8483,6 +9770,14 @@ where
 mod tests {
     use super::*;
 
+    #[test]
+    fn transfer_query_timeout_errors_are_classified() {
+        assert!(is_transfer_query_timeout("Query timed out after 1 seconds"));
+        assert!(is_transfer_query_timeout("查询超时 (1s)"));
+        assert!(is_transfer_query_timeout("查詢逾時 (1s)"));
+        assert!(!is_transfer_query_timeout("Connection timed out while loading tables"));
+    }
+
     fn jdbc_transfer_config(connection_string: &str, driver_class: &str, profile: &str) -> ConnectionConfig {
         ConnectionConfig {
             id: "test-jdbc".to_string(),
@@ -8529,6 +9824,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -8636,6 +9932,30 @@ mod tests {
         );
     }
 
+    /// The rename pre-pass of `drop_target_before_create` consumes the `parents_first =
+    /// false` order, and a foreign key cycle has no such order. Cycle members must still
+    /// come out — appended in their original order — because dropping them would silently
+    /// leave those tables un-renamed and the main pass would append into the old table.
+    #[test]
+    fn table_dependency_sort_keeps_cycle_members_instead_of_dropping_them() {
+        let tables = vec!["employees".to_string(), "departments".to_string(), "regions".to_string()];
+        // employees <-> departments is a cycle; regions is free of foreign keys.
+        let dependencies = vec![
+            ("employees".to_string(), "departments".to_string()),
+            ("departments".to_string(), "employees".to_string()),
+        ];
+
+        for parents_first in [true, false] {
+            let sorted = sort_table_names_by_dependencies(&tables, &dependencies, parents_first);
+            assert_eq!(sorted.len(), tables.len(), "cycle members were dropped (parents_first={parents_first})");
+            assert_eq!(
+                sorted,
+                vec!["regions".to_string(), "employees".to_string(), "departments".to_string()],
+                "the acyclic table sorts first, then the cycle in input order (parents_first={parents_first})"
+            );
+        }
+    }
+
     #[test]
     fn table_dependency_sort_ignores_duplicates_and_out_of_scope_tables() {
         let tables = vec!["orders".to_string(), "users".to_string(), "logs".to_string()];
@@ -8663,6 +9983,97 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let storage = crate::storage::Storage::open(&dir.join("storage.db")).await.unwrap();
         (AppState::new(storage), dir)
+    }
+
+    async fn spawn_influxdb3_transfer_server() -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 2048];
+                let bytes_read = socket.read(&mut chunk).await.unwrap();
+                assert!(bytes_read > 0, "request ended before headers were complete");
+                request.extend_from_slice(&chunk[..bytes_read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 2048];
+                let bytes_read = socket.read(&mut chunk).await.unwrap();
+                assert!(bytes_read > 0, "request ended before body was complete");
+                request.extend_from_slice(&chunk[..bytes_read]);
+            }
+            let body = r#"[{"time":"2026-09-03T00:00:00Z","value":42}]"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn transfer_read_dispatches_influxdb3_with_database_and_row_limit() {
+        let (base_url, server) = spawn_influxdb3_transfer_server().await;
+        let (state, dir) = test_app_state().await;
+        let config: ConnectionConfig = serde_json::from_value(json!({
+            "id": "influxdb3-transfer",
+            "name": "InfluxDB 3 transfer",
+            "db_type": "influxdb3",
+            "host": "127.0.0.1",
+            "port": 8181,
+            "username": "",
+            "password": "",
+            "database": "metrics"
+        }))
+        .unwrap();
+        let client = db::influxdb3_driver::Influxdb3Client::new_for_config(
+            &base_url,
+            &config,
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        state.configs.write().await.insert(config.id.clone(), config);
+        state
+            .update_connection_pools(|connections| {
+                connections.insert("influxdb3-transfer:metrics".to_string(), PoolKind::InfluxDb3(client));
+            })
+            .await;
+
+        let result = execute_read_on_pool_with_max_rows(
+            &state,
+            "influxdb3-transfer:metrics",
+            "SELECT value FROM weather",
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("InfluxDB 3 transfer server did not receive a request")
+            .unwrap();
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+
+        assert_eq!(payload["db"], json!("metrics"));
+        assert_eq!(payload["q"], json!("SELECT value FROM weather LIMIT 2"));
+        assert_eq!(result.affected_rows, 1);
     }
 
     #[tokio::test]
@@ -8743,6 +10154,8 @@ mod tests {
             quote_target_column_names: true,
             ownership_policy: TransferOwnershipPolicy::Preserve,
             batch_size: 1000,
+            drop_target_before_create: false,
+            drop_target_confirmed: false,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["content"], "structureOnly");
@@ -8818,6 +10231,8 @@ mod tests {
                 batch_size: 1000,
                 content: TransferContent::DataOnly,
                 objects: Vec::new(),
+                drop_target_before_create: false,
+                drop_target_confirmed: false,
             };
             assert!(validate_transfer_request(&base).is_ok());
 
@@ -8833,6 +10248,56 @@ mod tests {
 
             let structure_only = TransferRequest { content: TransferContent::StructureOnly, ..base.clone() };
             assert!(validate_transfer_request(&structure_only).is_ok());
+        }
+
+        #[test]
+        fn rejects_drop_target_before_create_with_data_only() {
+            let base = TransferRequest {
+                transfer_id: "t".into(),
+                source_connection_id: "s".into(),
+                source_database: "db".into(),
+                source_schema: "public".into(),
+                source_catalog: None,
+                target_connection_id: "t".into(),
+                target_database: "db".into(),
+                target_schema: "public".into(),
+                target_catalog: None,
+                tables: vec!["orders".into()],
+                create_table: true,
+                mode: TransferMode::Append,
+                target_table_name_case: TransferTableNameCase::Preserve,
+                quote_target_column_names: true,
+                ownership_policy: TransferOwnershipPolicy::Preserve,
+                batch_size: 1000,
+                content: TransferContent::StructureAndData,
+                objects: Vec::new(),
+                drop_target_before_create: false,
+                drop_target_confirmed: false,
+            };
+
+            // drop_target_before_create=false → valid
+            assert!(validate_transfer_request(&base).is_ok());
+
+            // drop_target_before_create=true + StructureAndData → valid
+            let with_drop = TransferRequest { drop_target_before_create: true, ..base.clone() };
+            assert!(validate_transfer_request(&with_drop).is_ok());
+
+            // drop_target_before_create=true + StructureOnly → valid
+            let structure_only = TransferRequest {
+                content: TransferContent::StructureOnly,
+                drop_target_before_create: true,
+                ..base.clone()
+            };
+            assert!(validate_transfer_request(&structure_only).is_ok());
+
+            // drop_target_before_create=true + DataOnly → error
+            let data_only =
+                TransferRequest { content: TransferContent::DataOnly, drop_target_before_create: true, ..base.clone() };
+            let err = validate_transfer_request(&data_only).unwrap_err();
+            assert!(
+                err.contains("drop_target_before_create") && err.contains("DataOnly"),
+                "expected error to mention drop_target_before_create and DataOnly, got: {err}"
+            );
         }
     }
 
@@ -9698,6 +11163,30 @@ mod tests {
             assert!(legacy.contains("'FUNCTION'"));
             assert!(legacy.contains("NOT p.proisagg"));
             assert!(legacy.contains("NOT p.proiswindow"));
+
+            for sql in [modern, legacy] {
+                assert!(sql.contains("JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid"));
+                assert!(sql.contains("d.classid = 'pg_catalog.pg_proc'::regclass"));
+                assert!(sql.contains("d.objid = p.oid"));
+                assert!(sql.contains("d.refclassid = 'pg_catalog.pg_extension'::regclass"));
+                assert!(sql.contains("d.deptype = 'e'"));
+                assert!(sql.contains("e.extnamespace = n.oid"));
+            }
+        }
+
+        #[test]
+        fn postgres_transfer_relation_sources_exclude_extension_members() {
+            for relkind in ['v', 'm'] {
+                let sql = postgres_transfer_relation_sources_sql("public", relkind);
+
+                assert!(sql.contains(&format!("c.relkind = '{relkind}'")));
+                assert!(sql.contains("JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid"));
+                assert!(sql.contains("d.classid = 'pg_catalog.pg_class'::regclass"));
+                assert!(sql.contains("d.objid = c.oid"));
+                assert!(sql.contains("d.refclassid = 'pg_catalog.pg_extension'::regclass"));
+                assert!(sql.contains("d.deptype = 'e'"));
+                assert!(sql.contains("e.extnamespace = n.oid"));
+            }
         }
 
         #[test]
@@ -9798,6 +11287,7 @@ mod tests {
                 cycle: true,
                 cache_value: "7".into(),
                 last_value: Some("41".into()),
+                is_called: Some(true),
             };
 
             assert_eq!(
@@ -9807,6 +11297,12 @@ mod tests {
             assert_eq!(
                 generate_postgres_transfer_sequence_setval_sql(&sequence, "archive"),
                 Some("SELECT setval('\"archive\".\"biz_banner_id_seq\"', 41, true)".into())
+            );
+
+            let not_called = PostgresTransferSequence { is_called: Some(false), ..sequence.clone() };
+            assert_eq!(
+                generate_postgres_transfer_sequence_setval_sql(&not_called, "archive"),
+                Some("SELECT setval('\"archive\".\"biz_banner_id_seq\"', 41, false)".into())
             );
 
             let never_called = PostgresTransferSequence { last_value: None, ..sequence };
@@ -9844,6 +11340,8 @@ mod tests {
             quote_target_column_names: true,
             ownership_policy: TransferOwnershipPolicy::Preserve,
             batch_size: 1000,
+            drop_target_before_create: false,
+            drop_target_confirmed: false,
         }
     }
 
@@ -10461,16 +11959,20 @@ mod tests {
     #[test]
     fn postgres_comment_ddl_generates_column_and_table_comments() {
         let cols = vec![
-            db::ColumnInfo { comment: Some("主键".to_string()), ..test_column("id", "int") },
+            db::ColumnInfo { comment: Some(" 主键's ".to_string()), ..test_column("id", "int") },
             db::ColumnInfo { comment: Some("名称".to_string()), ..test_column("name", "varchar(100)") },
         ];
 
-        let stmts = generate_comment_ddl(&cols, "items", "public", &DatabaseType::Postgres, Some("项目表"));
+        let stmts = generate_comment_ddl(&cols, "items", "public", &DatabaseType::Postgres, Some(" 项目表 "));
 
-        assert_eq!(stmts.len(), 3);
-        assert!(stmts[0].contains("COMMENT ON TABLE \"public\".\"items\" IS '项目表'"));
-        assert!(stmts[1].contains("COMMENT ON COLUMN \"public\".\"items\".\"id\" IS '主键'"));
-        assert!(stmts[2].contains("COMMENT ON COLUMN \"public\".\"items\".\"name\" IS '名称'"));
+        assert_eq!(
+            stmts,
+            vec![
+                "COMMENT ON TABLE \"public\".\"items\" IS ' 项目表 '".to_string(),
+                "COMMENT ON COLUMN \"public\".\"items\".\"id\" IS ' 主键''s '".to_string(),
+                "COMMENT ON COLUMN \"public\".\"items\".\"name\" IS '名称'".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -10500,6 +12002,46 @@ mod tests {
         ];
 
         let stmts = generate_comment_ddl(&cols, "items", "public", &DatabaseType::Kingbase, Some("  "));
+
+        assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn dameng_comment_ddl_generates_column_and_table_comments() {
+        let cols = vec![
+            db::ColumnInfo { comment: Some("主键's".to_string()), ..test_column("id", "int") },
+            db::ColumnInfo { comment: Some("名称".to_string()), ..test_column("name", "varchar(100)") },
+        ];
+
+        let stmts = generate_comment_ddl(&cols, "items", "APP", &DatabaseType::Dameng, Some("项目表"));
+
+        assert_eq!(
+            stmts,
+            vec![
+                "COMMENT ON TABLE \"APP\".\"items\" IS '项目表'".to_string(),
+                "COMMENT ON COLUMN \"APP\".\"items\".\"id\" IS '主键''s'".to_string(),
+                "COMMENT ON COLUMN \"APP\".\"items\".\"name\" IS '名称'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dameng_comment_ddl_skips_empty_comments() {
+        let cols = vec![
+            db::ColumnInfo { comment: None, ..test_column("id", "int") },
+            db::ColumnInfo { comment: Some("  ".to_string()), ..test_column("name", "varchar(100)") },
+        ];
+
+        let stmts = generate_comment_ddl(&cols, "items", "APP", &DatabaseType::Dameng, Some("  "));
+
+        assert!(stmts.is_empty());
+    }
+
+    #[test]
+    fn mysql_comment_ddl_stays_empty_inline_only() {
+        let cols = vec![db::ColumnInfo { comment: Some("主键".to_string()), ..test_column("id", "int") }];
+
+        let stmts = generate_comment_ddl(&cols, "items", "db", &DatabaseType::Mysql, Some("项目表"));
 
         assert!(stmts.is_empty());
     }
@@ -11553,6 +13095,123 @@ mod tests {
     }
 
     #[test]
+    fn keyset_column_indexes_require_keyset_capable_dialect() {
+        let columns = vec![db::ColumnInfo {
+            name: "id".to_string(),
+            data_type: "integer".to_string(),
+            is_primary_key: true,
+            ..Default::default()
+        }];
+        let pks = vec!["id".to_string()];
+
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Postgres), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::OpenGauss), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Gaussdb), Some(vec![0]));
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Kingbase), Some(vec![0]));
+        // Dialects whose cursor literal rendering is not audited keep OFFSET paging.
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Mysql), None);
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::SqlServer), None);
+        // No primary key → no keyset cursor.
+        assert_eq!(transfer_keyset_column_indexes(&columns, &[], &DatabaseType::Postgres), None);
+    }
+
+    #[test]
+    fn keyset_column_indexes_require_selected_round_trippable_key_columns() {
+        let columns = vec![
+            db::ColumnInfo { name: "payload".to_string(), data_type: "jsonb".to_string(), ..Default::default() },
+            db::ColumnInfo {
+                name: "id".to_string(),
+                data_type: "bigint".to_string(),
+                is_primary_key: true,
+                ..Default::default()
+            },
+        ];
+        let pks = vec!["id".to_string()];
+
+        // The key column may sit anywhere in the selected column list.
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Postgres), Some(vec![1]));
+
+        // A key column that is not selected (e.g. a generated-always identity
+        // excluded from the writable columns) cannot be read back from a page.
+        assert_eq!(transfer_keyset_column_indexes(&columns, &["missing".to_string()], &DatabaseType::Postgres), None);
+
+        // Key types that do not round-trip through a text literal keep OFFSET paging.
+        let columns = vec![db::ColumnInfo {
+            name: "id".to_string(),
+            data_type: "bytea".to_string(),
+            is_primary_key: true,
+            ..Default::default()
+        }];
+        assert_eq!(transfer_keyset_column_indexes(&columns, &pks, &DatabaseType::Postgres), None);
+    }
+
+    #[test]
+    fn postgres_keyset_column_type_support() {
+        for supported in [
+            "integer",
+            "int4",
+            "bigint",
+            "smallint",
+            "bigserial",
+            "numeric(10, 2)",
+            "decimal",
+            "real",
+            "double precision",
+            "float8",
+            "text",
+            "character varying(255)",
+            "bpchar",
+            "name",
+            "boolean",
+            "date",
+            "timestamp without time zone",
+            "timestamptz",
+            "time with time zone",
+            "uuid",
+        ] {
+            assert!(postgres_keyset_column_type_supported(supported), "{supported}");
+        }
+        for unsupported in
+            ["integer[]", "bytea", "interval", "money", "jsonb", "inet", "int4range", "numrange", "bit", ""]
+        {
+            assert!(!postgres_keyset_column_type_supported(unsupported), "{unsupported}");
+        }
+    }
+
+    #[test]
+    fn keyset_cursor_reads_key_values_from_last_row() {
+        let rows = vec![vec![json!(1), json!("a")], vec![json!(2), json!("b")]];
+
+        assert_eq!(keyset_cursor_from_last_row(&rows, &[0]), Some(vec![json!(2)]));
+        assert_eq!(keyset_cursor_from_last_row(&rows, &[1]), Some(vec![json!("b")]));
+        assert_eq!(keyset_cursor_from_last_row(&rows, &[0, 1]), Some(vec![json!(2), json!("b")]));
+        // Missing column index reads as NULL → no keyset cursor.
+        assert_eq!(keyset_cursor_from_last_row(&rows, &[5]), None);
+        assert_eq!(keyset_cursor_from_last_row(&Vec::new(), &[0]), None);
+        let null_rows = vec![vec![json!(1), serde_json::Value::Null]];
+        assert_eq!(keyset_cursor_from_last_row(&null_rows, &[1]), None);
+    }
+
+    #[test]
+    fn advance_keyset_cursor_detects_stall_and_null_fallback() {
+        let mut cursor = Vec::new();
+        let rows = vec![vec![json!(1)], vec![json!(2)]];
+
+        assert!(matches!(advance_keyset_cursor(&mut cursor, &rows, &[0], "t"), Ok(KeysetAdvance::Advanced)));
+        assert_eq!(cursor, vec![json!(2)]);
+        // Re-reading the same page must fail instead of looping forever.
+        assert!(advance_keyset_cursor(&mut cursor, &rows, &[0], "t").is_err());
+        // NULL keys degrade to OFFSET paging.
+        let null_rows = vec![vec![serde_json::Value::Null]];
+        assert!(matches!(
+            advance_keyset_cursor(&mut cursor, &null_rows, &[0], "t"),
+            Ok(KeysetAdvance::FallBackToOffset)
+        ));
+        // Empty pages leave the cursor untouched.
+        assert!(matches!(advance_keyset_cursor(&mut cursor, &Vec::new(), &[0], "t"), Ok(KeysetAdvance::Advanced)));
+    }
+
+    #[test]
     fn postgres_generates_index_and_foreign_key_sql() {
         let indexes = vec![db::IndexInfo {
             name: "users_name_idx".to_string(),
@@ -11563,7 +13222,10 @@ mod tests {
             index_type: Some("btree".to_string()),
             included_columns: Some(vec!["created_at".to_string()]),
             comment: Some("lookup index".to_string()),
-            key_is_expression: Vec::new(),
+            key_is_expression: vec![true],
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
         }];
         let foreign_keys = vec![
             db::ForeignKeyInfo {
@@ -11601,6 +13263,194 @@ mod tests {
             vec![
                 "ALTER TABLE \"archive\".\"orders\" ADD CONSTRAINT \"orders_user_id_fkey\" FOREIGN KEY (\"user_id\", \"tenant_id\") REFERENCES \"archive\".\"users\" (\"id\", \"tenant_id\")".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn postgres_index_ddl_includes_opclass_for_gin_trigram() {
+        let indexes = vec![db::IndexInfo {
+            name: "users_name_trgm_idx".to_string(),
+            columns: vec!["name".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: Some("gin".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![false],
+            column_opclasses: vec![Some("gin_trgm_ops".to_string())],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }];
+
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX IF NOT EXISTS \"users_name_trgm_idx\" ON \"public\".\"users\" USING gin (\"name\" gin_trgm_ops)".to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_index_ddl_no_opclass_when_all_default() {
+        let indexes = vec![db::IndexInfo {
+            name: "users_name_idx".to_string(),
+            columns: vec!["name".to_string(), "status".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: None,
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![false, false],
+            column_opclasses: vec![None, None],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }];
+
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX IF NOT EXISTS \"users_name_idx\" ON \"public\".\"users\" (\"name\", \"status\")"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_index_ddl_expression_appends_opclass() {
+        // The per-column `pg_get_indexdef(indexrelid, colno, pretty)` returns only the
+        // bare expression (PostgreSQL sets `attrsOnly = (colno != 0)`, so the opclass
+        // block is skipped — see `ruleutils.c`). The opclass is read separately from
+        // `indclass` into `column_opclasses`, so transfer DDL must append it to an
+        // expression key just like a real column.
+        let indexes = vec![db::IndexInfo {
+            name: "users_lower_email_idx".to_string(),
+            columns: vec!["lower(email)".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: Some("gin".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![true],
+            column_opclasses: vec![Some("gin_trgm_ops".to_string())],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }];
+
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX IF NOT EXISTS \"users_lower_email_idx\" ON \"public\".\"users\" USING gin (lower(email) gin_trgm_ops)"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_index_ddl_mixed_opclass_and_default() {
+        let indexes = vec![db::IndexInfo {
+            name: "users_name_status_idx".to_string(),
+            columns: vec!["name".to_string(), "status".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: Some("btree".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![false, false],
+            column_opclasses: vec![Some("text_pattern_ops".to_string()), None],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }];
+
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX IF NOT EXISTS \"users_name_status_idx\" ON \"public\".\"users\" USING btree (\"name\" text_pattern_ops, \"status\")".to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_index_ddl_preserves_per_key_ordering_and_include_columns() {
+        let indexes = vec![db::IndexInfo {
+            name: "event_order_idx".to_string(),
+            columns: vec![
+                "created_at".to_string(),
+                "tenant_id".to_string(),
+                "score".to_string(),
+                "lower(payload)".to_string(),
+            ],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: Some("btree".to_string()),
+            included_columns: Some(vec!["payload".to_string()]),
+            comment: None,
+            key_is_expression: vec![false, false, false, true],
+            column_opclasses: vec![None, None, None, None],
+            key_options: vec![1, 0, 2, 3],
+            constraint_backed: false,
+        }];
+
+        let sql = generate_postgres_index_ddl(&indexes, "event_log", "public");
+
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX IF NOT EXISTS \"event_order_idx\" ON \"public\".\"event_log\" USING btree (\"created_at\" DESC NULLS LAST, \"tenant_id\" ASC NULLS LAST, \"score\" ASC NULLS FIRST, lower(payload) DESC NULLS FIRST) INCLUDE (\"payload\")".to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_index_ddl_ignores_access_method_options_for_non_btree_indexes() {
+        let indexes = vec![db::IndexInfo {
+            name: "events_payload_idx".to_string(),
+            columns: vec!["payload".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: Some("gin".to_string()),
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![false],
+            column_opclasses: vec![None],
+            key_options: vec![3],
+            constraint_backed: false,
+        }];
+
+        let sql = generate_postgres_index_ddl(&indexes, "events", "public");
+
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX IF NOT EXISTS \"events_payload_idx\" ON \"public\".\"events\" USING gin (\"payload\")"
+                .to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_index_ddl_empty_column_opclasses_vec_falls_back_to_no_opclass() {
+        let indexes = vec![db::IndexInfo {
+            name: "users_name_idx".to_string(),
+            columns: vec!["name".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: None,
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![false],
+            column_opclasses: vec![],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }];
+
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX IF NOT EXISTS \"users_name_idx\" ON \"public\".\"users\" (\"name\")".to_string()]
         );
     }
 
@@ -11744,6 +13594,21 @@ mod tests {
             owner_sql,
             "ALTER SEQUENCE \"public\".\"it_quick_entry_id_seq\" OWNED BY \"public\".\"it_quick_entry\".\"id\""
                 .to_string()
+        );
+    }
+
+    #[test]
+    fn postgres_transfer_rewrites_serial_columns_to_existing_sequences() {
+        let sequence = PostgresOwnedSequence {
+            name: "ticket_id_seq".into(),
+            owner_table: "ticket".into(),
+            owner_column: "id".into(),
+        };
+        let ddl = "CREATE TABLE \"src\".\"ticket\" (\n  \"id\" serial NOT NULL\n)";
+
+        assert_eq!(
+            rewrite_postgres_serial_columns_for_transfer(ddl, &[sequence], "dst"),
+            "CREATE TABLE \"src\".\"ticket\" (\n  \"id\" integer DEFAULT nextval('\"dst\".\"ticket_id_seq\"'::regclass) NOT NULL\n)"
         );
     }
 
@@ -12518,6 +14383,56 @@ SELECT 1 FROM dual"#
     }
 
     #[test]
+    fn oracle_jdbc_url_routes_multi_row_insert_through_insert_all() {
+        let config =
+            jdbc_transfer_config("jdbc:oracle:thin:@localhost:1521:ORCL", "oracle.jdbc.driver.OracleDriver", "");
+        assert_eq!(effective_transfer_database_type(&config), DatabaseType::Oracle);
+        // Mixed-case URL and driver class alone must be recognized too.
+        assert_eq!(
+            effective_transfer_database_type(&jdbc_transfer_config("JDBC:Oracle:thin:@localhost:1521:ORCL", "", "")),
+            DatabaseType::Oracle
+        );
+        assert_eq!(
+            effective_transfer_database_type(&jdbc_transfer_config("", "oracle.jdbc.OracleDriver", "")),
+            DatabaseType::Oracle
+        );
+
+        let sql = generate_insert_typed(
+            &[String::from("id"), String::from("name")],
+            &[Some(String::from("number")), Some(String::from("varchar2(64)"))],
+            &[vec![json!(1), json!("Ada")], vec![json!(2), json!("Grace")]],
+            "INSTR_CATEGORY",
+            "APP",
+            &effective_transfer_database_type(&config),
+            None,
+        );
+
+        assert!(sql.starts_with("INSERT ALL\nINTO "));
+        assert!(sql.ends_with("SELECT 1 FROM dual"));
+        assert!(!sql.contains("),\n("));
+    }
+
+    #[test]
+    fn non_oracle_jdbc_url_keeps_multi_row_values_insert() {
+        let config = jdbc_transfer_config("jdbc:mysql://localhost:3306/dbx_test", "com.mysql.cj.jdbc.Driver", "");
+        assert_eq!(effective_transfer_database_type(&config), DatabaseType::Jdbc);
+
+        let sql = generate_insert_typed(
+            &[String::from("id"), String::from("name")],
+            &[Some(String::from("int")), Some(String::from("varchar(64)"))],
+            &[vec![json!(1), json!("Ada")], vec![json!(2), json!("Grace")]],
+            "instr_category",
+            "",
+            &effective_transfer_database_type(&config),
+            None,
+        );
+
+        assert!(sql.starts_with("INSERT INTO "));
+        assert!(sql.contains("),\n("));
+        assert!(!sql.contains("INSERT ALL"));
+    }
+
+    #[test]
     fn transfer_write_sql_batches_split_large_insert_statements() {
         let rows = (0..4).map(|index| vec![json!(index), json!("x".repeat(180 * 1024))]).collect::<Vec<_>>();
         let statements = generate_transfer_write_sql_batches(
@@ -12924,6 +14839,7 @@ SELECT 1 FROM dual"#
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -13004,7 +14920,41 @@ SELECT 1 FROM dual"#
                 if target == DatabaseType::Oracle { DatabaseType::OceanbaseOracle } else { DatabaseType::Oracle };
             assert_eq!(map_column_type("VARCHAR2(50 CHAR)", &source, &target), "VARCHAR(50 char)");
             assert_eq!(map_column_type("CHAR(20 BYTE)", &source, &target), "CHAR(20 byte)");
+            // Oracle-family bare lengths keep their own default semantics; they
+            // pass through verbatim between Oracle-family databases.
+            assert_eq!(map_column_type("VARCHAR2(20)", &source, &target), "VARCHAR(20)");
         }
+    }
+
+    #[test]
+    fn map_column_type_pins_char_unit_for_character_counting_sources() {
+        // MySQL/Postgres/… count VARCHAR(n) in characters; an Oracle-family
+        // target running byte semantics (Oracle NLS_LENGTH_SEMANTICS=BYTE,
+        // Dameng LENGTH_IN_CHAR=0) would read the bare length in bytes and
+        // reject multi-byte text that fit the source column (#8101).
+        for target in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle, DatabaseType::Dameng] {
+            assert_eq!(map_column_type("varchar(20)", &DatabaseType::Mysql, &target), "VARCHAR(20 CHAR)");
+            assert_eq!(map_column_type("varchar(30)", &DatabaseType::Postgres, &target), "VARCHAR(30 CHAR)");
+            assert_eq!(map_column_type("nvarchar(40)", &DatabaseType::SqlServer, &target), "VARCHAR(40 CHAR)");
+            assert_eq!(map_column_type("char(10)", &DatabaseType::Mysql, &target), "CHAR(10 CHAR)");
+        }
+
+        // Non-Oracle-family targets keep the plain numeric length.
+        assert_eq!(map_column_type("varchar(20)", &DatabaseType::Mysql, &DatabaseType::Postgres), "VARCHAR(20)");
+        assert_eq!(map_column_type("varchar(20)", &DatabaseType::Postgres, &DatabaseType::Mysql), "VARCHAR(20)");
+        assert_eq!(map_column_type("char(10)", &DatabaseType::Mysql, &DatabaseType::Postgres), "CHAR(10)");
+
+        // Params that already carry a qualifier or are not a plain numeric
+        // length pass through unchanged instead of being double-qualified.
+        assert_eq!(
+            map_column_type("varchar(20 char)", &DatabaseType::Mysql, &DatabaseType::Oracle),
+            "VARCHAR(20 char)"
+        );
+        assert_eq!(
+            map_column_type("varchar(20 byte)", &DatabaseType::Mysql, &DatabaseType::Oracle),
+            "VARCHAR(20 byte)"
+        );
+        assert_eq!(map_column_type("nvarchar(max)", &DatabaseType::SqlServer, &DatabaseType::Dameng), "VARCHAR(max)");
     }
 
     #[test]

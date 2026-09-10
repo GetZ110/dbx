@@ -1,15 +1,18 @@
+import { UPDATE_RESTORE_KEY, assertUpdateAllowsInteraction } from "@/lib/app/updatePreparation";
 import { defineStore } from "pinia";
+import { isRedisMonitorCommand, startRedisMonitor } from "@/lib/redis/redisMonitor";
 import { uuid } from "@/lib/common/utils";
 import { computed, markRaw, nextTick, onScopeDispose, reactive, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { BatchSqlExecution, ConnectionConfig, DatabaseType, IndexInfo, NacosConfigEditorViewport, ObjectBrowserViewport, QueryResult, QueryResultSourceColumnRef, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
+import type { BatchSqlExecution, ConnectionConfig, DatabaseType, IndexInfo, NacosConfigEditorViewport, ObjectBrowserFilter, ObjectBrowserViewport, QueryResult, QueryResultSourceColumnRef, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
+import { sanitizeTabPageUiState } from "@/lib/tabs/tabUiState";
 import { orderPinnedFirst } from "@/lib/app/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
-import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, sqlServerExplainResult, type BuildExplainSqlResult } from "@/lib/diagram/explainPlan";
+import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, sqlServerExplainResult, type BuildExplainSqlResult, type ExplainPlanDatabaseType } from "@/lib/diagram/explainPlan";
 import { mysqlExplainCompatibilityHint } from "@/lib/diagram/mysqlExplainCompatibility";
 import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQueryEditability, analyzeSelectStructureForDisplay, resolveMetadataColumnName, resolveSourceColumnsByOrdinal, sourceColumnsForResult, type EditableQueryInfo, type EditableQuerySource } from "@/lib/sql/sqlAnalysis";
 import { buildQueryWithHiddenPrimaryKeys, hiddenResultColumnIndexes, type HiddenPrimaryKeyProjection } from "@/lib/sql/editableQueryHiddenKeys";
-import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsPayload, restoreOpenTabsState, serializeOpenTabs } from "@/lib/app/openTabsPersistence";
+import { ACTIVE_TAB_STORAGE_KEY, OPEN_TABS_STORAGE_KEY, restoreOpenTabsPayload, restoreOpenTabsState, serializeOpenTabs, type OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 import {
   evaluateMongoAggregateSafety,
   evaluateMongoWriteSafety,
@@ -36,11 +39,12 @@ import { nextRedisCommandDb } from "@/lib/redis/redisCommandSession";
 import { isRedisMutatingCommand } from "@/lib/redis/redisCommandTable";
 import { usesAgentCursorForQuery } from "@/lib/database/databaseDriverManifest";
 import { defaultAutoCommitForDbType, supportsClearableQuerySchema, supportsTransaction } from "@/lib/database/databaseFeatureSupport";
-import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, editablePrimaryKeys, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, editablePrimaryKeys, shouldIncludeSyntheticRowId, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/table/tableDataExport";
 import { tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
 import { isDataTabMetadataLifecycleStale } from "@/lib/sidebar/dataTabOpenPolicy";
 import { dataTabExecutionDatabase } from "@/lib/table/dataTabExecutionDatabase";
+import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
 import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { getCachedTableMetadata, loadTableColumns, loadTableIndexes, loadTableMetadata, tableMetadataToDataTabMeta, updateCachedTableMetadataType, type TableMetadataRequest } from "@/lib/metadata/tableMetadataCache";
 import { MetadataTaskLimiter } from "@/lib/metadata/metadataTaskLimiter";
@@ -59,7 +63,10 @@ import { replaceSqlServerLeadingUseQuery, sqlServerLeadingUseScript, sqlServerUs
 import { classifySqlRisk } from "@/lib/sql/sqlRisk";
 import { externalSqlFileDisplayTitles, normalizeExternalSqlPath } from "@/lib/sql/sqlFileOpen";
 import { clearDataGridPendingSnapshot, clearDataGridPendingSnapshotsForTab } from "@/composables/useDataGridEditor";
+import { beginClosingDataGridViewSnapshotsForTab, clearDataGridViewSnapshot, clearDataGridViewSnapshotsForTab } from "@/lib/dataGrid/dataGridViewStateCache";
+import { beginClosingBrowserState } from "@/lib/tabs/documentBrowserStateCache";
 import { clearDataGridStructuredFilterStatesForTab } from "@/lib/dataGrid/dataGridFilterBuilderPersistence";
+import { clearDataGridSearchStatesForTab } from "@/lib/dataGrid/dataGridSearchStatePersistence";
 import { buildTabResultSnapshot, deleteTabResultSnapshot, pruneTabResultSnapshots, readTabResultSnapshot, tabResultCacheKey, writeTabResultSnapshot } from "@/lib/tabs/tabResultCache";
 import { estimateQueryResultsBytes, selectInactiveResultEvictions } from "@/lib/tabs/queryResultSize";
 import { queryResultBaseSql, queryResultExecutionSql, resultGridInstanceKey } from "@/lib/tabs/tabPresentation";
@@ -104,7 +111,7 @@ const groupedDisplayMetadataLimiter = new MetadataTaskLimiter(GROUPED_DISPLAY_ME
   console.debug("[DBX][metadata-load:grouped-display-limiter]", event);
 });
 const UPPERCASE_FOLDED_METADATA_TYPES = new Set<string>([...ORACLE_LIKE_METADATA_TYPES, "saphana"]);
-const HIDDEN_QUERY_KEY_DATABASE_TYPES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver", "oracle"]);
+const HIDDEN_QUERY_KEY_DATABASE_TYPES = new Set<DatabaseType>(["mysql", "postgres", "sqlserver", "oracle", "xugu"]);
 const QUERY_RESULT_EXPORT_UNSUPPORTED_ERROR = "Streaming export is unsupported for this query. Simplify it or use a supported driver.";
 const BACKGROUND_CLIENT_SESSION_SUFFIXES = ["count", "explain", "export"] as const;
 const CANCEL_QUERY_TIMEOUT_MS = 10_000;
@@ -113,6 +120,19 @@ const ORACLE_QUERY_METADATA_PREFLIGHT_BUDGET_MS = 1_000;
 const ORACLE_QUERY_METADATA_PREFLIGHT_TIMEOUT = Symbol("oracle-query-metadata-preflight-timeout");
 const SAVED_SQL_EDITOR_POSITION_PERSIST_DELAY_MS = 500;
 type CloseConfirmContext = "tab" | "batch" | "app";
+
+export interface EditorGroup {
+  id: string;
+  tabIds: string[];
+  activeTabId: string | null;
+}
+
+export interface EditorWorkspacePersistState {
+  groups: EditorGroup[];
+  focusedGroupId: string;
+  orientation: "vertical" | "horizontal";
+  sizes: number[];
+}
 
 interface BatchSqlResumeOptions {
   batch: BatchSqlExecution;
@@ -136,6 +156,7 @@ interface BuildQueryResultExportRequestOptions {
   includeSqlSheet?: boolean;
   exportTableName?: string;
   exportColumnTypes?: Array<string | null | undefined>;
+  insertMode?: SqlInsertMode;
 }
 
 interface OpenSavedSqlOptions {
@@ -642,6 +663,7 @@ function bindColumnsForSource(
       if (!column.sourceName) return column;
       if (column.sourceKey) {
         if (column.sourceKey !== source.key) return column;
+        if (dbType === "oracle" && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID") return column;
         const canonicalName = resolveSourceColumnName(dbType, column.sourceName, column.sourceNameQuoted, tableColumns);
         return { ...column, sourceName: canonicalName };
       }
@@ -657,7 +679,7 @@ function bindColumnsForSource(
 }
 
 function primaryKeysPresentForSource(dbType: string, primaryKeys: string[], resultColumns: string[], analysis: EditableQueryInfo, sourceKey: string, tableColumns: readonly { name: string }[]): boolean {
-  if (!analysis.selectStar) return allPrimaryKeysPresent(primaryKeys, resultColumns, analysis, sourceKey);
+  if (!analysis.selectStar) return allPrimaryKeysPresent(primaryKeys, resultColumns, analysis, sourceKey, dbType as DatabaseType);
   const metadataNames = tableColumns.map((column) => column.name);
   const canonicalResultColumns = resultColumns.flatMap((column) => {
     const canonicalName = resolveMetadataColumnName(dbType, column, undefined, metadataNames);
@@ -689,9 +711,20 @@ let saveTabsQueue = Promise.resolve();
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let persistGeneration = 0;
 
-function saveTabs(tabs: QueryTab[], activeTabId: string | null): Promise<void> {
+function saveTabs(tabs: QueryTab[], activeTabId: string | null, workspace?: EditorWorkspacePersistState): Promise<void> {
   if (isDetachedWindow()) return Promise.resolve();
-  const payload = { tabs: serializeOpenTabs(tabs), activeTabId };
+  const payload: OpenTabsStatePayload = {
+    tabs: serializeOpenTabs(tabs),
+    activeTabId,
+    ...(workspace && tabs.length > 0
+      ? {
+          groups: workspace.groups.map((group) => ({ ...group, tabIds: [...group.tabIds] })),
+          focusedGroupId: workspace.focusedGroupId,
+          orientation: workspace.orientation,
+          sizes: [...workspace.sizes],
+        }
+      : {}),
+  };
   saveTabsQueue = saveTabsQueue.catch(() => undefined).then(() => api.saveOpenTabsState(payload));
   return saveTabsQueue;
 }
@@ -708,23 +741,45 @@ function clearLegacySavedTabs() {
   safeLocalStorageRemove(ACTIVE_TAB_STORAGE_KEY);
 }
 
-function restoreSavedTabsFromPayload(payload: { tabs?: unknown; activeTabId?: unknown } | null | undefined, options: { validConnectionIds?: Iterable<string> } = {}): { tabs: QueryTab[]; activeTabId: string | null } {
-  const restoreMode = useSettingsStore().editorSettings.openTabsRestoreMode;
-  if (restoreMode === "none") return { tabs: [], activeTabId: null };
-  return restoreOpenTabsPayload(payload, {
+function restoreSavedTabsFromPayload(
+  payload: { tabs?: unknown; activeTabId?: unknown; groups?: unknown; focusedGroupId?: unknown; orientation?: unknown; sizes?: unknown } | null | undefined,
+  options: { validConnectionIds?: Iterable<string> } = {},
+): { tabs: QueryTab[]; activeTabId: string | null; workspace?: unknown } {
+  const restoreMode = safeLocalStorageGet(UPDATE_RESTORE_KEY) === "1" ? "all" : useSettingsStore().editorSettings.openTabsRestoreMode;
+  if (restoreMode === "none") {
+    return { tabs: [], activeTabId: null, workspace: undefined };
+  }
+  const restored = restoreOpenTabsPayload(payload, {
     filter: restoreMode === "pinned" ? "pinned" : "all",
     validConnectionIds: options.validConnectionIds,
   });
+  return {
+    ...restored,
+    workspace:
+      payload && "groups" in payload
+        ? {
+            groups: payload.groups,
+            focusedGroupId: payload.focusedGroupId,
+            orientation: payload.orientation,
+            sizes: payload.sizes,
+          }
+        : undefined,
+  };
 }
 
-function restoreLegacySavedTabs(options: { validConnectionIds?: Iterable<string> } = {}): { tabs: QueryTab[]; activeTabId: string | null } {
-  const restoreMode = useSettingsStore().editorSettings.openTabsRestoreMode;
-  if (restoreMode === "none") return { tabs: [], activeTabId: null };
+function restoreLegacySavedTabs(options: { validConnectionIds?: Iterable<string> } = {}): { tabs: QueryTab[]; activeTabId: string | null; workspace?: undefined } {
+  const restoreMode = safeLocalStorageGet(UPDATE_RESTORE_KEY) === "1" ? "all" : useSettingsStore().editorSettings.openTabsRestoreMode;
+  if (restoreMode === "none") {
+    return { tabs: [], activeTabId: null, workspace: undefined };
+  }
   const legacy = loadLegacySavedTabs();
-  return restoreOpenTabsState(legacy.rawTabs, legacy.rawActiveTabId, {
-    filter: restoreMode === "pinned" ? "pinned" : "all",
-    validConnectionIds: options.validConnectionIds,
-  });
+  return {
+    ...restoreOpenTabsState(legacy.rawTabs, legacy.rawActiveTabId, {
+      filter: restoreMode === "pinned" ? "pinned" : "all",
+      validConnectionIds: options.validConnectionIds,
+    }),
+    workspace: undefined,
+  };
 }
 
 function getI18nT() {
@@ -736,6 +791,7 @@ function getI18nT() {
 }
 
 export const useQueryStore = defineStore("query", () => {
+  const redisMonitors = new Map<string, () => void>();
   const t = getI18nT();
   const settingsStore = useSettingsStore();
   const tabs = ref<QueryTab[]>([]);
@@ -768,11 +824,397 @@ export const useQueryStore = defineStore("query", () => {
     return keys;
   });
   const activeTabId = ref<string | null>(null);
+  const groups = ref<EditorGroup[]>([{ id: "main", tabIds: [], activeTabId: null }]);
+  const focusedGroupId = ref("main");
+  const orientation = ref<"vertical" | "horizontal">("vertical");
+  const sizes = ref<number[]>([100]);
   const isOpenTabsLoaded = ref(false);
   const activeTabHistory = ref<string[]>([]);
   // Most-recently-activated tab ids, oldest first. Read-only view for the
   // Ctrl+Tab switcher, which renders them in reverse.
   const recentTabIds = computed(() => activeTabHistory.value);
+
+  function findGroup(groupId: string): EditorGroup | undefined {
+    return groups.value.find((group) => group.id === groupId);
+  }
+
+  function focusedGroup(): EditorGroup {
+    return findGroup(focusedGroupId.value) ?? groups.value[0];
+  }
+
+  function groupForTab(tabId: string): EditorGroup | undefined {
+    return groups.value.find((group) => group.tabIds.includes(tabId));
+  }
+
+  function syncActiveTabFromFocusedGroup() {
+    const group = focusedGroup();
+    if (!group) {
+      return;
+    }
+    if (group.activeTabId && tabs.value.some((tab) => tab.id === group.activeTabId)) {
+      activeTabId.value = group.activeTabId;
+      return;
+    }
+    const firstAvailable = groups.value.find((candidate) => candidate.tabIds.length > 0)?.tabIds.find((id) => tabs.value.some((tab) => tab.id === id)) ?? tabs.value[0]?.id ?? null;
+    if (firstAvailable) {
+      activeTabId.value = firstAvailable;
+      if (group.tabIds.includes(firstAvailable)) {
+        group.activeTabId = firstAvailable;
+      }
+    } else {
+      group.activeTabId = null;
+      activeTabId.value = null;
+    }
+  }
+
+  function normalizeGroups() {
+    const validIds = new Set(tabs.value.map((tab) => tab.id));
+
+    // Group ids must be unique and non-empty; keep only the first occurrence.
+    const seenGroupIds = new Set<string>();
+    groups.value = groups.value.filter((group) => {
+      if (!group.id || seenGroupIds.has(group.id)) {
+        return false;
+      }
+      seenGroupIds.add(group.id);
+      return true;
+    });
+
+    // Enforce the four-group limit before assigning missing tabs, so tabs from
+    // dropped groups are merged into a kept group instead of becoming ownerless.
+    if (groups.value.length > 1) {
+      groups.value = groups.value.filter((group) => group.tabIds.length > 0);
+    }
+    if (groups.value.length > 4) {
+      const target = groups.value[0];
+      for (const group of groups.value.slice(4)) {
+        target.tabIds.push(...group.tabIds);
+      }
+      groups.value = groups.value.slice(0, 4);
+    }
+
+    // A tab may only belong to the first group that claims it.
+    const globallyAssigned = new Set<string>();
+    for (const group of groups.value) {
+      const nextTabIds: string[] = [];
+      for (const id of group.tabIds) {
+        if (!validIds.has(id) || globallyAssigned.has(id)) {
+          continue;
+        }
+        globallyAssigned.add(id);
+        nextTabIds.push(id);
+      }
+      group.tabIds = nextTabIds;
+      if (group.activeTabId && !group.tabIds.includes(group.activeTabId)) {
+        group.activeTabId = group.tabIds[0] ?? null;
+      }
+    }
+
+    const assigned = new Set(groups.value.flatMap((group) => group.tabIds));
+    const missing = tabs.value.filter((tab) => !assigned.has(tab.id));
+    if (missing.length > 0) {
+      const target = focusedGroup() ?? groups.value[0];
+      if (target) {
+        for (const tab of missing) {
+          target.tabIds.push(tab.id);
+        }
+      }
+    }
+
+    if (groups.value.length > 1) {
+      groups.value = groups.value.filter((group) => group.tabIds.length > 0);
+    }
+    if (groups.value.length === 0) {
+      groups.value = [{ id: "main", tabIds: [], activeTabId: null }];
+    }
+    if (!groups.value.some((group) => group.id === focusedGroupId.value)) {
+      focusedGroupId.value = groups.value[0].id;
+    }
+
+    // Restore boundary order (guide §3.9): repair each group's active tab,
+    // then repair sizes, and only at the very end derive the global active tab
+    // from the focused group. A stale persisted activeTabId must never pull
+    // focus (or the group active) toward another group.
+    for (const group of groups.value) {
+      if (!group.activeTabId || !group.tabIds.includes(group.activeTabId)) {
+        group.activeTabId = group.tabIds[0] ?? null;
+      }
+    }
+
+    repairGroupSizes();
+
+    syncActiveTabFromFocusedGroup();
+  }
+
+  /** Keeps `sizes` aligned with the current group count after structural changes. */
+  function repairGroupSizes() {
+    const sizeCount = groups.value.length;
+    const validSizes = Array.isArray(sizes.value) && sizes.value.length === sizeCount && sizes.value.every((size) => Number.isFinite(size) && size > 0);
+    if (!validSizes) {
+      const each = Math.floor(100 / sizeCount);
+      sizes.value = groups.value.map((_, index) => (index === sizeCount - 1 ? 100 - each * (sizeCount - 1) : each));
+      return;
+    }
+    const total = sizes.value.reduce((sum, size) => sum + size, 0);
+    if (total <= 0) {
+      const each = Math.floor(100 / sizeCount);
+      sizes.value = groups.value.map((_, index) => (index === sizeCount - 1 ? 100 - each * (sizeCount - 1) : each));
+    } else if (Math.abs(total - 100) > 0.01) {
+      sizes.value = sizes.value.map((size) => (size / total) * 100);
+    }
+  }
+
+  /**
+   * Drops groups that no longer own any tab, keeps one (possibly empty) main
+   * group, re-points the focused group, and re-pairs sizes. Structural store
+   * operations call this directly instead of leaning on a full normalization
+   * pass or a post-flush watcher.
+   */
+  function pruneEmptyGroups() {
+    if (groups.value.length > 1) {
+      groups.value = groups.value.filter((group) => group.tabIds.length > 0);
+    }
+    if (groups.value.length === 0) {
+      groups.value = [{ id: "main", tabIds: [], activeTabId: null }];
+    }
+    if (!groups.value.some((group) => group.id === focusedGroupId.value)) {
+      focusedGroupId.value = groups.value[0].id;
+    }
+    repairGroupSizes();
+  }
+
+  function focusGroup(groupId: string) {
+    const group = findGroup(groupId) ?? groups.value[0];
+    if (!group) {
+      return;
+    }
+    focusedGroupId.value = group.id;
+    const candidate = group.activeTabId && tabs.value.some((tab) => tab.id === group.activeTabId) ? group.activeTabId : (group.tabIds.find((tabId) => tabs.value.some((tab) => tab.id === tabId)) ?? null);
+    if (candidate) {
+      group.activeTabId = candidate;
+      activeTabId.value = candidate;
+    }
+    // If the focused group has no valid active tab, keep the current global
+    // active tab rather than clearing it and unmounting the workspace.
+    settingsStore.settingsPageActive = false;
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event(QUERY_SURFACE_ACTIVATION_EVENT));
+    }
+  }
+
+  function activateTabInGroup(groupId: string, tabId: string) {
+    const group = findGroup(groupId);
+    if (!group || !group.tabIds.includes(tabId)) {
+      return;
+    }
+    group.activeTabId = tabId;
+    focusedGroupId.value = group.id;
+    activeTabId.value = tabId;
+    settingsStore.settingsPageActive = false;
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event(QUERY_SURFACE_ACTIVATION_EVENT));
+    }
+  }
+
+  function activateTab(tabId: string): boolean {
+    const owner = groupForTab(tabId);
+    if (!owner) {
+      return false;
+    }
+    owner.activeTabId = tabId;
+    focusedGroupId.value = owner.id;
+    activeTabId.value = tabId;
+    settingsStore.settingsPageActive = false;
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event(QUERY_SURFACE_ACTIVATION_EVENT));
+    }
+    return true;
+  }
+
+  function initializeResultAutoSave(tab: QueryTab) {
+    if (tab.mode === "query" && tab.resultAutoSave === undefined && settingsStore.editorSettings.defaultAutoKeepResults === true) {
+      tab.resultAutoSave = true;
+    }
+  }
+
+  // Apply after the settings mutation completes, never during tab registration
+  // or restoration while the workspace still has incomplete group membership.
+  watch(
+    () => settingsStore.editorSettings.defaultAutoKeepResults,
+    (enabled) => {
+      for (const tab of tabs.value) {
+        if (tab.mode === "query") setResultAutoSave(tab, enabled === true);
+      }
+    },
+  );
+
+  /**
+   * Atomically registers a freshly built tab: the tab joins the focused group
+   * and (by default) becomes that group's active tab and the global active tab
+   * in one synchronous step. Programmatic open paths must use this instead of
+   * pushing to `tabs` and writing `activeTabId` separately, which used to leave
+   * the new tab ownerless until a post-flush watcher repaired the groups.
+   */
+  function registerOpenTab(tab: QueryTab, options: { activate?: boolean; insertAfterTabId?: string } = {}): string {
+    assertUpdateAllowsInteraction();
+    initializeResultAutoSave(tab);
+    const anchorIndex = options.insertAfterTabId ? tabs.value.findIndex((item) => item.id === options.insertAfterTabId) : -1;
+    if (anchorIndex >= 0) {
+      tabs.value.splice(anchorIndex + 1, 0, tab);
+    } else {
+      tabs.value.push(tab);
+    }
+    const group = focusedGroup() ?? groups.value[0];
+    if (group && !group.tabIds.includes(tab.id)) {
+      const groupAnchorIndex = options.insertAfterTabId ? group.tabIds.indexOf(options.insertAfterTabId) : -1;
+      if (groupAnchorIndex >= 0) {
+        // Fresh tabs are never pinned; keep them behind the group's pinned block.
+        const pinnedCount = group.tabIds.filter((id) => tabs.value.find((item) => item.id === id)?.pinned).length;
+        const insertAt = tab.pinned ? groupAnchorIndex + 1 : Math.max(groupAnchorIndex + 1, pinnedCount);
+        group.tabIds.splice(insertAt, 0, tab.id);
+      } else {
+        group.tabIds.push(tab.id);
+      }
+    }
+    if (options.activate !== false) {
+      activateTab(tab.id);
+    }
+    return tab.id;
+  }
+
+  function splitTab(tabId: string, direction: "right" | "down"): boolean {
+    if (groups.value.length >= 4) {
+      return false;
+    }
+    // With a single open tab the split is a no-op: the tab moves into the new
+    // group, the emptied source group is pruned, and the layout returns to one
+    // group holding the same tab (only the group identity churns).
+    if (tabs.value.length <= 1) {
+      return false;
+    }
+    const tab = tabs.value.find((item) => item.id === tabId);
+    if (!tab) {
+      return false;
+    }
+    const owner = groupForTab(tabId);
+    if (!owner) {
+      return false;
+    }
+
+    orientation.value = direction === "right" ? "vertical" : "horizontal";
+
+    const newGroupId = uuid();
+    const newGroup: EditorGroup = { id: newGroupId, tabIds: [tabId], activeTabId: tabId };
+    const ownerIndex = groups.value.findIndex((group) => group.id === owner.id);
+    owner.tabIds = owner.tabIds.filter((id) => id !== tabId);
+    if (owner.activeTabId === tabId) {
+      owner.activeTabId = owner.tabIds[0] ?? null;
+    }
+    groups.value.splice(ownerIndex + 1, 0, newGroup);
+    // Removing the tab may leave the source group empty; pruning keeps sizes
+    // paired with the surviving groups without a full normalization pass.
+    pruneEmptyGroups();
+    focusedGroupId.value = newGroup.id;
+    activeTabId.value = tabId;
+    return true;
+  }
+
+  function splitTabRight(tabId: string): boolean {
+    return splitTab(tabId, "right");
+  }
+
+  function splitTabDown(tabId: string): boolean {
+    return splitTab(tabId, "down");
+  }
+
+  function setOrientation(value: "vertical" | "horizontal") {
+    orientation.value = value;
+  }
+
+  function moveTabToGroup(tabId: string, targetGroupId: string, index?: number): boolean {
+    const tab = tabs.value.find((item) => item.id === tabId);
+    const target = findGroup(targetGroupId);
+    if (!tab || !target) {
+      return false;
+    }
+
+    const source = groupForTab(tabId);
+    if (!source) {
+      return false;
+    }
+
+    function pinnedCountIn(tabIds: string[]): number {
+      return tabIds.filter((id) => tabs.value.find((item) => item.id === id)?.pinned).length;
+    }
+
+    if (source.id === target.id) {
+      if (index === undefined) {
+        return false;
+      }
+      const fromIndex = target.tabIds.indexOf(tabId);
+      if (fromIndex < 0) {
+        return false;
+      }
+      const next = [...target.tabIds];
+      next.splice(fromIndex, 1);
+      let insertAt = index;
+      if (fromIndex < insertAt) {
+        insertAt -= 1;
+      }
+      const pinnedCount = pinnedCountIn(next);
+      if (tab.pinned) {
+        insertAt = Math.max(0, Math.min(insertAt, pinnedCount));
+      } else {
+        insertAt = Math.max(pinnedCount, Math.min(insertAt, next.length));
+      }
+      next.splice(insertAt, 0, tabId);
+      target.tabIds = next;
+      return true;
+    }
+
+    source.tabIds = source.tabIds.filter((id) => id !== tabId);
+    if (source.activeTabId === tabId) {
+      source.activeTabId = source.tabIds[0] ?? null;
+    }
+
+    const pinnedCount = pinnedCountIn(target.tabIds);
+    const rawIndex = index ?? target.tabIds.length;
+    const insertAt = tab.pinned ? Math.max(0, Math.min(rawIndex, pinnedCount)) : Math.max(pinnedCount, Math.min(rawIndex, target.tabIds.length));
+    target.tabIds.splice(insertAt, 0, tabId);
+
+    target.activeTabId = tabId;
+    focusedGroupId.value = target.id;
+    activeTabId.value = tabId;
+    pruneEmptyGroups();
+    return true;
+  }
+
+  function unsplitTab(tabId: string): boolean {
+    const main = groups.value[0];
+    if (!main) {
+      return false;
+    }
+    if (main.tabIds.includes(tabId)) {
+      focusGroup(main.id);
+      return true;
+    }
+    const source = groupForTab(tabId);
+    if (!source) {
+      return false;
+    }
+
+    source.tabIds = source.tabIds.filter((id) => id !== tabId);
+    if (source.activeTabId === tabId) {
+      source.activeTabId = source.tabIds[0] ?? null;
+    }
+    main.tabIds.push(tabId);
+    main.activeTabId = tabId;
+    focusedGroupId.value = main.id;
+    activeTabId.value = tabId;
+    pruneEmptyGroups();
+    return true;
+  }
+
   const showCloseConfirm = ref(false);
   const pendingCloseTabId = ref<string | null>(null);
   const pendingBatchCloseTabIds = ref<string[] | null>(null);
@@ -784,6 +1226,7 @@ export const useQueryStore = defineStore("query", () => {
   const savedSqlEditorPositionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingTabSessionResets = new Map<string, Promise<void>>();
   const pendingResultRunRestores = new Map<string, string>();
+  const pendingResultRunPreparations = new WeakMap<QueryTab, string>();
   const multiDbExecutionWorkers = new Map<string, QueryTab>();
   const multiDbExecutionWorkerScopes = new Map<string, Set<string>>();
   let resultCacheTrimScheduled = false;
@@ -1047,6 +1490,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultEstimatedBytes = undefined;
     tab.queryAnalysis = undefined;
     tab.querySourceColumns = undefined;
+    tab.queryWriteTargets = undefined;
     tab.resultColumnComments = undefined;
     tab.queryDisplaySourceColumns = undefined;
     tab.queryEditabilityReason = undefined;
@@ -1057,6 +1501,12 @@ export const useQueryStore = defineStore("query", () => {
     if (!options.evicted) {
       if (tab.resultCacheKey && !options.preserveCacheSnapshot) void deleteTabResultSnapshot(tab.resultCacheKey);
       tab.resultCacheKey = undefined;
+      // Drop the stale view snapshot but do NOT tombstone: ordinary execution
+      // clears the payload before running, and the replacement result must stay
+      // free to capture a fresh snapshot when the user switches away. Tab
+      // closure (closeTab/closeTabsWhere/releaseTabsWhere) uses the tombstone.
+      // An evicted result keeps its snapshot so returning to the tab can replay it.
+      clearDataGridViewSnapshotsForTab(tab.id);
     }
   }
 
@@ -1119,6 +1569,7 @@ export const useQueryStore = defineStore("query", () => {
     run.resultEstimatedBytes = undefined;
     run.queryAnalysis = undefined;
     run.querySourceColumns = undefined;
+    run.queryWriteTargets = undefined;
     run.resultColumnComments = undefined;
     run.queryDisplaySourceColumns = undefined;
     run.queryEditabilityReason = undefined;
@@ -1135,6 +1586,9 @@ export const useQueryStore = defineStore("query", () => {
     tab.results = run.results;
     tab.activeResultIndex = run.activeResultIndex;
     tab.resultGridRevision = run.resultGridRevision;
+    // A legacy run without the token must not inherit a stale tab value: fail
+    // safe by starting a fresh logical result.
+    tab.resultViewGeneration = run.resultViewGeneration ?? uuid();
     tab.batchSqlExecution = cloneBatchSqlExecution(run.batchSqlExecution);
     tab.resultBaseSql = run.resultBaseSql;
     tab.resultEditorFingerprint = run.resultEditorFingerprint;
@@ -1163,6 +1617,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.resultEvicted = run.resultEvicted;
     tab.queryAnalysis = run.queryAnalysis;
     tab.querySourceColumns = run.querySourceColumns;
+    tab.queryWriteTargets = run.queryWriteTargets;
     tab.resultColumnComments = run.resultColumnComments;
     tab.queryDisplaySourceColumns = run.queryDisplaySourceColumns;
     tab.queryEditabilityReason = run.queryEditabilityReason;
@@ -1182,7 +1637,7 @@ export const useQueryStore = defineStore("query", () => {
     return true;
   }
 
-  async function restoreResultRunPayload(tab: QueryTab, runId: string) {
+  async function restoreResultRunPayload(tab: QueryTab, runId: string, isCurrent?: () => boolean) {
     const run = tab.resultRuns?.find((item) => item.id === runId);
     if (!run || run.result || run.results?.length) return run;
 
@@ -1190,6 +1645,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!cacheKey) return run;
 
     const snapshot = await readTabResultSnapshot(cacheKey);
+    if (isCurrent && !isCurrent()) return undefined;
     const snapshotRun = snapshot?.resultRuns?.find((item) => item.id === runId);
     if (!snapshotRun) return run;
 
@@ -1218,11 +1674,12 @@ export const useQueryStore = defineStore("query", () => {
     return restoredRun;
   }
 
-  async function setActiveResultRun(id: string, runId: string, options: { evictInactive?: boolean } = {}) {
+  async function setActiveResultRun(id: string, runId: string, options: { evictInactive?: boolean; isCurrent?: () => boolean } = {}) {
     const tab = findExecutionTab(id);
     if (!tab) return false;
     const existingRun = tab.resultRuns?.find((item) => item.id === runId);
-    const run = existingRun && resultRunHasPayload(existingRun) ? existingRun : await restoreResultRunPayload(tab, runId);
+    const run = existingRun && resultRunHasPayload(existingRun) ? existingRun : await restoreResultRunPayload(tab, runId, options.isCurrent);
+    if (options.isCurrent && !options.isCurrent()) return false;
     if (!run?.result && !run?.results?.length) return false;
     projectResultRun(tab, run);
     if (options.evictInactive !== false) evictInactiveResultRunPayloads(tab);
@@ -1403,6 +1860,7 @@ export const useQueryStore = defineStore("query", () => {
         activeResultRunId: run.id,
         queryAnalysis: run.queryAnalysis,
         querySourceColumns: run.querySourceColumns,
+        queryWriteTargets: run.queryWriteTargets,
         resultColumnComments: run.resultColumnComments,
         queryDisplaySourceColumns: run.queryDisplaySourceColumns,
         queryEditabilityReason: run.queryEditabilityReason,
@@ -1456,6 +1914,7 @@ export const useQueryStore = defineStore("query", () => {
       results: tab.results,
       activeResultIndex: tab.activeResultIndex,
       resultGridRevision: tab.resultGridRevision,
+      resultViewGeneration: tab.resultViewGeneration,
       batchSqlExecution: cloneBatchSqlExecution(tab.batchSqlExecution),
       resultBaseSql: tab.resultBaseSql,
       resultEditorFingerprint: tab.resultEditorFingerprint,
@@ -1484,6 +1943,7 @@ export const useQueryStore = defineStore("query", () => {
       resultEvicted: tab.resultEvicted,
       queryAnalysis: tab.queryAnalysis,
       querySourceColumns: tab.querySourceColumns,
+      queryWriteTargets: tab.queryWriteTargets,
       resultColumnComments: tab.resultColumnComments,
       queryDisplaySourceColumns: tab.queryDisplaySourceColumns,
       queryEditabilityReason: tab.queryEditabilityReason,
@@ -1538,11 +1998,15 @@ export const useQueryStore = defineStore("query", () => {
   function toggleResultAutoSave(id: string): boolean {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab || tab.mode !== "query") return false;
-    tab.resultAutoSave = tab.resultAutoSave ? undefined : true;
-    if (tab.resultAutoSave && tab.result && !tab.activeResultRunId) {
+    setResultAutoSave(tab, tab.resultAutoSave !== true);
+    return tab.resultAutoSave === true;
+  }
+
+  function setResultAutoSave(tab: QueryTab, enabled: boolean) {
+    tab.resultAutoSave = enabled;
+    if (enabled && !tab.isExecuting && tab.result && !tab.activeResultRunId) {
       captureDisplayedResultRun(tab, tab.resultBaseSql ?? tab.lastExecutedSql ?? tab.sql);
     }
-    return tab.resultAutoSave === true;
   }
 
   function syncActiveResultRunFromDisplayed(tab: QueryTab, sql?: string) {
@@ -1556,6 +2020,7 @@ export const useQueryStore = defineStore("query", () => {
       results: tab.results,
       activeResultIndex: tab.activeResultIndex,
       resultGridRevision: tab.resultGridRevision,
+      resultViewGeneration: tab.resultViewGeneration,
       batchSqlExecution: cloneBatchSqlExecution(tab.batchSqlExecution),
       resultBaseSql: tab.resultBaseSql,
       resultEditorFingerprint: tab.resultEditorFingerprint,
@@ -1584,6 +2049,7 @@ export const useQueryStore = defineStore("query", () => {
       resultEvicted: tab.resultEvicted,
       queryAnalysis: tab.queryAnalysis,
       querySourceColumns: tab.querySourceColumns,
+      queryWriteTargets: tab.queryWriteTargets,
       resultColumnComments: tab.resultColumnComments,
       queryDisplaySourceColumns: tab.queryDisplaySourceColumns,
       queryEditabilityReason: tab.queryEditabilityReason,
@@ -1615,6 +2081,27 @@ export const useQueryStore = defineStore("query", () => {
     }
   }
 
+  type ResultPublicationOrigin = "execute" | "refresh" | "page" | "sort" | "local-sort" | "append" | "disk-restore";
+
+  /**
+   * Single writer of `resultViewGeneration`, the logical-result identity used by
+   * the tab-switch view snapshot cache (`dataGridViewStateCache.ts`).
+   *
+   * New value by default, so a path that forgets to classify itself still fails
+   * safe (the old view snapshot stops matching) instead of replaying a stale
+   * viewport. `append` extends the current dataset; `disk-restore` inherits, so
+   * an evicted-then-restored payload keeps its captured view. No other code path
+   * may assign the token directly.
+   */
+  function publishResultGeneration(tab: QueryTab, origin: ResultPublicationOrigin) {
+    if (origin === "disk-restore") return;
+    if (origin === "append") {
+      tab.resultViewGeneration ??= uuid();
+      return;
+    }
+    tab.resultViewGeneration = uuid();
+  }
+
   function sortTabResultLocally(id: string, column: string, columnIndex: number, direction: DataGridSortDirection | null) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab?.result) return;
@@ -1636,6 +2123,8 @@ export const useQueryStore = defineStore("query", () => {
     const mongo_copy_documents = originalMongoCopyDocuments ? rowIndexes.map((index) => originalMongoCopyDocuments[index]) : undefined;
     const large_value_cells = remapLargeValueCells(tab.resultLocalSortOriginalLargeValueCells, rowIndexes);
     assignDisplayedResult(tab, { ...tab.result, rows, large_value_cells, mongo_documents, mongo_copy_documents });
+    // Reordering rows invalidates source-index view snapshots.
+    publishResultGeneration(tab, "local-sort");
 
     tab.resultSortColumn = direction ? column : undefined;
     tab.resultSortColumnIndex = direction ? columnIndex : undefined;
@@ -1671,7 +2160,7 @@ export const useQueryStore = defineStore("query", () => {
     clearResultPayload(tab, { evicted: true });
   }
 
-  function applyRestoredOpenTabs(restored: { tabs: QueryTab[]; activeTabId: string | null }) {
+  function applyRestoredOpenTabs(restored: { tabs: QueryTab[]; activeTabId: string | null; workspace?: unknown }) {
     const connectionStore = useConnectionStore();
     for (const tab of restored.tabs) {
       const connection = connectionStore.getConfig(tab.connectionId);
@@ -1681,12 +2170,48 @@ export const useQueryStore = defineStore("query", () => {
         tab.schema = connectionObjectTreeNodeSchema(connection, tab.database, tab.schema);
       }
     }
+    restored.tabs.forEach(initializeResultAutoSave);
     tabs.value = restored.tabs;
-    activeTabId.value = restored.activeTabId;
-    activeTabHistory.value = restored.activeTabId ? [restored.activeTabId] : [];
     for (const tab of restored.tabs) {
-      if (tab.mode === "data") void deleteTabResultSnapshot(tabResultCacheKey(tab.id));
+      if (tab.mode === "data") {
+        void deleteTabResultSnapshot(tabResultCacheKey(tab.id));
+      }
     }
+
+    // Restore order (guide §3.9): the persisted global active tab is only a
+    // hint for legacy tabs-only payloads. Group membership, group actives and
+    // the focused group are repaired first; the global active tab is derived
+    // from the focused group last, so a stale payload value can never move
+    // focus to a different group.
+    const workspace = restored.workspace && typeof restored.workspace === "object" ? (restored.workspace as Record<string, unknown>) : undefined;
+    if (!Array.isArray(workspace?.groups) && restored.activeTabId && tabs.value.some((tab) => tab.id === restored.activeTabId)) {
+      groups.value = [{ id: "main", tabIds: tabs.value.map((tab) => tab.id), activeTabId: restored.activeTabId }];
+      focusedGroupId.value = "main";
+    } else if (workspace) {
+      if (Array.isArray(workspace.groups)) {
+        groups.value = (workspace.groups as Array<Record<string, unknown>>)
+          .filter((group) => group && typeof group.id === "string")
+          .map((group) => ({
+            id: group.id as string,
+            tabIds: Array.isArray(group.tabIds) ? (group.tabIds as unknown[]).map(String) : [],
+            activeTabId: typeof group.activeTabId === "string" ? group.activeTabId : null,
+          }));
+      }
+      if (typeof workspace.focusedGroupId === "string") {
+        focusedGroupId.value = workspace.focusedGroupId;
+      }
+      if (workspace.orientation === "vertical" || workspace.orientation === "horizontal") {
+        orientation.value = workspace.orientation;
+      }
+      if (Array.isArray(workspace.sizes)) {
+        sizes.value = (workspace.sizes as unknown[]).map(Number);
+      }
+    }
+    // Start from no global active so normalization cannot treat the persisted
+    // value as authoritative over the restored focused group.
+    activeTabId.value = null;
+    normalizeGroups();
+    activeTabHistory.value = activeTabId.value ? [activeTabId.value] : [];
   }
 
   async function recoverDetachedTabsToMain(options: { validConnectionIds?: Iterable<string> } = {}) {
@@ -1722,14 +2247,15 @@ export const useQueryStore = defineStore("query", () => {
     if (saved?.tabs && Array.isArray(saved.tabs)) {
       const restored = restoreSavedTabsFromPayload(saved, options);
       applyRestoredOpenTabs(restored);
-      if (useSettingsStore().editorSettings.openTabsRestoreMode === "none") {
+      if (safeLocalStorageGet(UPDATE_RESTORE_KEY) !== "1" && useSettingsStore().editorSettings.openTabsRestoreMode === "none") {
         // Restore is explicitly disabled, so stale saved payloads should not
         // reappear if the user later changes the setting.
         clearLegacySavedTabs();
-        await saveTabs(tabs.value, activeTabId.value).catch(() => undefined);
+        await saveTabs(tabs.value, activeTabId.value, { groups: groups.value, focusedGroupId: focusedGroupId.value, orientation: orientation.value, sizes: sizes.value }).catch(() => undefined);
       }
       await recoverDetachedTabsToMain(options);
       await saveTabs(tabs.value, activeTabId.value).catch(() => undefined);
+      safeLocalStorageRemove(UPDATE_RESTORE_KEY);
       isOpenTabsLoaded.value = true;
       scheduleResultCacheMaintenance();
       return;
@@ -1739,7 +2265,7 @@ export const useQueryStore = defineStore("query", () => {
     if (legacy.rawTabs || legacy.rawActiveTabId) {
       const restored = restoreLegacySavedTabs(options);
       applyRestoredOpenTabs(restored);
-      if (useSettingsStore().editorSettings.openTabsRestoreMode === "none") {
+      if (safeLocalStorageGet(UPDATE_RESTORE_KEY) !== "1" && useSettingsStore().editorSettings.openTabsRestoreMode === "none") {
         // Restore is explicitly disabled, so keeping the legacy startup payload
         // would resurrect old tabs if the user later changes the setting.
         clearLegacySavedTabs();
@@ -1749,7 +2275,7 @@ export const useQueryStore = defineStore("query", () => {
       }
       await recoverDetachedTabsToMain(options);
       try {
-        await saveTabs(tabs.value, activeTabId.value);
+        await saveTabs(tabs.value, activeTabId.value, { groups: groups.value, focusedGroupId: focusedGroupId.value, orientation: orientation.value, sizes: sizes.value });
         // Keep old desktop installs readable until the async store has the
         // migrated state; only then remove the synchronous startup payload.
         clearLegacySavedTabs();
@@ -1771,6 +2297,8 @@ export const useQueryStore = defineStore("query", () => {
       database: t.database,
       schema: t.schema,
       sql: t.sql,
+      editorViewport: t.editorViewport,
+      editorSelection: t.editorSelection,
       savedSqlId: t.savedSqlId,
       externalSqlPath: t.externalSqlPath,
       externalSqlFileVersion: t.externalSqlFileVersion,
@@ -1791,9 +2319,12 @@ export const useQueryStore = defineStore("query", () => {
       mode: t.mode,
       autoCommit: t.autoCommit,
       resultAutoSave: t.resultAutoSave,
+      uiState: t.uiState,
       structureTableName: t.structureTableName,
+      structureDraft: t.structureDraft,
       objectBrowser: t.objectBrowser,
       objectSource: t.objectSource,
+      sourceView: t.sourceView,
       tableMeta: t.tableMeta,
       mongoEditTarget: t.mongoEditTarget,
       resultEvicted: t.resultEvicted,
@@ -1817,18 +2348,26 @@ export const useQueryStore = defineStore("query", () => {
 
   const storePersistGeneration = ++persistGeneration;
   watch(
-    [_persistSnapshot, activeTabId],
+    [_persistSnapshot, activeTabId, groups, focusedGroupId, orientation, sizes],
     () => {
       if (storePersistGeneration !== persistGeneration) return;
       if (persistTimer) clearTimeout(persistTimer);
       persistTimer = setTimeout(() => {
-        if (isDetachedWindow()) void flushDetachedTabPersistence(activeTabId.value ?? undefined).catch(() => {});
-        else void saveTabs(tabs.value, activeTabId.value).catch(() => {});
+        if (isDetachedWindow()) {
+          void flushDetachedTabPersistence(activeTabId.value ?? undefined).catch(() => {});
+        } else {
+          void saveTabs(tabs.value, activeTabId.value, { groups: groups.value, focusedGroupId: focusedGroupId.value, orientation: orientation.value, sizes: sizes.value }).catch(() => {});
+        }
         persistTimer = null;
       }, 300);
     },
-    { flush: "post" },
+    { flush: "post", deep: true },
   );
+
+  // Group invariants are maintained by the atomic store operations themselves
+  // (registerOpenTab / activateTab / split / move / close); there is
+  // deliberately no post-flush watcher repairing them here. Normalization is
+  // reserved for the persistence restore boundary.
 
   onScopeDispose(() => {
     if (persistTimer) clearTimeout(persistTimer);
@@ -1847,7 +2386,7 @@ export const useQueryStore = defineStore("query", () => {
       clearTimeout(persistTimer);
       persistTimer = null;
     }
-    return saveTabs(tabs.value, activeTabId.value);
+    return saveTabs(tabs.value, activeTabId.value, { groups: groups.value, focusedGroupId: focusedGroupId.value, orientation: orientation.value, sizes: sizes.value });
   }
 
   async function prepareDetachedTab(tabId: string, runtime: DetachedTabRuntimeState = {}): Promise<DetachedTabHandoff> {
@@ -1894,23 +2433,61 @@ export const useQueryStore = defineStore("query", () => {
     await api.saveDetachedTabHandoff(tabId, handoff);
   }
 
+  /**
+   * Lands a workspace-adopted tab in the pane layout. The split workspace
+   * renders from group membership, so a tab arriving through a detached
+   * handoff must belong to a group to be visible at all. A group that still
+   * carries the id (a return to a pane that never cleaned up) just gets its
+   * active tab repaired; everything else adopts into the first group. Used by
+   * detached-window open, return-to-main, and startup recovery alike.
+   */
+  function ensureTabInWorkspace(tabId: string) {
+    const owner = groups.value.find((group) => group.tabIds.includes(tabId));
+    if (owner) {
+      owner.activeTabId = tabId;
+      focusedGroupId.value = owner.id;
+      return;
+    }
+    const main = groups.value[0];
+    main.tabIds.push(tabId);
+    main.activeTabId = tabId;
+    focusedGroupId.value = main.id;
+  }
+
   async function adoptDetachedTab(handoff: DetachedTabHandoff): Promise<string> {
     if (!handoff || handoff.schemaVersion !== 1 || !handoff.tab || typeof handoff.tab.id !== "string" || handoff.tab.id !== handoff.tabId) throw new Error("Unsupported detached tab state");
     const restored = restoreOpenTabsPayload({ tabs: [handoff.tab], activeTabId: handoff.tabId });
     const restoredTab = restored.tabs[0];
     if (!restoredTab) throw new Error("Unable to restore detached tab");
+    // serializeOpenTabs() blanks `sql` for a clean saved-SQL-library tab to avoid
+    // duplicating on-disk state across app restarts, relying on hydrateSavedSqlTabs()
+    // to refill it afterwards. The detach handoff goes through the same serialization
+    // but skips that hydration step, so do it here too or the new window opens empty.
+    // A freshly created detached window never runs the main-window bootstrap that
+    // populates savedSqlStore's local file index, so useSavedSqlStore().ensureFileContent()
+    // can't find the file locally either — go straight to the backend instead.
+    if (restoredTab.savedSqlId && restoredTab.mode === "query" && !restoredTab.sql && restoredTab.originalSql === undefined) {
+      const file = await api.loadSavedSqlFile(restoredTab.savedSqlId).catch(() => undefined);
+      if (file) {
+        restoredTab.title = restoredTab.customTitle ? restoredTab.title : file.name;
+        restoredTab.sql = file.sql;
+        restoredTab.originalSql = file.sql;
+      }
+    }
     Object.assign(restoredTab, handoff.runtime);
     if (handoff.resultCacheKey) {
       restoredTab.resultCacheKey = handoff.resultCacheKey;
       const restoredResult = restoreCachedResultPayload(restoredTab, await readTabResultSnapshot(handoff.resultCacheKey));
       if (!restoredResult) restoredTab.resultCacheState = "missing";
     }
+    initializeResultAutoSave(restoredTab);
     const existingIndex = tabs.value.findIndex((tab) => tab.id === handoff.tabId);
     if (existingIndex >= 0) {
       tabs.value.splice(existingIndex, 1, restoredTab);
     } else {
       tabs.value.push(restoredTab);
     }
+    ensureTabInWorkspace(handoff.tabId);
     activeTabId.value = handoff.tabId;
     return handoff.tabId;
   }
@@ -1918,8 +2495,13 @@ export const useQueryStore = defineStore("query", () => {
   function removeTabAfterDetachedReady(tabId: string): boolean {
     const index = tabs.value.findIndex((tab) => tab.id === tabId);
     if (index < 0) return false;
+    // Group-aware removal: the split workspace renders from group membership,
+    // so the tab must leave its pane too. The emptied pane is pruned exactly
+    // like a bulk close, and a dangling pane (group entry without a tab) is
+    // never left behind for the return trip to trip over.
     tabs.value.splice(index, 1);
-    if (activeTabId.value === tabId) activeTabId.value = tabs.value[Math.min(index, tabs.value.length - 1)]?.id ?? null;
+    removeTabsFromGroups(new Set([tabId]));
+    if (activeTabId.value === tabId) syncActiveTabFromFocusedGroup();
     return true;
   }
 
@@ -1930,10 +2512,20 @@ export const useQueryStore = defineStore("query", () => {
     return tabs.value.find((tab) => tab.connectionId === connectionId && tab.database === database && tab.title === title && tab.mode === mode && (tab.schema || "") === (schema || "") && (tab.catalog || "") === (catalog || ""));
   }
 
-  function createTab(connectionId: string, database: string, title?: string, mode: QueryTab["mode"] = "query", schema?: string, initialSql?: string, catalog?: string, options: { forceNew?: boolean; activate?: boolean; forceWordWrap?: boolean; insertAfterActive?: boolean } = {}) {
+  function createTab(
+    connectionId: string,
+    database: string,
+    title?: string,
+    mode: QueryTab["mode"] = "query",
+    schema?: string,
+    initialSql?: string,
+    catalog?: string,
+    options: { forceNew?: boolean; activate?: boolean; forceWordWrap?: boolean; insertAfterActive?: boolean; sourceView?: boolean } = {},
+  ) {
     if (title && !options.forceNew) {
       const existing = findTabByIdentity(connectionId, database, title, mode, schema, catalog);
       if (existing) {
+        if (options.sourceView) existing.sourceView = true;
         switchTab(existing.id);
         return existing.id;
       }
@@ -1946,6 +2538,7 @@ export const useQueryStore = defineStore("query", () => {
       title: title || `query_${tabs.value.length + 1}`,
       customTitle: mode === "query" && title ? true : undefined,
       forceWordWrap: options.forceWordWrap,
+      sourceView: options.sourceView,
       connectionId,
       database,
       schema,
@@ -1958,11 +2551,10 @@ export const useQueryStore = defineStore("query", () => {
       ...(mode === "query" ? { autoCommit: defaultAutoCommitForDbTypeWithSetting(dbType) } : {}),
     };
     if (mode === "query") tab.originalSql = initialSql ?? "";
-    const activeIndex = options.insertAfterActive ? tabs.value.findIndex((item) => item.id === activeTabId.value) : -1;
-    if (activeIndex >= 0) tabs.value.splice(activeIndex + 1, 0, tab);
-    else tabs.value.push(tab);
-    if (options.activate !== false) activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab, {
+      ...(options.activate === false ? { activate: false } : {}),
+      ...(options.insertAfterActive && activeTabId.value ? { insertAfterTabId: activeTabId.value } : {}),
+    });
   }
 
   function openObjectSourceTab(options: OpenObjectSourceTabOptions) {
@@ -1979,6 +2571,7 @@ export const useQueryStore = defineStore("query", () => {
         (tab.objectSource.signature || "") === (options.objectSource.signature || ""),
     );
     if (existing) {
+      existing.sourceView = true;
       switchTab(existing.id);
       if (!isTabDirty(existing)) {
         updateSql(existing.id, options.sql);
@@ -1987,7 +2580,7 @@ export const useQueryStore = defineStore("query", () => {
       return existing.id;
     }
 
-    const id = createTab(options.connectionId, options.database, options.title, "query", options.schema, options.sql, options.catalog, { forceNew: true });
+    const id = createTab(options.connectionId, options.database, options.title, "query", options.schema, options.sql, options.catalog, { forceNew: true, sourceView: true });
     setObjectSource(id, options.objectSource);
     return id;
   }
@@ -2010,6 +2603,9 @@ export const useQueryStore = defineStore("query", () => {
     tab.executionId = undefined;
     tab.executingResultRunId = undefined;
     tab.queryExecutionStartedAt = undefined;
+    // An externally-supplied result is a brand-new dataset, not the previous
+    // one: publish a fresh generation so the tab can capture a view snapshot.
+    publishResultGeneration(tab, "execute");
     if (tab.result) touchResult(tab);
     return id;
   }
@@ -2056,8 +2652,7 @@ export const useQueryStore = defineStore("query", () => {
       mode: "query",
       autoCommit: defaultAutoCommitForDbTypeWithSetting(dbType),
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
+    registerOpenTab(tab);
     refreshExternalSqlFileTitles();
     return id;
   }
@@ -2114,9 +2709,7 @@ export const useQueryStore = defineStore("query", () => {
         eventCreateRequestId,
       },
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openDatabaseBrowser(connectionId: string) {
@@ -2127,7 +2720,7 @@ export const useQueryStore = defineStore("query", () => {
     }
 
     const id = uuid();
-    tabs.value.push({
+    return registerOpenTab({
       id,
       title: "Databases",
       connectionId,
@@ -2138,8 +2731,6 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "databases",
     });
-    activeTabId.value = id;
-    return id;
   }
 
   function openDriverProfileWorkspace(connectionId: string, database: string, title: string, mode: QueryTab["mode"], tabScope: DriverProfileWorkspaceScope = "database", workspaceBranch?: string) {
@@ -2152,7 +2743,7 @@ export const useQueryStore = defineStore("query", () => {
     }
 
     const id = uuid();
-    tabs.value.push({
+    return registerOpenTab({
       id,
       title,
       connectionId,
@@ -2164,11 +2755,14 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode,
     });
-    activeTabId.value = id;
-    return id;
   }
 
   function switchTab(tabId: string) {
+    const owner = groupForTab(tabId);
+    if (owner) {
+      activateTabInGroup(owner.id, tabId);
+      return;
+    }
     activeTabId.value = tabId;
     settingsStore.settingsPageActive = false;
     if (typeof window !== "undefined") window.dispatchEvent(new Event(QUERY_SURFACE_ACTIVATION_EVENT));
@@ -2194,9 +2788,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "users",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openProcessList(connectionId: string) {
@@ -2219,9 +2811,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "processlist",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openSqlServerActivityTrace(connectionId: string) {
@@ -2244,9 +2834,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "sqlserver-trace",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openMysqlDashboard(connectionId: string) {
@@ -2269,9 +2857,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "mysql-dashboard",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openPostgresDashboard(connectionId: string) {
@@ -2294,9 +2880,30 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "postgres-dashboard",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
+  }
+
+  function openXuguDashboard(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "xugu-dashboard" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: conn?.name ? `${conn.name} - ${t("xuguServerDashboard.title")}` : t("xuguServerDashboard.title"),
+      connectionId,
+      database: conn?.database || "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "xugu-dashboard",
+    };
+    return registerOpenTab(tab);
   }
 
   function openNacosDashboard(connectionId: string) {
@@ -2319,9 +2926,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "nacos-dashboard",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openDamengJobAdmin(connectionId: string) {
@@ -2344,9 +2949,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "dameng-jobs",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openDamengUsers(connectionId: string) {
@@ -2369,9 +2972,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "dameng-users",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openDamengRoles(connectionId: string) {
@@ -2394,9 +2995,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "dameng-roles",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openMongoBucket(connectionId: string, database: string, bucketName: string) {
@@ -2422,9 +3021,7 @@ export const useQueryStore = defineStore("query", () => {
         bucketName,
       },
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openMongoGridFs(connectionId: string, database: string) {
@@ -2446,9 +3043,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "mongo-gridfs",
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openMqAdmin(connectionId: string, target?: { tenant?: string; initialTab?: QueryTab["mqInitialTab"] }) {
@@ -2475,9 +3070,7 @@ export const useQueryStore = defineStore("query", () => {
       mqTenant: target?.tenant,
       mqInitialTab: target?.initialTab,
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openNacosAdmin(connectionId: string, target?: { namespace?: string; namespaceName?: string; dataId?: string; group?: string; keyword?: string }) {
@@ -2516,9 +3109,7 @@ export const useQueryStore = defineStore("query", () => {
       nacosTargetKeyword: target?.keyword,
       nacosTargetRequestId: target?.dataId ? 1 : undefined,
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function openMqttAdmin(connectionId: string, target?: { initialTopic?: string }) {
@@ -2543,9 +3134,7 @@ export const useQueryStore = defineStore("query", () => {
       mode: "mqtt",
       mqttInitialTopic: target?.initialTopic,
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function clearNacosNavigationTarget(connectionId: string, namespace: string, requestId?: number) {
@@ -2593,9 +3182,7 @@ export const useQueryStore = defineStore("query", () => {
       structureInitialTabRequestId: initialTab || initialTarget?.name ? 1 : undefined,
       structureInitialTarget: initialTarget?.name ? initialTarget : undefined,
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   function isTabDirty(tab: QueryTab): boolean {
@@ -2604,7 +3191,7 @@ export const useQueryStore = defineStore("query", () => {
       return !!tab.structureDraft && tab.structureDraft.dirty !== false;
     }
     if (tab.mode !== "query") return false;
-    if (!tab.externalSqlPath && !tab.sql.trim()) return false;
+    if (!tab.externalSqlPath && !tab.sql.trim() && !(tab.savedSqlId && tab.originalSql !== undefined)) return false;
     const original = tab.originalSql;
     if (original === undefined) return !!tab.savedSqlId;
     return tab.sql !== original;
@@ -2635,7 +3222,11 @@ export const useQueryStore = defineStore("query", () => {
   function showDirtyTabCloseConfirm(tab: QueryTab, context: CloseConfirmContext) {
     pendingCloseTabId.value = tab.id;
     closeConfirmContext.value = context;
-    activeTabId.value = tab.id;
+    // Move focus through the atomic activate so the confirming dialog, the
+    // shared result area, and the dirty tab's owner group stay coherent.
+    if (!activateTab(tab.id)) {
+      activeTabId.value = tab.id;
+    }
     showCloseConfirm.value = true;
   }
 
@@ -2723,6 +3314,13 @@ export const useQueryStore = defineStore("query", () => {
     );
   }
 
+  function flushEditorState(id: string): Promise<void> {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab) return Promise.resolve();
+    persistSavedSqlEditorPosition(tab);
+    return flushPendingPersist();
+  }
+
   function queueSavedSqlEditorPositionPersist(tab: QueryTab | undefined) {
     if (!tab?.savedSqlId || tab.mode !== "query") return;
     const pending = savedSqlEditorPositionTimers.get(tab.savedSqlId);
@@ -2764,9 +3362,25 @@ export const useQueryStore = defineStore("query", () => {
     pendingBatchCloseFinalActiveTabId.value = undefined;
     pendingBatchCloseComplete = null;
     if (finalActiveTabId !== undefined) {
-      activeTabId.value = finalActiveTabId && tabs.value.some((tab) => tab.id === finalActiveTabId) ? finalActiveTabId : null;
+      commitBatchCloseActiveTab(finalActiveTabId);
     }
     return onComplete;
+  }
+
+  /**
+   * Applies a batch close's chosen active tab while keeping the group
+   * invariants: the surviving tab becomes its owner group's active tab and the
+   * focused group. Falls back to the focused group when the choice no longer
+   * exists.
+   */
+  function commitBatchCloseActiveTab(finalActiveTabId: string | null) {
+    if (finalActiveTabId && tabs.value.some((tab) => tab.id === finalActiveTabId)) {
+      if (!activateTab(finalActiveTabId)) {
+        syncActiveTabFromFocusedGroup();
+      }
+      return;
+    }
+    syncActiveTabFromFocusedGroup();
   }
 
   function continuePendingBatchClose() {
@@ -2845,7 +3459,10 @@ export const useQueryStore = defineStore("query", () => {
     persistSavedSqlEditorPosition(tabs.value[idx]);
     if (tab.mode === "sqlserver-trace") void disposeSqlServerActivityTrace(tab.id);
     clearDataGridPendingSnapshotsForTab(id);
+    beginClosingDataGridViewSnapshotsForTab(id);
+    beginClosingBrowserState(id);
     clearDataGridStructuredFilterStatesForTab(id);
+    clearDataGridSearchStatesForTab(id);
     if (tabs.value[idx].txnSessionId) void rollbackTransaction(id);
     if (tabs.value[idx].isExecuting) void cancelTabExecution(id);
     if (tabs.value[idx].isExplaining) void cancelTabExplain(id);
@@ -2856,10 +3473,33 @@ export const useQueryStore = defineStore("query", () => {
     releaseTabResultObjectPayloads(tabs.value[idx]);
     clearResultRuns(tabs.value[idx]);
     clearResultPayload(tabs.value[idx]);
+    const owner = groupForTab(id);
+    const ownerIndexInGroup = owner ? owner.tabIds.indexOf(id) : -1;
+    const wasOwnerActive = owner?.activeTabId === id;
+    const wasGlobalActive = activeTabId.value === id;
+
     tabs.value.splice(idx, 1);
     if (tab.externalSqlPath) refreshExternalSqlFileTitles();
-    if (activeTabId.value === id) {
-      activeTabId.value = fallbackActiveTabAfterClose(id, idx);
+
+    if (owner) {
+      owner.tabIds = owner.tabIds.filter((tabId) => tabId !== id);
+      if (wasOwnerActive) {
+        const groupHistory = activeTabHistory.value.filter((tabId) => tabId !== id && owner.tabIds.includes(tabId));
+        owner.activeTabId = groupHistory[groupHistory.length - 1] ?? owner.tabIds[Math.min(ownerIndexInGroup, owner.tabIds.length - 1)] ?? null;
+      }
+      if (owner.tabIds.length === 0 && groups.value.length > 1) {
+        const removedIndex = groups.value.findIndex((group) => group.id === owner.id);
+        groups.value.splice(removedIndex, 1);
+        if (focusedGroupId.value === owner.id) {
+          focusedGroupId.value = groups.value[0]?.id ?? "main";
+        }
+        repairGroupSizes();
+      }
+    }
+
+    if (wasGlobalActive) {
+      const nextGroup = focusedGroup();
+      activeTabId.value = nextGroup?.activeTabId ?? null;
     }
     if (force) resumePendingBatchCloseAfter(id);
   }
@@ -2905,7 +3545,7 @@ export const useQueryStore = defineStore("query", () => {
     const idsToClose = batchIds ?? (pendingId ? [pendingId] : []);
     for (const id of idsToClose) closeTab(id, { force: true });
     if (finalActiveTabId !== undefined) {
-      activeTabId.value = finalActiveTabId && tabs.value.some((tab) => tab.id === finalActiveTabId) ? finalActiveTabId : null;
+      commitBatchCloseActiveTab(finalActiveTabId);
     }
     if (batchIds) onBatchComplete?.();
   }
@@ -2939,7 +3579,7 @@ export const useQueryStore = defineStore("query", () => {
     const dirtyTab = dirtyId ? tabs.value.find((tab) => tab.id === dirtyId) : undefined;
     if (!dirtyTab) return false;
     pendingCloseTabId.value = dirtyTab.id;
-    activeTabId.value = dirtyTab.id;
+    activateTab(dirtyTab.id);
     showCloseConfirm.value = true;
     return true;
   }
@@ -2964,7 +3604,7 @@ export const useQueryStore = defineStore("query", () => {
     const idsToClose = batchIds ?? (pendingId ? [pendingId] : []);
     for (const id of idsToClose) closeTab(id, { force: true });
     if (finalActiveTabId !== undefined) {
-      activeTabId.value = finalActiveTabId && tabs.value.some((tab) => tab.id === finalActiveTabId) ? finalActiveTabId : null;
+      commitBatchCloseActiveTab(finalActiveTabId);
     }
     if (batchIds) onBatchComplete?.();
     return "tabs" as const;
@@ -2976,6 +3616,30 @@ export const useQueryStore = defineStore("query", () => {
       tabs.value.filter((tab) => tab.id !== id).map((tab) => tab.id),
       id,
     );
+  }
+
+  function closeOtherTabsInGroup(groupId: string, id: string) {
+    const group = findGroup(groupId);
+    const target = tabs.value.find((tab) => tab.id === id);
+    if (!group || !target) return;
+    const ids = group.tabIds.filter((tabId) => {
+      const tab = tabs.value.find((item) => item.id === tabId);
+      return tab && tabId !== id && Boolean(tab.pinned) === Boolean(target.pinned);
+    });
+    beginBatchClose(ids, id);
+  }
+
+  function closeAllTabsInGroup(groupId: string, id: string) {
+    const group = findGroup(groupId);
+    const target = tabs.value.find((tab) => tab.id === id);
+    if (!group || !target) return;
+    const ids = group.tabIds.filter((tabId) => {
+      const tab = tabs.value.find((item) => item.id === tabId);
+      return tab && Boolean(tab.pinned) === Boolean(target.pinned);
+    });
+    if (ids.length === 0) return;
+    const finalActiveTabId = group.activeTabId && !ids.includes(group.activeTabId) ? group.activeTabId : id;
+    beginBatchClose(ids, finalActiveTabId);
   }
 
   function closeTabsByIds(ids: Iterable<string>, finalActiveTabId?: string | null, onComplete?: () => void) {
@@ -3125,9 +3789,11 @@ export const useQueryStore = defineStore("query", () => {
       structureDraft: original.structureDraft ? cloneTabDraft(original.structureDraft) : undefined,
       objectBrowser: original.objectBrowser ? { ...original.objectBrowser } : undefined,
       objectSource: original.objectSource ? { ...original.objectSource } : undefined,
+      sourceView: original.sourceView,
       tableMeta: original.tableMeta ? { ...original.tableMeta, columns: [...original.tableMeta.columns], primaryKeys: [...original.tableMeta.primaryKeys] } : undefined,
       queryAnalysis: original.queryAnalysis ? { ...original.queryAnalysis, sources: original.queryAnalysis.sources?.map((source) => ({ ...source })), columns: original.queryAnalysis.columns.map((c) => ({ ...c })) } : undefined,
       querySourceColumns: original.querySourceColumns ? [...original.querySourceColumns] : undefined,
+      queryWriteTargets: original.queryWriteTargets?.map((target) => ({ ...target, sourceColumns: [...target.sourceColumns] })),
       resultColumnComments: original.resultColumnComments ? [...original.resultColumnComments] : undefined,
       queryDisplaySourceColumns: original.queryDisplaySourceColumns ? [...original.queryDisplaySourceColumns] : undefined,
       queryEditabilityReason: original.queryEditabilityReason,
@@ -3135,7 +3801,16 @@ export const useQueryStore = defineStore("query", () => {
       whereInput: original.whereInput,
       previewSql: original.previewSql,
     };
+    initializeResultAutoSave(newTab);
     tabs.value.splice(idx + 1, 0, newTab);
+
+    const owner = groupForTab(id);
+    if (owner) {
+      const ownerIndex = owner.tabIds.indexOf(id);
+      owner.tabIds.splice(ownerIndex + 1, 0, newId);
+      owner.activeTabId = newId;
+      focusedGroupId.value = owner.id;
+    }
     activeTabId.value = newId;
   }
 
@@ -3148,7 +3823,10 @@ export const useQueryStore = defineStore("query", () => {
       .forEach((tab) => {
         if (tab.mode === "sqlserver-trace") void disposeSqlServerActivityTrace(tab.id);
         clearDataGridPendingSnapshotsForTab(tab.id);
+        beginClosingDataGridViewSnapshotsForTab(tab.id);
+        beginClosingBrowserState(tab.id);
         clearDataGridStructuredFilterStatesForTab(tab.id);
+        clearDataGridSearchStatesForTab(tab.id);
         if (tab.txnSessionId) void rollbackTransaction(tab.id);
         if (tab.isExecuting) void cancelTabExecution(tab.id);
         if (tab.isExplaining) void cancelTabExplain(tab.id);
@@ -3163,9 +3841,38 @@ export const useQueryStore = defineStore("query", () => {
 
     const activeClosingIndex = tabs.value.findIndex((tab) => tab.id === activeTabId.value && closingIds.has(tab.id));
     tabs.value = tabs.value.filter((tab) => !closingIds.has(tab.id));
-    if (activeClosingIndex >= 0) {
-      activeTabId.value = tabs.value[Math.min(activeClosingIndex, tabs.value.length - 1)]?.id ?? null;
+    // Resolve the fallback against the POST-filter array: the survivor at the
+    // closing tab's index, not the closing tab itself.
+    const fallbackTabId = activeClosingIndex >= 0 ? tabs.value[Math.min(activeClosingIndex, tabs.value.length - 1)]?.id : undefined;
+    // Drop the closed ids from their owning groups, repair each group's
+    // active tab, and remove groups emptied by this close.
+    removeTabsFromGroups(closingIds);
+    if (fallbackTabId && tabs.value.some((tab) => tab.id === fallbackTabId)) {
+      activateTab(fallbackTabId);
+    } else {
+      syncActiveTabFromFocusedGroup();
     }
+  }
+
+  /**
+   * Removes a set of tab ids from whichever groups own them, repairs each
+   * group's active tab (MRU first, then adjacent), and prunes groups emptied
+   * by the removal. Used by bulk close paths so group state stays consistent
+   * without a normalization pass.
+   */
+  function removeTabsFromGroups(closingIds: Set<string>) {
+    if (closingIds.size === 0) return;
+    for (const group of groups.value) {
+      if (!group.tabIds.some((tabId) => closingIds.has(tabId))) continue;
+      const ownerIndexInGroup = group.activeTabId ? group.tabIds.indexOf(group.activeTabId) : -1;
+      const wasOwnerActive = group.activeTabId != null && closingIds.has(group.activeTabId);
+      group.tabIds = group.tabIds.filter((tabId) => !closingIds.has(tabId));
+      if (wasOwnerActive) {
+        const groupHistory = activeTabHistory.value.filter((tabId) => !closingIds.has(tabId) && group.tabIds.includes(tabId));
+        group.activeTabId = groupHistory[groupHistory.length - 1] ?? group.tabIds[Math.min(Math.max(ownerIndexInGroup, 0), group.tabIds.length - 1)] ?? null;
+      }
+    }
+    pruneEmptyGroups();
   }
 
   function closeScopedTabsWhere(predicate: (tab: QueryTab) => boolean, options: { force?: boolean } = {}) {
@@ -3248,7 +3955,7 @@ export const useQueryStore = defineStore("query", () => {
         const metadataGenerationAtStart = connectionGeneration;
         const reloadedMetadata = await loadTableMetadata({
           connectionId: tab.connectionId,
-          database: tab.database,
+          database: tableMeta.database ?? tab.database,
           schema: tableMeta.schema,
           tableName: tableMeta.tableName,
           tableType: tableMeta.tableType,
@@ -3287,8 +3994,9 @@ export const useQueryStore = defineStore("query", () => {
         primaryKeys,
         ...tableDataLargeValuePreviewOptions(effectiveDbType, tableMeta.columns, primaryKeys, limit),
         includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
-        includeRowId: usesSyntheticRowIdKey(effectiveDbType, primaryKeys, tableMeta.tableType),
+        includeRowId: shouldIncludeSyntheticRowId(effectiveDbType, primaryKeys, tableMeta.tableType),
         whereInput: tab.whereInput,
+        injectDefaultTimeSeriesWhere: true,
         orderBy,
         limit,
         offset,
@@ -3301,6 +4009,7 @@ export const useQueryStore = defineStore("query", () => {
       await executeTabSql(tab.id, sql, {
         pagination: { limit, offset },
         preserveResultDuringExecution: true,
+        publicationOrigin: "refresh",
       });
       return true;
     } catch (error) {
@@ -3334,7 +4043,10 @@ export const useQueryStore = defineStore("query", () => {
       .forEach((tab) => {
         rollbackTabTransaction(tab, { resetAutoCommit: true });
         clearDataGridPendingSnapshotsForTab(tab.id);
+        beginClosingDataGridViewSnapshotsForTab(tab.id);
+        beginClosingBrowserState(tab.id);
         clearDataGridStructuredFilterStatesForTab(tab.id);
+        clearDataGridSearchStatesForTab(tab.id);
         if (tab.isExecuting) void cancelTabExecution(tab.id);
         if (tab.isExplaining) void cancelTabExplain(tab.id);
         void closeResultSession(tab);
@@ -3491,6 +4203,36 @@ export const useQueryStore = defineStore("query", () => {
     queueSavedSqlEditorPositionPersist(tab);
   }
 
+  function updateTabUiState(id: string, patch: Partial<NonNullable<QueryTab["uiState"]>>) {
+    const tab = tabs.value.find((candidate) => candidate.id === id);
+    if (!tab) return;
+    tab.uiState = { ...tab.uiState, ...patch };
+  }
+
+  function updateTabPageUiState(id: string, mode: string, patch: Record<string, unknown>, owner?: QueryTab) {
+    const tab = tabs.value.find((candidate) => candidate.id === id);
+    if (!tab || tab.mode !== mode || (owner && owner !== tab)) return;
+    const nextPageState = sanitizeTabPageUiState({ ...(tab.uiState?.page?.[mode] ?? {}), ...patch });
+    if (!nextPageState) return;
+    const page = sanitizeTabPageUiState({ ...(tab.uiState?.page ?? {}), [mode]: nextPageState });
+    if (!page) return;
+    tab.uiState = { ...tab.uiState, page: page as NonNullable<QueryTab["uiState"]>["page"] };
+  }
+
+  function updateTabPageResult(id: string, mode: string, result: QueryResult | undefined, owner?: QueryTab) {
+    const tab = tabs.value.find((candidate) => candidate.id === id);
+    if (!tab || tab.mode !== mode || (owner && owner !== tab)) return;
+    if (!result) {
+      clearResultPayload(tab);
+      return;
+    }
+    tab.results = undefined;
+    tab.activeResultIndex = undefined;
+    assignDisplayedResult(tab, result);
+    touchResult(tab);
+    scheduleResultCacheTrim();
+  }
+
   function updateEditorSelection(id: string, selection: { anchor: number; head: number }) {
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab) return;
@@ -3504,6 +4246,19 @@ export const useQueryStore = defineStore("query", () => {
     const previous = tab.objectBrowser?.viewport;
     if (previous?.scrollTop === viewport.scrollTop && previous.viewMode === viewport.viewMode) return;
     tab.objectBrowser = { ...tab.objectBrowser, viewport };
+  }
+
+  function updateObjectBrowserSearch(id: string, query: string) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "objects") return;
+    if (tab.objectBrowser?.searchQuery === query) return;
+    tab.objectBrowser = { ...tab.objectBrowser, searchQuery: query };
+  }
+
+  function updateObjectBrowserFilter(id: string, filter: ObjectBrowserFilter) {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "objects" || tab.objectBrowser?.filter === filter) return;
+    tab.objectBrowser = { ...tab.objectBrowser, filter };
   }
 
   function updateNacosConfigEditorViewport(connectionId: string, namespace: string, viewport: NacosConfigEditorViewport) {
@@ -3598,7 +4353,7 @@ export const useQueryStore = defineStore("query", () => {
     const existing = tabs.value.find((tab) => tab.savedSqlId === file.id);
     if (existing) {
       persistSavedSqlEditorPosition(existing);
-      if (!existing.sql && file.sql) {
+      if (!existing.sql && file.sql && existing.originalSql === undefined) {
         existing.sql = file.sql;
         existing.originalSql = file.sql;
         const restored = restoreSavedSqlEditorPosition(file.id, file.sql);
@@ -3632,15 +4387,13 @@ export const useQueryStore = defineStore("query", () => {
       editorSelection: restoredPosition.selection,
       editorViewport: restoredPosition.viewport,
     };
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   async function hydrateSavedSqlTabs() {
     await initSavedSqlEditorPositions();
     const savedSqlStore = useSavedSqlStore();
-    const linkedTabs = tabs.value.filter((tab) => tab.savedSqlId && tab.sql === "");
+    const linkedTabs = tabs.value.filter((tab) => tab.savedSqlId && tab.sql === "" && tab.originalSql === undefined);
     for (const tab of linkedTabs) {
       const file = await savedSqlStore.ensureFileContent(tab.savedSqlId!);
       if (!file) continue;
@@ -3658,6 +4411,13 @@ export const useQueryStore = defineStore("query", () => {
     if (!tab) return;
     tab.pinned = !tab.pinned;
     tabs.value = orderPinnedFirst(tabs.value, (item) => !!item.pinned);
+
+    const owner = groupForTab(id);
+    if (owner) {
+      const pinned = owner.tabIds.filter((tabId) => tabs.value.find((item) => item.id === tabId)?.pinned);
+      const regular = owner.tabIds.filter((tabId) => !tabs.value.find((item) => item.id === tabId)?.pinned);
+      owner.tabIds = [...pinned, ...regular];
+    }
   }
 
   function reorderTab(id: string, targetId: string, position: "before" | "after") {
@@ -3672,6 +4432,12 @@ export const useQueryStore = defineStore("query", () => {
     const nextTabs = orderPinnedFirst(reordered, (item) => !!item.pinned);
     if (nextTabs.every((item, index) => item.id === tabs.value[index]?.id)) return false;
     tabs.value = nextTabs;
+
+    const owner = groupForTab(id);
+    if (owner) {
+      const order = new Map(tabs.value.map((tab, index) => [tab.id, index]));
+      owner.tabIds = [...owner.tabIds].sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0));
+    }
     return true;
   }
 
@@ -3739,7 +4505,7 @@ export const useQueryStore = defineStore("query", () => {
       clearExplain(tab);
     }
     tab.schema = schema;
-    if (tab.mode === "objects") tab.objectBrowser = { ...tab.objectBrowser, schema, viewport: undefined };
+    if (tab.mode === "objects") tab.objectBrowser = { ...tab.objectBrowser, schema, filter: undefined, viewport: undefined };
     persistSavedSqlExecutionTarget(tab, options);
   }
 
@@ -3873,6 +4639,8 @@ export const useQueryStore = defineStore("query", () => {
     tab.result = toErrorResult(e);
     tab.results = undefined;
     tab.activeResultIndex = undefined;
+    // An error result is a replacement, not the previous dataset.
+    publishResultGeneration(tab, "execute");
     tab.resultSessionId = undefined;
     tab.resultClientSessionId = undefined;
     tab.isExecuting = false;
@@ -3902,6 +4670,7 @@ export const useQueryStore = defineStore("query", () => {
         current.activeResultIndex = undefined;
         current.resultSessionId = undefined;
         current.resultClientSessionId = undefined;
+        publishResultGeneration(current, "execute");
         touchResult(current);
       }
       clearLiveBatchSqlExecution(current, executionId);
@@ -3909,16 +4678,20 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   async function executeCurrentTab() {
+    assertUpdateAllowsInteraction();
     const tab = tabs.value.find((t) => t.id === activeTabId.value);
     if (!tab || !tab.sql.trim()) return;
 
     await executeCurrentSql(tab.sql);
   }
 
-  async function executeCurrentSql(sql: string, options?: { skipRedisSafetyCheck?: boolean; sourceOffset?: number; openInNewResultTab?: boolean; onExecutionStarted?: () => void }) {
-    const executionTabId = activeTabId.value;
+  async function executeCurrentSql(sql: string, options?: { tabId?: string; skipRedisSafetyCheck?: boolean; sourceOffset?: number; openInNewResultTab?: boolean; onExecutionStarted?: () => void }) {
+    // Execution targets the requesting tab; only fall back to the global
+    // active tab when the caller did not (or could not) capture one.
+    const executionTabId = options?.tabId ?? activeTabId.value;
     if (!executionTabId) return;
     const tab = tabs.value.find((item) => item.id === executionTabId);
+    if (tab && pendingResultRunPreparations.has(tab)) return false;
     const previousGridKey = tab ? resultGridInstanceKey(tab) : undefined;
     if (tab?.mode === "query") {
       tab.resultSortColumn = undefined;
@@ -3934,13 +4707,16 @@ export const useQueryStore = defineStore("query", () => {
         current.resultGridRevision = uuid();
         if (current.activeResultRunId) syncActiveResultRunFromDisplayed(current);
         await nextTick();
-        if (previousGridKey && options?.openInNewResultTab !== true) clearDataGridPendingSnapshot(previousGridKey);
+        if (previousGridKey && options?.openInNewResultTab !== true) {
+          clearDataGridPendingSnapshot(previousGridKey);
+          clearDataGridViewSnapshot(previousGridKey);
+        }
       }
     }
     return producedResult;
   }
 
-  type QueryMetadataPatch = Pick<QueryTab, "queryAnalysis" | "querySourceColumns" | "queryEditabilityReason" | "tableMeta" | "resultColumnComments" | "queryDisplaySourceColumns">;
+  type QueryMetadataPatch = Pick<QueryTab, "queryAnalysis" | "querySourceColumns" | "queryWriteTargets" | "queryEditabilityReason" | "tableMeta" | "resultColumnComments" | "queryDisplaySourceColumns">;
 
   type LoadedEditableSource = {
     source: EditableQuerySource;
@@ -4026,9 +4802,34 @@ export const useQueryStore = defineStore("query", () => {
     oracleLobPreview: boolean;
   }
 
+  function oracleCompletionTableType(tab: QueryTab, metadataDbType: string, database: string, schema: string, tableName: string, catalog?: string): string | undefined {
+    if (metadataDbType !== "oracle" && metadataDbType !== "oceanbase-oracle") return undefined;
+    const resolvedSchema = schema.trim();
+    if (!resolvedSchema) return undefined;
+    const normalizeIdentifier = (value: string | undefined) => value?.trim().toLowerCase() ?? "";
+    const targetName = normalizeIdentifier(tableName);
+    const targetSchema = normalizeIdentifier(resolvedSchema);
+    const targetCatalog = catalog?.trim() ? normalizeIdentifier(catalog) : undefined;
+    const matches = useConnectionStore()
+      .lookupLocalCompletionTables(tab.connectionId!, database, tableName, 20, resolvedSchema, catalog)
+      .filter((table) => normalizeIdentifier(table.name) === targetName && normalizeIdentifier(table.schema) === targetSchema && (!targetCatalog || normalizeIdentifier(table.catalog) === targetCatalog));
+    if (matches.length !== 1) return undefined;
+    const match = matches[0]!;
+    return match.tableType?.trim() || match.type?.toUpperCase();
+  }
+
+  function canUseQueryKeylessRowPredicate(databaseType: DatabaseType, loaded: LoadedEditableSource): boolean {
+    if (!canUseKeylessRowPredicate(databaseType, loaded.tableMeta.primaryKeys)) return false;
+    // An unknown Oracle object may be a view whose query shape rejects ROWID
+    // and whose rows cannot be mapped safely for writes. Keep the result
+    // read-only until the object tree or tab metadata confirms its type.
+    return databaseType !== "oracle" || !!loaded.tableMeta.tableType?.trim();
+  }
+
   function applyQueryMetadataPatch(tab: QueryTab, patch: QueryMetadataPatch) {
     tab.queryAnalysis = patch.queryAnalysis;
     tab.querySourceColumns = patch.querySourceColumns;
+    tab.queryWriteTargets = patch.queryWriteTargets;
     tab.queryEditabilityReason = patch.queryEditabilityReason;
     tab.mongoEditTarget = undefined;
     tab.tableMeta = patch.tableMeta;
@@ -4037,6 +4838,12 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   function resolveEditableSourceMetadataTarget(tab: QueryTab, analysis: EditableQueryInfo, source: EditableQuerySource, conn: ConnectionConfig | undefined, dbType: string, executionDatabase: string): EditableSourceMetadataTarget {
+    // Oracle-family metadata rules (schema-less resolution + uppercase folding)
+    // must follow the connection's effective database type. Callers built from
+    // the raw connection db_type pass "jdbc" for a JDBC Oracle connection,
+    // which would keep the service-name schema fallback and the query's
+    // lowercase table spelling, so the write targets a non-existent table.
+    const metadataDbType = effectiveDatabaseTypeForConnection(conn) || dbType;
     // Metadata must resolve in the same namespace as the query execution. An
     // empty query-tab database still executes in the connection's default DB,
     // while database-tree dialects and SQL Server 3-part names may override it
@@ -4060,10 +4867,10 @@ export const useQueryStore = defineStore("query", () => {
     // connection's search_path. Keep the metadata request unqualified when no
     // schema was selected instead of assuming public (or the database name).
     const useCurrentPostgresSchema = (dbType === "postgres" || dbType === "kwdb") && !source.schema && !tab.schema;
-    const resolvedSchema = (dbType === "sqlserver" && !source.schema) || (ORACLE_LIKE_METADATA_TYPES.has(dbType) && !schema) || resolveAgentSearchPathSchema || useCurrentPostgresSchema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
-    const metadataSchema = normalizeUppercaseFoldedMetadataIdentifier(dbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
-    const metadataTableName = normalizeUppercaseFoldedMetadataIdentifier(dbType, source.tableName, source.tableNameQuoted)!;
-    const metadataCatalog = normalizeUppercaseFoldedMetadataIdentifier(dbType, source.catalog, source.catalogQuoted);
+    const resolvedSchema = (dbType === "sqlserver" && !source.schema) || (ORACLE_LIKE_METADATA_TYPES.has(metadataDbType) && !schema) || resolveAgentSearchPathSchema || useCurrentPostgresSchema ? "" : metadataSchemaForConnection(conn, metadataDatabase, schema || undefined);
+    const metadataSchema = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, resolvedSchema || undefined, source.schema ? source.schemaQuoted : false) || "";
+    const metadataTableName = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, source.tableName, source.tableNameQuoted)!;
+    const metadataCatalog = normalizeUppercaseFoldedMetadataIdentifier(metadataDbType, source.catalog, source.catalogQuoted);
     const metadataSource: EditableQuerySource = {
       ...source,
       catalog: metadataCatalog,
@@ -4073,10 +4880,11 @@ export const useQueryStore = defineStore("query", () => {
     // Keep SQL Server writes unqualified unless the SELECT source explicitly
     // named a schema, so SELECT and UPDATE resolve the same object.
     const writeSchema = dbType === "sqlserver" && !source.schema ? undefined : metadataSchema || undefined;
-    const knownTableType = tab.tableMeta?.tableName.toLowerCase() === metadataTableName.toLowerCase() && normalizeOptionalSchema(tab.tableMeta.schema) === normalizeOptionalSchema(metadataSchema) ? tab.tableMeta.tableType : undefined;
+    const localTableType = oracleCompletionTableType(tab, metadataDbType, metadataDatabase, metadataSchema || conn?.default_schema || "", metadataTableName, metadataCatalog);
+    const knownTableType = localTableType ?? (tab.tableMeta?.tableName.toLowerCase() === metadataTableName.toLowerCase() && normalizeOptionalSchema(tab.tableMeta.schema) === normalizeOptionalSchema(metadataSchema) ? tab.tableMeta.tableType : undefined);
     return {
       source: metadataSource,
-      analysis: normalizeUppercaseFoldedQueryAnalysis(dbType, cloneAnalysisForSource(analysis, metadataSource), metadataSchema || undefined, metadataTableName),
+      analysis: normalizeUppercaseFoldedQueryAnalysis(metadataDbType, cloneAnalysisForSource(analysis, metadataSource), metadataSchema || undefined, metadataTableName),
       writeSchema,
       request: {
         connectionId: tab.connectionId!,
@@ -4154,9 +4962,15 @@ export const useQueryStore = defineStore("query", () => {
     return loadedEditableSourceFromMetadata(target, loadedMetadata.metadata);
   }
 
-  function missingPrimaryKeysForSource(primaryKeys: string[], analysis: EditableQueryInfo, sourceKey: string): string[] {
+  function missingPrimaryKeysForSource(databaseType: DatabaseType, primaryKeys: string[], analysis: EditableQueryInfo, sourceKey: string): string[] {
     if (analysis.selectStar) return [];
-    const selectedColumns = new Set(analysis.columns.flatMap((column) => (column.sourceName && column.sourceKey === sourceKey ? [column.sourceName] : [])));
+    const selectedColumns = new Set(
+      analysis.columns.flatMap((column) => {
+        if (!column.sourceName || column.sourceKey !== sourceKey) return [];
+        if (databaseType === "oracle" && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID") return [DBX_ROWID_COLUMN, column.sourceName];
+        return [column.sourceName];
+      }),
+    );
     return primaryKeys.filter((primaryKey) => !selectedColumns.has(primaryKey));
   }
 
@@ -4176,9 +4990,12 @@ export const useQueryStore = defineStore("query", () => {
     return matches.length === 1 && matches[0]?.type === "table";
   }
 
-  async function resolveOracleRowIdSafety(tab: QueryTab, loaded: LoadedEditableSource): Promise<boolean> {
+  async function resolveOracleRowIdSafety(tab: QueryTab, loaded: LoadedEditableSource, databaseType: DatabaseType): Promise<boolean> {
     if (oracleRowIdIsSafeForQuery(tab, loaded)) return true;
     if (loaded.tableMeta.tableType?.trim()) return false;
+    // Never enumerate an Oracle schema on the query execution path: large
+    // schemas can make this optional editability check take minutes (#8462).
+    if (databaseType === "oracle") return false;
 
     const connection = useConnectionStore().getConfig(tab.connectionId!);
     const schema = loaded.tableMeta.schema?.trim() || tab.schema?.trim() || connection?.default_schema?.trim() || "";
@@ -4193,7 +5010,7 @@ export const useQueryStore = defineStore("query", () => {
         database: loaded.tableMeta.database ?? tab.database,
         schema: loaded.tableMeta.schema,
         tableName: loaded.tableMeta.tableName,
-        databaseType: "oracle",
+        databaseType,
         driverProfile: connection?.driver_profile || connection?.db_type,
         catalog: loaded.tableMeta.catalog,
       },
@@ -4210,7 +5027,10 @@ export const useQueryStore = defineStore("query", () => {
     const metadataAnalysis = expandStarProjectionColumnsForSource(bindColumnsForSource(databaseType, loaded.analysis, loaded.source, loaded.tableMeta.columns), loaded.source, loaded.tableMeta.columns);
     const oracleLobPreview = databaseType === "oracle" && primaryKeys.length > 0 && oracleRowIdIsSafeForQuery(tab, loaded) && oracleColumnsAllowDeferredLobMarkers(loaded.tableMeta.columns) && oracleQueryProjectsDeferredLob(metadataAnalysis, loaded.source.key, loaded.tableMeta.columns);
     const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [], oracleLobPreview };
-    const missingPrimaryKeys = declaredPrimaryKeys.length === 0 ? primaryKeys : missingPrimaryKeysForSource(primaryKeys, metadataAnalysis, loaded.source.key);
+    const missingPrimaryKeys =
+      declaredPrimaryKeys.length === 0
+        ? primaryKeys.filter((primaryKey) => !(databaseType === "oracle" && primaryKey === DBX_ROWID_COLUMN && metadataAnalysis.columns.some((column) => column.sourceKey === loaded.source.key && !column.sourceNameQuoted && column.sourceName?.toUpperCase() === "ROWID")))
+        : missingPrimaryKeysForSource(databaseType, primaryKeys, metadataAnalysis, loaded.source.key);
     if (missingPrimaryKeys.length === 0) return unchanged;
     const primaryKeySet = new Set(primaryKeys);
     const hasWritableProjection = metadataAnalysis.selectStar ? loaded.tableMeta.columns.some((column) => !primaryKeySet.has(column.name)) : metadataAnalysis.columns.some((column) => column.sourceName && column.sourceKey === loaded.source.key && !primaryKeySet.has(column.sourceName));
@@ -4221,7 +5041,7 @@ export const useQueryStore = defineStore("query", () => {
       databaseType,
       primaryKeys: missingPrimaryKeys,
       existingResultNames: metadataAnalysis.selectStar ? loaded.tableMeta.columns.map((column) => column.name) : metadataAnalysis.columns.map((column) => column.resultName),
-      sourceExpressions: databaseType === "oracle" && missingPrimaryKeys.includes(DBX_ROWID_COLUMN) ? { [DBX_ROWID_COLUMN]: "ROWIDTOCHAR(ROWID)" } : undefined,
+      sourceExpressions: missingPrimaryKeys.includes(DBX_ROWID_COLUMN) && (databaseType === "oracle" || databaseType === "xugu") ? { [DBX_ROWID_COLUMN]: databaseType === "oracle" ? "ROWIDTOCHAR(ROWID)" : "ROWID" } : undefined,
     });
     if (!rewritten) return unchanged;
     queryExecutionLog("info", "hidden-primary-keys", {
@@ -4248,13 +5068,14 @@ export const useQueryStore = defineStore("query", () => {
       const hasDirectSourceProjection = analysis.columns.some((column) => Boolean(column.sourceName) && (!column.sourceKey || column.sourceKey === source.key));
       if (!wholeSourceProjected && !hasDirectSourceProjection) return unchanged;
       // Whole-source projections already include declared primary keys. Only
-      // Oracle needs preflight metadata here to add ROWID for a keyless table.
-      if (databaseType !== "oracle" && wholeSourceProjected) return unchanged;
+      // Oracle and Xugu need preflight metadata here to add their synthetic
+      // row key for a keyless base table.
+      if (databaseType !== "oracle" && databaseType !== "xugu" && wholeSourceProjected) return unchanged;
 
       const target = resolveEditableSourceMetadataTarget(tab, analysis, source, conn, databaseType, executionDatabase);
       const cached = getCachedTableMetadata(target.request);
       let loaded = cached ? loadedEditableSourceFromMetadata(target, cached.metadata) : undefined;
-      if (!cached && databaseType === "oracle") {
+      if (!cached && (databaseType === "oracle" || databaseType === "xugu")) {
         // Oracle column discovery can be slow. A star projection over a table
         // with a declared primary key already returns the complete row identity,
         // so SQL can start while the full metadata needed for editing loads.
@@ -4285,12 +5106,12 @@ export const useQueryStore = defineStore("query", () => {
       if (loaded.tableMeta.tableType?.toUpperCase().includes("VIEW")) return unchanged;
       const columnPrimaryKeys = loaded.tableMeta.columns.filter((column) => column.is_primary_key).map((column) => column.name);
       const primaryKeys = databaseType === "oracle" ? loaded.tableMeta.primaryKeys : editablePrimaryKeys(databaseType, loaded.tableMeta.columns, loaded.tableMeta.tableType);
-      const syntheticOracleRowId = databaseType === "oracle" && usesSyntheticRowIdKey(databaseType, primaryKeys, loaded.tableMeta.tableType);
-      // Oracle base tables without a natural identifier use the same ROWID
-      // identity as table-data tabs. Confirm the object is a base table because
-      // selecting ROWID from a view can fail with ORA-01445.
-      if (syntheticOracleRowId && !(await resolveOracleRowIdSafety(tab, loaded))) return unchanged;
-      const declaredPrimaryKeys = databaseType === "oracle" && !syntheticOracleRowId ? primaryKeys : columnPrimaryKeys;
+      const syntheticRowId = (databaseType === "oracle" || databaseType === "xugu") && usesSyntheticRowIdKey(databaseType, primaryKeys, loaded.tableMeta.tableType);
+      // Base tables without a natural identifier use the same ROWID identity
+      // as table-data tabs (Oracle and Xugu). Confirm the object is a base
+      // table because selecting ROWID from a view can fail with ORA-01445.
+      if (syntheticRowId && !(await resolveOracleRowIdSafety(tab, loaded, databaseType))) return unchanged;
+      const declaredPrimaryKeys = databaseType === "oracle" && !syntheticRowId ? primaryKeys : columnPrimaryKeys;
       return buildHiddenPrimaryKeyPreparation(tab, sql, databaseType, loaded, primaryKeys, declaredPrimaryKeys, traceId, elapsed);
     } catch (error) {
       // Metadata enrichment is optional. Query execution must retain its prior
@@ -4457,9 +5278,9 @@ export const useQueryStore = defineStore("query", () => {
         .map((loaded) => {
           const metadataAnalysis = expandStarProjectionColumnsForSource(bindColumnsForSource(dbType, loaded.analysis, loaded.source, loaded.tableMeta.columns, allSourceColumns), loaded.source, loaded.tableMeta.columns);
           const primaryKeys = loaded.tableMeta.primaryKeys;
-          const sourceColumns = sourceColumnsForResult(metadataAnalysis, tab.result!.columns, loaded.source.key);
+          const sourceColumns = sourceColumnsForResult(metadataAnalysis, tab.result!.columns, loaded.source.key, dbType as DatabaseType, primaryKeys);
           const primaryKeysPresent = primaryKeysPresentForSource(dbType, primaryKeys, tab.result!.columns, metadataAnalysis, loaded.source.key, loaded.tableMeta.columns);
-          const keylessAllowed = sources.length === 1 && canUseKeylessRowPredicate(dbType as DatabaseType, primaryKeys);
+          const keylessAllowed = sources.length === 1 && canUseQueryKeylessRowPredicate(dbType as DatabaseType, loaded);
           const primaryKeySet = new Set(primaryKeys);
           const editableSourceColumnCount = (sourceColumns ?? []).filter((column) => column && !primaryKeySet.has(column)).length;
           return {
@@ -4479,12 +5300,12 @@ export const useQueryStore = defineStore("query", () => {
         const syntheticRowIdProjection = hiddenPrimaryKeys.find((projection) => projection.sourceName.toUpperCase() === DBX_ROWID_COLUMN);
         const primaryKeys = loaded.tableMeta.primaryKeys.length === 0 && syntheticRowIdProjection ? [DBX_ROWID_COLUMN] : loaded.tableMeta.primaryKeys;
         const displaySourceInfo = resolveResultColumnInfo(dbType, analysis, tab.result.columns, loadedSources);
-        const sourceColumns = sourceColumnsForResult(metadataAnalysis, tab.result.columns, loaded.source.key);
+        const sourceColumns = sourceColumnsForResult(metadataAnalysis, tab.result.columns, loaded.source.key, dbType as DatabaseType, primaryKeys);
         if (sourceColumns && syntheticRowIdProjection) {
           const resultIndex = tab.result.columns.findIndex((column) => column.toLowerCase() === syntheticRowIdProjection.alias.toLowerCase());
           if (resultIndex >= 0) sourceColumns[resultIndex] = DBX_ROWID_COLUMN;
         }
-        if (primaryKeys.length === 0 && !canUseKeylessRowPredicate(dbType as DatabaseType, primaryKeys)) {
+        if (primaryKeys.length === 0 && !canUseQueryKeylessRowPredicate(dbType as DatabaseType, loaded)) {
           return {
             queryAnalysis: undefined,
             querySourceColumns: undefined,
@@ -4544,11 +5365,16 @@ export const useQueryStore = defineStore("query", () => {
       }
 
       if (candidates.length > 1) {
+        const target = candidates[0]!;
         return {
-          queryAnalysis: undefined,
-          querySourceColumns: undefined,
-          queryEditabilityReason: "complex-source",
-          tableMeta: undefined,
+          queryAnalysis: { ...target.analysis, multiSource: true, allowInsert: false, allowDelete: false, allowInsertDelete: false },
+          querySourceColumns: tab.result.columns.map((_, index) => {
+            const owners = candidates.filter((candidate) => candidate.sourceColumns?.[index] !== undefined);
+            return owners.length === 1 ? owners[0]!.sourceColumns![index] : undefined;
+          }),
+          queryWriteTargets: candidates.map((candidate) => ({ tableMeta: candidate.tableMeta, sourceColumns: candidate.sourceColumns! })),
+          queryEditabilityReason: undefined,
+          tableMeta: target.tableMeta,
           resultColumnComments: multiSourceInfo?.comments,
           queryDisplaySourceColumns: multiSourceInfo?.mapping,
         };
@@ -4590,7 +5416,9 @@ export const useQueryStore = defineStore("query", () => {
       const tab = tabs.value.find((t) => t.id === tabId);
       if (!tab || tab.result !== result) return;
       queryExecutionLog("info", "metadata:start", { traceId, elapsed: elapsed() });
-      const patch = await buildQueryMetadataPatch(tab, sql, executionDatabase, traceId, elapsed, hiddenPrimaryKeys);
+      // Metadata requests outlive the displayed result when another query starts
+      // or a retained run is selected. Analyze this result, not the live tab.
+      const patch = await buildQueryMetadataPatch({ ...tab, result }, sql, executionDatabase, traceId, elapsed, hiddenPrimaryKeys);
       if (patch?.queryAnalysis && hasHiddenPhysicalRowKey(databaseType, hiddenPrimaryKeys)) {
         patch.queryAnalysis = { ...patch.queryAnalysis, allowInsert: false };
       }
@@ -4758,6 +5586,8 @@ export const useQueryStore = defineStore("query", () => {
       };
       pagination?: { limit: number; offset: number; sessionId?: string; clientSessionId?: string };
       appendResult?: { maxRows: number };
+      /** Logical-result publication origin for the view-snapshot cache. */
+      publicationOrigin?: ResultPublicationOrigin;
       mongoSafety?: MongoAggregateSafetyOptions;
       preserveResultDuringExecution?: boolean;
       preserveTotalRowCountDuringExecution?: boolean;
@@ -4775,8 +5605,10 @@ export const useQueryStore = defineStore("query", () => {
       batchResume?: BatchSqlResumeOptions;
     },
   ) {
+    assertUpdateAllowsInteraction();
     const tab = findExecutionTab(id);
     if (!tab || !sql.trim()) return;
+    if (pendingResultRunPreparations.has(tab)) return false;
 
     const openInNewResultTab = tab.mode === "query" && options?.openInNewResultTab === true;
     // Auto-saved results need two independent decisions: keep the currently
@@ -4784,24 +5616,54 @@ export const useQueryStore = defineStore("query", () => {
     // response as another run. Previously `resultAutoSave` only made the latter
     // decision after clearing the displayed payload, which caused the result
     // toolbar and grid to briefly disappear before the next Run was added.
-    const captureAutoSavedResultRun = tab.mode === "query" && tab.resultAutoSave === true && !!tab.activeResultRunId && !!tab.result;
+    const captureAutoSavedResultRun = tab.mode === "query" && tab.resultAutoSave === true && (!!tab.activeResultRunId || !!tab.result);
     let captureResultRun = openInNewResultTab || captureAutoSavedResultRun;
+    let resultRunToRestore: string | undefined;
+    let reuseResultRun = false;
     if (!captureResultRun && tab.mode === "query" && !tab.resultAutoSave && tab.activeResultRunId) {
       const activeRun = tab.resultRuns?.find((run) => run.id === tab.activeResultRunId);
       if (activeRun?.pinned) {
         const reusableRun = tab.resultRuns?.find((run) => !run.pinned);
         if (reusableRun) {
-          // A stale disk snapshot must not make us fall back to overwriting
-          // the pinned active run. Capture a fresh run instead.
-          captureResultRun = !(await setActiveResultRun(id, reusableRun.id));
+          resultRunToRestore = reusableRun.id;
+          reuseResultRun = true;
         } else {
           captureResultRun = true;
         }
       }
     }
-    if (captureResultRun && tab.activeResultRunId && !tab.result) {
-      await setActiveResultRun(id, tab.activeResultRunId);
-      if (findExecutionTab(id) !== tab) return false;
+    if (captureResultRun && tab.activeResultRunId && !tab.result) resultRunToRestore = tab.activeResultRunId;
+    if (resultRunToRestore) {
+      // Reserve before disk I/O so another click cannot queue a second SQL.
+      const preparationId = uuid();
+      pendingResultRunPreparations.set(tab, preparationId);
+      tab.isExecuting = true;
+      tab.isCancelling = false;
+      tab.executionId = preparationId;
+      tab.executingResultRunId = null;
+      tab.queryExecutionStartedAt = Date.now();
+      const isCurrent = () => findExecutionTab(id) === tab && tab.executionId === preparationId && pendingResultRunPreparations.get(tab) === preparationId;
+      let prepared = false;
+      try {
+        const restored = await setActiveResultRun(id, resultRunToRestore, { isCurrent });
+        if (!isCurrent()) return false;
+        if (reuseResultRun) captureResultRun = !restored;
+        prepared = true;
+      } catch (error) {
+        if (!isCurrent()) return false;
+        throw error;
+      } finally {
+        if (pendingResultRunPreparations.get(tab) === preparationId) {
+          pendingResultRunPreparations.delete(tab);
+          if (!prepared && tab.executionId === preparationId) {
+            tab.isExecuting = false;
+            tab.isCancelling = false;
+            tab.executionId = undefined;
+            tab.executingResultRunId = undefined;
+            tab.queryExecutionStartedAt = undefined;
+          }
+        }
+      }
     }
     const executionId = uuid();
     const executionEditorFingerprint = tab.mode === "query" ? sqlTextFingerprint(tab.sql) : undefined;
@@ -4941,6 +5803,43 @@ export const useQueryStore = defineStore("query", () => {
           .map((line) => line.trim())
           .filter((line) => line.length > 0);
         if (commands.length === 0) return false;
+        if (commands.length === 1 && isRedisMonitorCommand(commands[0])) {
+          const monitor = startRedisMonitor(
+            () => api.redisPubSubConnect(executionConnectionId, true),
+            (rows) => {
+              const current = findExecutionTab(id);
+              if (current?.executionId !== executionId) return;
+              current.result = markQueryResultRowsRaw(annotateQueryResultSource({ columns: ["MONITOR"], rows: rows.map((message) => [message]), affected_rows: 0, execution_time_ms: performance.now() - startedAt }, "MONITOR"));
+              current.results = undefined;
+              current.activeResultIndex = undefined;
+              current.queryEditabilityReason = undefined;
+              current.queryWriteTargets = undefined;
+              current.tableMeta = undefined;
+              current.resultBaseSql = "MONITOR";
+              current.redisMonitorActive = true;
+              current.queryAnalysis = undefined;
+              current.querySourceColumns = undefined;
+              current.resultColumnComments = undefined;
+              current.queryDisplaySourceColumns = undefined;
+              current.mongoEditTarget = undefined;
+              if (!producedResult) {
+                publishResultGeneration(current, "execute");
+                syncDisplayedResultRun(current, "MONITOR", captureResultRun);
+              }
+              producedResult = true;
+              touchResult(current);
+            },
+          );
+          redisMonitors.set(executionId, monitor.stop);
+          try {
+            await monitor.done;
+          } finally {
+            redisMonitors.delete(executionId);
+            const current = findExecutionTab(id);
+            if (current?.executionId === executionId) current.redisMonitorActive = false;
+          }
+          return producedResult;
+        }
         queryExecutionLog("info", "redis:start", { traceId, db: currentDb, commandCount: commands.length, sqlLength: sql.length });
 
         const allResults: QueryResult[] = [];
@@ -4981,10 +5880,13 @@ export const useQueryStore = defineStore("query", () => {
             current.activeResultIndex = undefined;
             current.result = allResults[0];
           }
+          // Redis command batches always replace the visible result.
+          publishResultGeneration(current, "execute");
           producedResult = current.result !== undefined;
           touchResult(current);
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
+          current.queryWriteTargets = undefined;
           current.resultColumnComments = undefined;
           current.queryDisplaySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
@@ -5365,10 +6267,12 @@ export const useQueryStore = defineStore("query", () => {
             current.activeResultIndex = undefined;
             current.result = allResults[0];
           }
+          publishResultGeneration(current, shouldAppendResult ? "append" : "execute");
           producedResult = current.result !== undefined;
           touchResult(current);
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
+          current.queryWriteTargets = undefined;
           current.resultColumnComments = undefined;
           current.queryDisplaySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
@@ -5432,10 +6336,13 @@ export const useQueryStore = defineStore("query", () => {
           current.results = allResults.length > 1 ? allResults : undefined;
           current.activeResultIndex = allResults.length > 1 ? resultIndex : undefined;
           current.result = allResults[resultIndex];
+          // Elasticsearch batch requests replace the visible result.
+          publishResultGeneration(current, "execute");
           producedResult = current.result !== undefined;
           touchResult(current);
           current.queryAnalysis = undefined;
           current.querySourceColumns = undefined;
+          current.queryWriteTargets = undefined;
           current.resultColumnComments = undefined;
           current.queryDisplaySourceColumns = undefined;
           current.queryEditabilityReason = undefined;
@@ -5758,6 +6665,9 @@ export const useQueryStore = defineStore("query", () => {
           current.activeResultIndex = undefined;
           current.result = results[0];
         }
+        // Logical-result identity for the view-snapshot cache. An append extends
+        // the same dataset; every other branch above replaces it.
+        publishResultGeneration(current, shouldAppendResult ? "append" : (options?.publicationOrigin ?? "execute"));
         producedResult = current.result !== undefined;
         current.resultBaseSql = batchResume ? batchResume.batch.submittedSql : shouldReplaceActiveResultInGroup ? (current.resultBaseSql ?? queryBaseSql) : queryBaseSql;
         current.resultEditorFingerprint = batchResume ? batchResume.batch.editorFingerprint : shouldReplaceActiveResultInGroup ? (current.resultEditorFingerprint ?? executionEditorFingerprint) : executionEditorFingerprint;
@@ -5930,6 +6840,7 @@ export const useQueryStore = defineStore("query", () => {
         }
         current.queryAnalysis = undefined;
         current.querySourceColumns = undefined;
+        current.queryWriteTargets = undefined;
         current.resultColumnComments = undefined;
         current.queryDisplaySourceColumns = undefined;
         current.queryEditabilityReason = undefined;
@@ -5947,6 +6858,8 @@ export const useQueryStore = defineStore("query", () => {
         current.resultTotalRowCountLoading = false;
         touchResult(current);
         producedResult = true;
+        // An error result replaces the dataset the view snapshot was taken on.
+        publishResultGeneration(current, "execute");
         // When a pinned result requires a new run, errors must use that same
         // run instead of being replaced by the retained pinned result below.
         syncDisplayedResultRun(current, queryBaseSql, captureResultRun);
@@ -6016,6 +6929,7 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   async function explainTabSql(id: string, sql: string, databaseType?: DatabaseType, explainMode?: string) {
+    assertUpdateAllowsInteraction();
     const tab = tabs.value.find((t) => t.id === id);
     if (!tab) return { ok: false as const, reason: "empty" as const };
     const conn = useConnectionStore().getConfig(tab.connectionId);
@@ -6333,7 +7247,7 @@ export const useQueryStore = defineStore("query", () => {
       });
       const current = tabs.value.find((t) => t.id === id);
       if (current?.explainExecutionId === executionId) {
-        current.explainPlan = parseExplainResult(databaseType as "mysql" | "postgres", result);
+        current.explainPlan = parseExplainResult(databaseType as ExplainPlanDatabaseType, result);
         current.explainError = undefined;
       }
     } catch (e: any) {
@@ -6362,10 +7276,27 @@ export const useQueryStore = defineStore("query", () => {
 
     const executionId = tab.executionId;
     if (!executionId) return false;
+    const stopMonitor = redisMonitors.get(executionId);
+    if (stopMonitor) {
+      tab.isCancelling = true;
+      tab.cancelRequestCount = (tab.cancelRequestCount ?? 0) + 1;
+      stopMonitor();
+      return true;
+    }
     tab.isCancelling = true;
     // 单调递增、不随取消结果回退：导航流程据此判断"执行期间用户请求过停止"
     // （isCancelling 在取消失败或查询先完成时会被清掉，无法承担这个语义）
     tab.cancelRequestCount = (tab.cancelRequestCount ?? 0) + 1;
+    if (pendingResultRunPreparations.get(tab) === executionId) {
+      // No SQL was dispatched; invalidate the disk read without a backend cancel.
+      pendingResultRunPreparations.delete(tab);
+      tab.isExecuting = false;
+      tab.isCancelling = false;
+      tab.executionId = undefined;
+      tab.executingResultRunId = undefined;
+      tab.queryExecutionStartedAt = undefined;
+      return true;
+    }
     const cancellationStartedAt = performance.now();
     try {
       const canceled = await withCancelQueryTimeout(api.cancelQuery(executionId));
@@ -6447,6 +7378,7 @@ export const useQueryStore = defineStore("query", () => {
     touchResult(tab, Date.now(), { reuseEstimatedBytes: true });
     tab.queryAnalysis = undefined;
     tab.querySourceColumns = undefined;
+    tab.queryWriteTargets = undefined;
     tab.resultColumnComments = undefined;
     tab.queryDisplaySourceColumns = undefined;
     tab.queryEditabilityReason = undefined;
@@ -6530,15 +7462,6 @@ export const useQueryStore = defineStore("query", () => {
     activeTabHistory.value = [...activeTabHistory.value.filter((tabId) => tabId !== id), id];
   }
 
-  function fallbackActiveTabAfterClose(closedId: string, closedIndex: number): string | null {
-    const remainingIds = new Set(tabs.value.map((tab) => tab.id));
-    // Prefer the most recently focused remaining tab. This preserves the
-    // source query tab when a transient table-info/data tab is closed.
-    const history = activeTabHistory.value.filter((tabId) => tabId !== closedId && remainingIds.has(tabId));
-    activeTabHistory.value = history;
-    return [...history].reverse().find((tabId) => remainingIds.has(tabId)) ?? tabs.value[Math.min(closedIndex, tabs.value.length - 1)]?.id ?? null;
-  }
-
   watch(
     activeTabId,
     (id) => {
@@ -6548,6 +7471,16 @@ export const useQueryStore = defineStore("query", () => {
         Date.now(),
         { reuseEstimatedBytes: true },
       );
+    },
+    { flush: "sync" },
+  );
+
+  watch(
+    activeTabId,
+    (id) => {
+      if (tabs.value.length > 0 && (!id || !tabs.value.some((tab) => tab.id === id))) {
+        activeTabId.value = tabs.value[0].id;
+      }
     },
     { flush: "sync" },
   );
@@ -6568,10 +7501,13 @@ export const useQueryStore = defineStore("query", () => {
     // 置空让 projectResultRun 按需重算
     tab.resultRuns = snapshot.resultRuns ? markQueryResultRunsRowsRaw(snapshot.resultRuns).map((run) => ({ ...run, resultEstimatedBytes: undefined })) : tab.resultRuns;
     tab.activeResultRunId = snapshot.activeResultRunId ?? tab.activeResultRunId;
+    // Disk restore is the same logical result: keep the captured view identity.
+    tab.resultViewGeneration = snapshot.resultViewGeneration ?? tab.resultViewGeneration;
     if (!tab.result && !tab.results && !tab.resultRuns) return false;
 
     tab.queryAnalysis = snapshot.queryAnalysis;
     tab.querySourceColumns = snapshot.querySourceColumns;
+    tab.queryWriteTargets = snapshot.queryWriteTargets;
     tab.resultColumnComments = snapshot.resultColumnComments;
     tab.queryDisplaySourceColumns = snapshot.queryDisplaySourceColumns;
     tab.queryEditabilityReason = snapshot.queryEditabilityReason;
@@ -6656,9 +7592,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!restoreCachedResultPayload(tab, archive.snapshot)) return undefined;
     const activeRun = tab.resultRuns?.find((run) => run.id === tab.activeResultRunId) ?? tab.resultRuns?.[0];
     if (activeRun) projectResultRun(tab, activeRun);
-    tabs.value.push(tab);
-    activeTabId.value = id;
-    return id;
+    return registerOpenTab(tab);
   }
 
   async function importResultArchive(bytes: Uint8Array | ArrayBuffer): Promise<string | undefined> {
@@ -6969,6 +7903,7 @@ export const useQueryStore = defineStore("query", () => {
       useAgentCursor,
       filePath: options.filePath,
       format: options.format,
+      ...(options.format === "sql" && options.insertMode ? { insertMode: options.insertMode } : {}),
       includeSqlSheet: options.format === "xlsx" && options.includeSqlSheet === true,
       pageSize: settings.exportBatchSize,
       rowLimit,
@@ -7043,6 +7978,10 @@ export const useQueryStore = defineStore("query", () => {
   return {
     tabs,
     activeTabId,
+    groups,
+    focusedGroupId,
+    orientation,
+    sizes,
     isOpenTabsLoaded,
     recentTabIds,
     initOpenTabs,
@@ -7060,6 +7999,14 @@ export const useQueryStore = defineStore("query", () => {
     createTab,
     openObjectSourceTab,
     showExecutedQueryResults,
+    focusGroup,
+    activateTab,
+    activateTabInGroup,
+    splitTabRight,
+    splitTabDown,
+    setOrientation,
+    moveTabToGroup,
+    unsplitTab,
     switchTab,
     closeTab,
     forceClosePendingTab,
@@ -7082,6 +8029,8 @@ export const useQueryStore = defineStore("query", () => {
     discardTabChanges,
     requestAppCloseConfirmation,
     closeOtherTabs,
+    closeOtherTabsInGroup,
+    closeAllTabsInGroup,
     closeTabsByIds,
     closeRightTabs,
     closeOtherRegularTabs,
@@ -7106,8 +8055,14 @@ export const useQueryStore = defineStore("query", () => {
     updateDataGridLocalColumnFilters,
     updateDataGridHiddenColumnKeys,
     updateEditorViewport,
+    updateTabUiState,
+    updateTabPageUiState,
+    updateTabPageResult,
     updateEditorSelection,
+    flushEditorState,
     updateObjectBrowserViewport,
+    updateObjectBrowserSearch,
+    updateObjectBrowserFilter,
     updateNacosConfigEditorViewport,
     setAutoCommit,
     markManualTransactionDirty,
@@ -7124,6 +8079,7 @@ export const useQueryStore = defineStore("query", () => {
     openSqlServerActivityTrace,
     openMysqlDashboard,
     openPostgresDashboard,
+    openXuguDashboard,
     openNacosDashboard,
     openDamengUsers,
     openDamengRoles,

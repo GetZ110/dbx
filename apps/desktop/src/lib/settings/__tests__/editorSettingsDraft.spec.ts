@@ -1,6 +1,15 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { EDITOR_SETTINGS_DRAFT_KEYS, editorSettingsDraftFromSettings, editorSettingsDraftChanged, editorSettingsPatchFromDraft, normalizeQueryResultMaxRowsDraft, normalizeTableOpenPageSizeDraft, shouldConfirmEditorSettingsDialogClose } from "../editorSettingsDraft";
+import {
+  EDITOR_SETTINGS_DRAFT_KEYS,
+  editorSettingsDraftFromSettings,
+  editorSettingsDraftChanged,
+  editorSettingsDraftPatchFromSettings,
+  editorSettingsPatchFromDraft,
+  normalizeQueryResultMaxRowsDraft,
+  normalizeTableOpenPageSizeDraft,
+  shouldConfirmEditorSettingsDialogClose,
+} from "../editorSettingsDraft";
 import type { EditorSettings } from "@/stores/settingsStore";
 
 const settingsDialogSource = readFileSync(new URL("../../../components/editor/EditorSettingsDialog.vue", import.meta.url), "utf8");
@@ -68,6 +77,10 @@ describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataTabReuseMode");
   });
 
+  it("includes generated SQL identifier quote preference", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("generateSqlQuoteIdentifiers");
+  });
+
   it("includes adjacent data-tab opening", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("openDataTabsNextToActive");
   });
@@ -97,6 +110,7 @@ describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
 
   it("includes the data grid filter view", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataGridFilterEditorView");
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataGridKeepFilterEditorExpanded");
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("dataGridTextFilterPanelHeight");
   });
 
@@ -183,9 +197,10 @@ describe("editorSettingsDraftFromSettings", () => {
     expect(editorSettingsDraftFromSettings(makeSettings({ colorizeDataGridCellTypes: false })).colorizeDataGridCellTypes).toBe(false);
   });
 
-  it("maps the data grid filter view from settings", () => {
-    const draft = editorSettingsDraftFromSettings(makeSettings({ dataGridFilterEditorView: "text", dataGridTextFilterPanelHeight: 224 }));
+  it("maps the data grid filter view and persistent expansion from settings", () => {
+    const draft = editorSettingsDraftFromSettings(makeSettings({ dataGridFilterEditorView: "text", dataGridKeepFilterEditorExpanded: true, dataGridTextFilterPanelHeight: 224 }));
     expect(draft.dataGridFilterEditorView).toBe("text");
+    expect(draft.dataGridKeepFilterEditorExpanded).toBe(true);
     expect(draft.dataGridTextFilterPanelHeight).toBe(224);
   });
 
@@ -462,5 +477,28 @@ describe("editorSettingsPatchFromDraft - tabLayout", () => {
     const base = editorSettingsDraftFromSettings(settings);
     const patch = editorSettingsPatchFromDraft(draft, base);
     expect(patch.tabLayout).toBeUndefined();
+  });
+});
+
+describe("editorSettingsDraftPatchFromSettings", () => {
+  it("contains exactly the keys present in the input", () => {
+    const patch = editorSettingsDraftPatchFromSettings({ wordWrap: true, pageSize: 200 } as Partial<EditorSettings>);
+    expect(Object.keys(patch).sort()).toEqual(["pageSize", "wordWrap"]);
+    expect(patch.wordWrap).toBe(true);
+    expect(patch.pageSize).toBe(200);
+  });
+
+  it("normalizes imported values per key", () => {
+    const patch = editorSettingsDraftPatchFromSettings({ pageSize: 999999 } as Partial<EditorSettings>);
+    expect(patch.pageSize).toBe(normalizeTableOpenPageSizeDraft(999999));
+  });
+
+  it("is the base for the settings import path in the dialog", () => {
+    // The import must patch only imported keys into the edit refs; rebuilding
+    // the whole draft would drop unsaved state the file does not cover (e.g. a
+    // half-filled table-column template row, which serialization drops).
+    expect(settingsDialogSource).toContain("const patch = editorSettingsDraftPatchFromSettings(imported);");
+    expect(settingsDialogSource).toContain("applyEditorSettingsKeysToRefs(patch as EditorSettingsDraft, Object.keys(patch) as EditorSettingsDraftKey[]);");
+    expect(settingsDialogSource).not.toContain("const merged = editorSettingsDraftFromSettings({");
   });
 });

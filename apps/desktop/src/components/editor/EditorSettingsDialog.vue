@@ -10,8 +10,6 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   ChevronUp,
   CircleHelp,
   Cloud,
@@ -69,6 +67,7 @@ import {
   normalizeAiHeaders,
   getAiProviderPreset,
   getAiProviderPresetId,
+  getAiProviderPresetDefaultEndpoint,
   getAiProviderPresetOption,
   isAiPartnerProviderPreset,
   type AiProvider,
@@ -96,7 +95,9 @@ import {
   type CustomThemeColors,
   type CustomTheme,
   type McpConnectionPolicy,
+  type McpGroupPolicy,
   type ClickTableNavigationTarget,
+  type EditorSettings,
   type SqlCompletionTriggerMode,
   SIDEBAR_INDENT_MIN,
   SIDEBAR_INDENT_MAX,
@@ -131,10 +132,15 @@ import {
   forgetWebdavSyncSecretsPassphrase,
   forgetWebdavSavedPassword,
   getAppSupportInfo,
+  checkBackgroundImage,
+  clearBackgroundImage,
+  saveBackgroundImage,
   loadMaxAgentTurns,
   saveMaxAgentTurns,
   loadMaxRetries,
   saveMaxRetries,
+  loadSqlFileUploadMaxBytes,
+  saveSqlFileUploadMaxMb,
   saveWebdavSyncSecretsPreference,
   saveWebdavSavedPassword,
   saveSnippetSavedToken,
@@ -174,9 +180,9 @@ import { currentExecutableStatementRange, type SqlTextRange } from "@/lib/sql/sq
 import { executableStatementRangeCacheForDoc, executableStatementRangeStartingAt, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
 import { EMPTY_TABLE_COLUMN_TEMPLATE_DATA_TYPE, parseTableColumnTemplateFields, TABLE_COLUMN_TEMPLATE_DATABASE_TYPES, tableColumnTemplateRowsToSettings } from "@/lib/table/tableColumnTemplates";
 import { DEFAULT_SQL_VARIABLE_SYNTAX_TOGGLES, normalizeSqlVariableSyntaxOverrides, SQL_VARIABLE_SYNTAX_DATABASE_TYPES, SQL_VARIABLE_SYNTAX_KEYS, SQL_VARIABLE_SYNTAX_TOKENS, type SqlVariableSyntaxOverrides, type SqlVariableSyntaxToggles } from "@/lib/sql/sqlVariableSyntax";
-import { buildMcpCherryStudioConfig, buildMcpCodexConfig, buildMcpDeepSeekHarnessConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpPiConfig, buildMcpTraeConfig, buildMcpVsCodeConfig, mcpWebBackendUrl, type McpLaunchConfig } from "@/lib/mcp/mcpConfigTemplates";
+import { buildMcpCherryStudioConfig, buildMcpCodexConfig, buildMcpDeepSeekHarnessConfig, buildMcpJsonConfig, buildMcpOpenCodeConfig, buildMcpPiConfig, buildMcpQoderConfig, buildMcpTraeConfig, buildMcpVsCodeConfig, mcpWebBackendUrl, type McpLaunchConfig } from "@/lib/mcp/mcpConfigTemplates";
 import { beginMcpStatusRequest, mcpUpdateAvailability } from "@/lib/mcp/mcpUpdateStatus";
-import { isMcpPolicyMutationBlocked, MCP_CAPABILITY_ROWS, MCP_EXECUTION_MODE_COLUMNS, mcpExecutionModeFromPolicy, mcpPolicyFieldsForExecutionMode, type McpExecutionMode } from "@/lib/mcp/mcpPolicySelection";
+import { isMcpPolicyMutationBlocked, MCP_CAPABILITY_ROWS, MCP_EXECUTION_MODE_COLUMNS, MCP_TOOL_OPTIONS, mcpExecutionModeFromPolicy, mcpPolicyFieldsForExecutionMode, toggleMcpAllowedToolName, type McpExecutionMode } from "@/lib/mcp/mcpPolicySelection";
 import { isMacOS, isWindows } from "@/lib/backend/platform";
 import { combineDataTypeForDatabase, dataTypeLengthInputValue, getDataTypeOptions, getDefaultLengthForType, isDataTypeLengthDisabled, splitDataType } from "@/lib/table/tableStructureEditorState";
 import { useToast } from "@/composables/useToast";
@@ -187,44 +193,109 @@ import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
 import AiProviderLogo from "@/components/icons/AiProviderLogo.vue";
 import AppLogo from "@/components/icons/AppLogo.vue";
 import ChangelogPanel from "@/components/settings/ChangelogPanel.vue";
-import McpConnectionScopePicker from "@/components/settings/McpConnectionScopePicker.vue";
+import SettingsTransferPanel from "@/components/settings/SettingsTransferPanel.vue";
+import McpResourceScopePicker from "@/components/settings/McpResourceScopePicker.vue";
 import McpDatabaseScopePicker from "@/components/settings/McpDatabaseScopePicker.vue";
 import McpAuthorizationStepper from "@/components/settings/McpAuthorizationStepper.vue";
 import ScheduledDatabaseBackupSettings from "@/components/backup/ScheduledDatabaseBackupSettings.vue";
 import SqlFormatterSettingsPanel from "./SqlFormatterSettingsPanel.vue";
 import { APP_CUSTOM_UI_COLOR_DEFS, APP_THEME_PALETTES, type AppCornerStyle, type AppCustomUiColors, type AppThemeAppearance, type AppThemeMode, type AppThemePalette } from "@/lib/app/appTheme";
-import { editorSettingsDraftChanged, editorSettingsDraftFromSettings, editorSettingsPatchFromDraft, normalizeQueryResultMaxRowsDraft, normalizeTableOpenPageSizeDraft, shouldConfirmEditorSettingsDialogClose, type EditorSettingsDraft } from "@/lib/settings/editorSettingsDraft";
+import { BACKGROUND_IMAGE_DISPLAY_MODES, BACKGROUND_IMAGE_STORAGE_LIMIT_BYTES, defaultBackgroundImageSettings, normalizeBackgroundImageDisplayMode, type BackgroundImageSettings } from "@/lib/app/appBackgroundImage";
+import {
+  editorSettingsDraftChanged,
+  editorSettingsDraftFromSettings,
+  editorSettingsDraftPatchFromSettings,
+  editorSettingsPatchFromDraft,
+  normalizeQueryResultMaxRowsDraft,
+  normalizeTableOpenPageSizeDraft,
+  shouldConfirmEditorSettingsDialogClose,
+  type EditorSettingsDraft,
+  type EditorSettingsDraftKey,
+} from "@/lib/settings/editorSettingsDraft";
+import { applyEditorSettingsDraftToRefs, type EditorSettingsDraftRefMap } from "@/lib/settings/applyEditorSettingsDraft";
+import { serializeSettingsTransfer, sortTransferCategories, transferCategoryForKey, type SettingsTransferCategoryId } from "@/lib/settings/settingsTransfer";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
-import { currentLocale, setLocale, type Locale } from "@/i18n";
-import { SETTINGS_SEARCH_DEFINITIONS, TOOLBAR_VISIBILITY_ITEMS, createShortcutSettingsSearchDefinitions, resolveSettingsSearchEntries, searchSettings, toolbarVisibilityItemLabel, type SettingsCategory, type SettingsSearchEntry, type ToolbarVisibilityItem } from "@/lib/settings/settingsSearch";
+import { currentLocale, previewLocale, restoreLocalePreview, setLocale, type Locale } from "@/i18n";
+import {
+  SETTINGS_SEARCH_DEFINITIONS,
+  TOOLBAR_VISIBILITY_ITEMS,
+  createShortcutSettingsSearchDefinitions,
+  resolveSettingsCategory,
+  resolveSettingsSearchEntries,
+  searchSettings,
+  toolbarVisibilityItemLabel,
+  type SettingsCategory,
+  type SettingsSearchEntry,
+  type ToolbarVisibilityItem,
+} from "@/lib/settings/settingsSearch";
 import { LOCALE_OPTIONS } from "@/lib/app/localeOptions";
 import { DEFAULT_WEB_DAV_AUTO_UPLOAD_INTERVAL_MINUTES, DEFAULT_WEB_DAV_REMOTE_PATH, normalizedWebDavAutoUploadInterval, writeWebDavAutoUploadFields } from "@/lib/webdav/webdavAutoUploadConfig";
 import { apiUrl, webPath } from "@/lib/common/webPath";
 import { DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, normalizeCustomFontFamilyInput, readableFontFamily, SYSTEM_UI_FONT_FAMILY } from "@/lib/app/appFonts";
 import { buildFontFamilyOptions, displayFontFamily, isPresetFontFamily, loadSystemFontNames } from "@/lib/app/fontFamilyOptions";
 import { buildAppSupportInfoRows, formatAppSupportInfoForClipboard, type AppSupportInfoLabels } from "@/lib/app/supportInfo";
+import { useUiFontFamilyPreview } from "@/composables/useUiFontFamilyPreview";
 import { DateTimePatterns, normalizeSupportedDateTimePattern } from "@/lib/dataGrid/columnFormatter";
 import { MAX_RESULT_PAGE_SIZE, MIN_RESULT_PAGE_SIZE } from "@/lib/dataGrid/paginationPageSize";
 import { MAX_QUERY_RESULT_MAX_ROWS } from "@/lib/dataGrid/queryResultRowLimit";
+import { MAX_EXTERNAL_SQL_EDITOR_FILE_MB, MIN_EXTERNAL_SQL_EDITOR_FILE_MB, clampExternalSqlEditorMaxMbInput } from "@/lib/sql/sqlFileOpen";
 import type { PromptTemplate } from "@/types/promptTemplate";
 import { GLOBAL_INSTRUCTIONS_MAX, PROMPT_TEMPLATE_CONTENT_MAX, PROMPT_TEMPLATE_NAME_MAX, promptTemplateCharacterCount } from "@/types/promptTemplate";
 import { METADATA_CACHE_HARD_MAX_MEMORY_MB, METADATA_CACHE_MIN_MEMORY_MB, normalizeMetadataCacheMemoryMb } from "@/lib/metadata/metadataRuntimeCache";
 import { databaseManifestEntry, manifestDatabaseTypes } from "@/lib/database/databaseDriverManifest";
+import { buildConnectionGroupIdPathMap, connectionGroupDestinationRows, connectionIdsInGroups } from "@/lib/sidebar/sidebarLayout";
 
-const { t } = useI18n();
+const { t, locale } = useI18n();
 const { toast } = useToast();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
 const savedSqlStore = useSavedSqlStore();
 const promptTemplateStore = usePromptTemplateStore();
 const tunnelProfileStore = useTunnelProfileStore();
-const { isDark, themeMode, themePalette, activeCustomUiColors, cornerStyle, setThemeMode, setThemePalette, setCustomUiColors, resetCustomUiColors, setCornerStyle } = useTheme();
+const { isDark, themeMode, themePalette, activeCustomUiColors, cornerStyle, setThemeMode, setThemePalette, previewThemePalette, clearThemePalettePreview, setCustomUiColors, resetCustomUiColors, setCornerStyle } = useTheme();
+const { previewUiFontFamily, clearUiFontFamilyPreview } = useUiFontFamilyPreview();
 
 function updateCustomUiColor(key: keyof AppCustomUiColors, value: string) {
   setCustomUiColors({ ...activeCustomUiColors.value, [key]: value });
+}
+
+function onThemePaletteSelect(value: unknown) {
+  if (typeof value === "string") setThemePalette(value as AppThemePalette);
+}
+
+function onThemePaletteOpenChange(open: boolean) {
+  if (!open) clearThemePalettePreview();
+}
+
+function previewUiFontOption(value: string | undefined) {
+  if (value) previewUiFontFamily(value);
+}
+
+function restoreUiFontFamilyPreview() {
+  previewUiFontFamily(editUiFontFamily.value);
+}
+
+function onUiFontFamilyOpenChange(open: boolean) {
+  if (open) {
+    void loadSystemFontOptions();
+  } else {
+    restoreUiFontFamilyPreview();
+  }
+}
+
+function previewLocaleOption(locale: Locale) {
+  void previewLocale(locale);
+}
+
+function restoreLocaleOptionPreview() {
+  void restoreLocalePreview();
+}
+
+function onLocaleOpenChange(open: boolean) {
+  if (!open) restoreLocaleOptionPreview();
 }
 
 const appThemePaletteOptions = computed(
@@ -279,6 +350,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   "update:open": [value: boolean];
   "check-updates": [];
+  "ai-config-deep-link-handled": [];
 }>();
 
 const isSettingsPage = computed(() => props.variant === "page");
@@ -295,6 +367,9 @@ const settingsTitleComponent = computed(() => (isSettingsPage.value ? "h2" : Dia
 const showUnsavedSettingsCloseConfirm = ref(false);
 
 function requestCloseSettings(nextOpen: boolean) {
+  // Flush any pending debounced MCP query-timeout save so a value typed right
+  // before closing is persisted instead of dropped (see onMcpQueryTimeoutInput).
+  flushMcpQueryTimeoutSave();
   if (shouldConfirmEditorSettingsDialogClose(nextOpen, hasChanges())) {
     showUnsavedSettingsCloseConfirm.value = true;
     return;
@@ -380,6 +455,12 @@ const editTableFontFamily = ref(settingsStore.editorSettings.tableFontFamily);
 const editUiFontFamily = ref(settingsStore.editorSettings.uiFontFamily);
 const editUiScale = ref(settingsStore.editorSettings.uiScale);
 const editTheme = ref(settingsStore.editorSettings.theme);
+const editBackgroundImage = ref<BackgroundImageSettings>(cloneBackgroundImageDraft(settingsStore.editorSettings.backgroundImage));
+const backgroundImageTransparencyPercent = computed(() => Math.round((1 - editBackgroundImage.value.opacity) * 100));
+const backgroundImageFileMissing = ref(false);
+// Set when the draft clears a configured image; the stored copy is only
+// deleted once the change is actually applied.
+let pendingBackgroundImageCleanup: string | null = null;
 const editCustomThemes = ref<CustomTheme[]>([...settingsStore.editorSettings.customThemes]);
 const editActiveCustomThemeId = ref(settingsStore.editorSettings.activeCustomThemeId);
 const editDataGridTypeColorSchemes = ref<DataGridTypeColorScheme[]>(cloneDataGridTypeColorSchemes(settingsStore.editorSettings.dataGridTypeColorSchemes));
@@ -451,8 +532,10 @@ const editShowIndexIndicatorsInHeader = ref(settingsStore.editorSettings.showInd
 const editCompactColumnHeaderActions = ref(settingsStore.editorSettings.compactColumnHeaderActions);
 const editDataGridQuickEntry = ref(settingsStore.editorSettings.dataGridQuickEntry);
 const editDataGridFilterEditorView = ref<DataGridFilterEditorView>(settingsStore.editorSettings.dataGridFilterEditorView);
+const editDataGridKeepFilterEditorExpanded = ref(settingsStore.editorSettings.dataGridKeepFilterEditorExpanded);
 const dataGridFilterViewPreviewExpanded = ref(true);
 const editDataGridTextFilterPanelHeight = ref(settingsStore.editorSettings.dataGridTextFilterPanelHeight);
+const editDefaultAutoKeepResults = ref(settingsStore.editorSettings.defaultAutoKeepResults);
 const editMultiStatementDefaultView = ref<MultiStatementDefaultView>(settingsStore.editorSettings.multiStatementDefaultView);
 const editDataGridAutoTransposeSingleRow = ref(settingsStore.editorSettings.dataGridAutoTransposeSingleRow);
 const editDataGridCellDetailButtonVisible = ref(settingsStore.editorSettings.dataGridCellDetailButtonVisible);
@@ -461,6 +544,7 @@ const editPageSize = ref(settingsStore.editorSettings.pageSize);
 const editTableOpenPageSize = ref(settingsStore.editorSettings.tableOpenPageSize);
 const editQueryResultMaxRowsEnabled = ref(settingsStore.editorSettings.queryResultMaxRowsEnabled);
 const editQueryResultMaxRows = ref(settingsStore.editorSettings.queryResultMaxRows);
+const editExternalSqlEditorMaxMb = ref(settingsStore.editorSettings.externalSqlEditorMaxMb);
 const editInfiniteScroll = ref(settingsStore.editorSettings.infiniteScroll);
 const editRegexMaxMatchCount = ref(settingsStore.editorSettings.regexMaxMatchCount);
 const editAutoCalculateTotalRows = ref(settingsStore.editorSettings.autoCalculateTotalRows);
@@ -489,6 +573,18 @@ function updateQueryResultMaxRowsInput(event: Event) {
   const normalized = normalizeQueryResultMaxRowsDraft(input.value);
   if (input.value !== String(normalized)) input.value = String(normalized);
   editQueryResultMaxRows.value = normalized;
+}
+
+function updateExternalSqlEditorMaxMbInput(event: Event) {
+  const input = event.currentTarget as HTMLInputElement;
+  const parsed = Number(input.value);
+  if (!Number.isFinite(parsed) || parsed > MAX_EXTERNAL_SQL_EDITOR_FILE_MB) {
+    input.value = String(editExternalSqlEditorMaxMb.value);
+    return;
+  }
+  const normalized = clampExternalSqlEditorMaxMbInput(input.value);
+  if (input.value !== String(normalized)) input.value = String(normalized);
+  editExternalSqlEditorMaxMb.value = normalized;
 }
 
 function sqlVariableSyntaxToggle(key: keyof SqlVariableSyntaxToggles): boolean {
@@ -537,6 +633,7 @@ const editDataTabReuseMode = ref<DataTabReuseMode>(settingsStore.editorSettings.
 const editOpenDataTabsNextToActive = ref(settingsStore.editorSettings.openDataTabsNextToActive);
 const editPrefillNewQueryWithSelect = ref(settingsStore.editorSettings.prefillNewQueryWithSelect);
 const editGenerateSqlIncludeDatabaseName = ref(settingsStore.editorSettings.generateSqlIncludeDatabaseName);
+const editGenerateSqlQuoteIdentifiers = ref(settingsStore.editorSettings.generateSqlQuoteIdentifiers);
 const editFormatSqlOnSqlFileSave = ref(settingsStore.editorSettings.formatSqlOnSqlFileSave);
 const editShowTableDdlHoverPreview = ref(settingsStore.editorSettings.showTableDdlHoverPreview);
 const editClickTableNavigationTarget = ref<ClickTableNavigationTarget>(settingsStore.editorSettings.clickTableNavigationTarget);
@@ -622,6 +719,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     uiFontFamily: editUiFontFamily.value,
     uiScale: editUiScale.value,
     theme: editTheme.value,
+    backgroundImage: editBackgroundImage.value,
     customThemes: editCustomThemes.value,
     activeCustomThemeId: editActiveCustomThemeId.value,
     executeMode: editExecuteMode.value,
@@ -661,7 +759,9 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     compactColumnHeaderActions: editCompactColumnHeaderActions.value,
     dataGridQuickEntry: editDataGridQuickEntry.value,
     dataGridFilterEditorView: editDataGridFilterEditorView.value,
+    dataGridKeepFilterEditorExpanded: editDataGridKeepFilterEditorExpanded.value,
     dataGridTextFilterPanelHeight: editDataGridTextFilterPanelHeight.value,
+    defaultAutoKeepResults: editDefaultAutoKeepResults.value,
     multiStatementDefaultView: editMultiStatementDefaultView.value,
     dataGridAutoTransposeSingleRow: editDataGridAutoTransposeSingleRow.value,
     dataGridCellDetailButtonVisible: editDataGridCellDetailButtonVisible.value,
@@ -671,6 +771,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     tableOpenPageSize: editTableOpenPageSize.value,
     queryResultMaxRowsEnabled: editQueryResultMaxRowsEnabled.value,
     queryResultMaxRows: editQueryResultMaxRows.value,
+    externalSqlEditorMaxMb: editExternalSqlEditorMaxMb.value,
     infiniteScroll: editInfiniteScroll.value,
     regexMaxMatchCount: editRegexMaxMatchCount.value,
     autoCalculateTotalRows: editAutoCalculateTotalRows.value,
@@ -689,6 +790,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     openDataTabsNextToActive: editOpenDataTabsNextToActive.value,
     prefillNewQueryWithSelect: editPrefillNewQueryWithSelect.value,
     generateSqlIncludeDatabaseName: editGenerateSqlIncludeDatabaseName.value,
+    generateSqlQuoteIdentifiers: editGenerateSqlQuoteIdentifiers.value,
     formatSqlOnSqlFileSave: editFormatSqlOnSqlFileSave.value,
     showTableDdlHoverPreview: editShowTableDdlHoverPreview.value,
     updateNotificationsEnabled: editUpdateNotificationsEnabled.value,
@@ -721,6 +823,86 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
 
 const editEditorSettingsBase = ref<EditorSettingsDraft>(editorSettingsDraftFromSettings(settingsStore.editorSettings));
 const hasEditorDraftChanges = computed(() => editorSettingsDraftChanged(currentEditorSettingsDraft(), editEditorSettingsBase.value));
+
+// --- Background image draft state ---
+function cloneBackgroundImageDraft(settings: BackgroundImageSettings): BackgroundImageSettings {
+  return JSON.parse(JSON.stringify(settings)) as BackgroundImageSettings;
+}
+
+async function checkBackgroundImageFileExists() {
+  const filePath = editBackgroundImage.value.filePath;
+  if (!filePath) {
+    backgroundImageFileMissing.value = false;
+    return;
+  }
+  try {
+    backgroundImageFileMissing.value = !(await checkBackgroundImage(filePath));
+  } catch {
+    backgroundImageFileMissing.value = true;
+  }
+}
+
+async function pickBackgroundImage() {
+  try {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const selected = await open({
+      multiple: false,
+      filters: [{ name: t("settings.backgroundImageFilterName"), extensions: ["png", "jpg", "jpeg", "webp", "bmp", "gif"] }],
+    });
+    if (Array.isArray(selected) || typeof selected !== "string" || !selected) return;
+    try {
+      const { stat } = await import("@tauri-apps/plugin-fs");
+      const metadata = await stat(selected);
+      if (metadata.size > BACKGROUND_IMAGE_STORAGE_LIMIT_BYTES) {
+        toast(t("settings.backgroundImageTooLarge"), 4000);
+        return;
+      }
+    } catch {
+      // The Rust command re-validates; keep going so it can produce the error.
+    }
+    const info = await saveBackgroundImage(selected);
+    editBackgroundImage.value = {
+      ...defaultBackgroundImageSettings(),
+      opacity: editBackgroundImage.value.opacity,
+      blur: editBackgroundImage.value.blur,
+      displayMode: editBackgroundImage.value.displayMode,
+      filePath: info.storedPath,
+      fileName: info.fileName,
+    };
+    backgroundImageFileMissing.value = false;
+  } catch (error) {
+    // Surface every failure (missing command in a stale binary, fs scope, copy
+    // errors): Tauri rejections are plain strings, so String() keeps the detail.
+    console.error("[dbx] background image selection failed", error);
+    toast(`${t("settings.backgroundImageSaveFailed")}: ${error instanceof Error ? error.message : String(error)}`, 6000);
+  }
+}
+
+function clearBackgroundImageDraft() {
+  const previousPath = editBackgroundImage.value.filePath;
+  editBackgroundImage.value = {
+    ...defaultBackgroundImageSettings(),
+    opacity: editBackgroundImage.value.opacity,
+    blur: editBackgroundImage.value.blur,
+    displayMode: editBackgroundImage.value.displayMode,
+  };
+  backgroundImageFileMissing.value = false;
+  if (previousPath) pendingBackgroundImageCleanup = previousPath;
+}
+
+function updateBackgroundImageDisplayMode(mode: unknown) {
+  editBackgroundImage.value = { ...editBackgroundImage.value, displayMode: normalizeBackgroundImageDisplayMode(mode) };
+}
+
+// Slider shows surface transparency (100% = wallpaper most visible); the stored
+// field stays surface opacity, so the value is inverted on the way in/out.
+function updateBackgroundImageTransparency(transparencyPercent: number) {
+  editBackgroundImage.value = { ...editBackgroundImage.value, opacity: Math.min(1, Math.max(0.05, 1 - transparencyPercent / 100)) };
+}
+
+function updateBackgroundImageBlur(value: number) {
+  editBackgroundImage.value = { ...editBackgroundImage.value, blur: Math.min(20, Math.max(0, Math.round(value))) };
+}
 
 const snippetDialogOpen = ref(false);
 const snippetEditingId = ref<string | null>(null);
@@ -1017,6 +1199,15 @@ async function loadSystemFontOptions() {
   }
 }
 
+// An import always leaves the loaded draft pending an explicit Apply, even
+// when every imported value happens to equal the saved settings — without this
+// the footer Apply / Apply & Close buttons stay disabled right after "载入设置"
+// and the "请应用以保存" toast points at a disabled button.
+// Declared before syncEditorSettingsDraftFromStore because the immediate
+// settingsVisible watch calls it during setup (a later declaration would be
+// hit in its temporal dead zone and crash the settings page on open).
+const hasImportedSettingsPendingApply = ref(false);
+
 function syncEditorSettingsDraftFromStore() {
   editFontFamily.value = settingsStore.editorSettings.fontFamily;
   editFontSize.value = settingsStore.editorSettings.fontSize;
@@ -1024,6 +1215,8 @@ function syncEditorSettingsDraftFromStore() {
   editUiFontFamily.value = settingsStore.editorSettings.uiFontFamily;
   editUiScale.value = settingsStore.editorSettings.uiScale;
   editTheme.value = settingsStore.editorSettings.theme;
+  editBackgroundImage.value = cloneBackgroundImageDraft(settingsStore.editorSettings.backgroundImage);
+  pendingBackgroundImageCleanup = null;
   editCustomThemes.value = [...settingsStore.editorSettings.customThemes];
   editActiveCustomThemeId.value = settingsStore.editorSettings.activeCustomThemeId;
   editExecuteMode.value = settingsStore.editorSettings.executeMode;
@@ -1064,7 +1257,9 @@ function syncEditorSettingsDraftFromStore() {
   editCompactColumnHeaderActions.value = settingsStore.editorSettings.compactColumnHeaderActions;
   editDataGridQuickEntry.value = settingsStore.editorSettings.dataGridQuickEntry;
   editDataGridFilterEditorView.value = settingsStore.editorSettings.dataGridFilterEditorView;
+  editDataGridKeepFilterEditorExpanded.value = settingsStore.editorSettings.dataGridKeepFilterEditorExpanded;
   editDataGridTextFilterPanelHeight.value = settingsStore.editorSettings.dataGridTextFilterPanelHeight;
+  editDefaultAutoKeepResults.value = settingsStore.editorSettings.defaultAutoKeepResults;
   editMultiStatementDefaultView.value = settingsStore.editorSettings.multiStatementDefaultView;
   editDataGridAutoTransposeSingleRow.value = settingsStore.editorSettings.dataGridAutoTransposeSingleRow;
   editDataGridCellDetailButtonVisible.value = settingsStore.editorSettings.dataGridCellDetailButtonVisible;
@@ -1074,6 +1269,7 @@ function syncEditorSettingsDraftFromStore() {
   editTableOpenPageSize.value = settingsStore.editorSettings.tableOpenPageSize;
   editQueryResultMaxRowsEnabled.value = settingsStore.editorSettings.queryResultMaxRowsEnabled;
   editQueryResultMaxRows.value = settingsStore.editorSettings.queryResultMaxRows;
+  editExternalSqlEditorMaxMb.value = settingsStore.editorSettings.externalSqlEditorMaxMb;
   editInfiniteScroll.value = settingsStore.editorSettings.infiniteScroll;
   editRegexMaxMatchCount.value = settingsStore.editorSettings.regexMaxMatchCount;
   editAutoCalculateTotalRows.value = settingsStore.editorSettings.autoCalculateTotalRows;
@@ -1093,6 +1289,7 @@ function syncEditorSettingsDraftFromStore() {
   editOpenDataTabsNextToActive.value = settingsStore.editorSettings.openDataTabsNextToActive;
   editPrefillNewQueryWithSelect.value = settingsStore.editorSettings.prefillNewQueryWithSelect;
   editGenerateSqlIncludeDatabaseName.value = settingsStore.editorSettings.generateSqlIncludeDatabaseName;
+  editGenerateSqlQuoteIdentifiers.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers;
   editFormatSqlOnSqlFileSave.value = settingsStore.editorSettings.formatSqlOnSqlFileSave;
   editShowTableDdlHoverPreview.value = settingsStore.editorSettings.showTableDdlHoverPreview;
   editClickTableNavigationTarget.value = settingsStore.editorSettings.clickTableNavigationTarget;
@@ -1122,8 +1319,144 @@ function syncEditorSettingsDraftFromStore() {
   editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(settingsStore.editorSettings.sqlVariableSyntaxOverrides);
   editClickTableNavigationTarget.value = settingsStore.editorSettings.clickTableNavigationTarget;
   editEditorSettingsBase.value = editorSettingsDraftFromSettings(settingsStore.editorSettings);
+  hasImportedSettingsPendingApply.value = false;
 }
 
+// Mirror of syncEditorSettingsDraftFromStore for loading draft values into
+// the edit refs. Draft values are already settings-shaped and normalized, so
+// this only performs the ref-specific representations (joined textarea
+// strings, grid rows, editable snippet copies). Accepts a key subset so a
+// partial update (settings import) writes exactly the listed refs and leaves
+// every other in-progress edit untouched. The base snapshot is intentionally
+// left untouched: changed values stay unapplied until the user clicks Apply,
+// exactly like hand-edited draft values.
+const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
+  fontFamily: editFontFamily,
+  fontSize: editFontSize,
+  tableFontFamily: editTableFontFamily,
+  uiFontFamily: editUiFontFamily,
+  uiScale: editUiScale,
+  theme: editTheme,
+  backgroundImage: editBackgroundImage,
+  customThemes: editCustomThemes,
+  activeCustomThemeId: editActiveCustomThemeId,
+  executeMode: editExecuteMode,
+  executeAllOnBlankLine: editExecuteAllOnBlankLine,
+  showExecutionTargetPicker: editShowExecutionTargetPicker,
+  showStatementRunButtons: editShowStatementRunButtons,
+  showLineNumbers: editShowLineNumbers,
+  showCurrentStatementFrame: editShowCurrentStatementFrame,
+  showInsertValueHints: editShowInsertValueHints,
+  autoAliasTables: editAutoAliasTables,
+  insertSpaceAfterCompletion: editInsertSpaceAfterCompletion,
+  sortCompletionColumnsAlphabetically: editSortCompletionColumnsAlphabetically,
+  selectFirstCompletionOnOpen: editSelectFirstCompletionOnOpen,
+  wordWrap: editWordWrap,
+  vimModeEnabled: editVimModeEnabled,
+  autoCloseBrackets: editAutoCloseBrackets,
+  sqlSemanticDiagnosticsMode: editSqlSemanticDiagnosticsMode,
+  confirmDangerousSqlExecution: editConfirmDangerousSqlExecution,
+  confirmUnsavedSqlClose: editConfirmUnsavedSqlClose,
+  appCloseUnsavedTabsMode: editAppCloseUnsavedTabsMode,
+  savedSqlOpenTargetMode: editSavedSqlOpenTargetMode,
+  appLayout: editAppLayout,
+  tabLayout: editTabLayout,
+  tabPlacement: editTabPlacement,
+  tabGroupMode: editTabGroupMode,
+  tabSortMode: editTabSortMode,
+  showColumnCommentsInHeader: editShowColumnCommentsInHeader,
+  showColumnTypesInHeader: editShowColumnTypesInHeader,
+  dataGridShowTransposeFieldMetadata: editDataGridShowTransposeFieldMetadata,
+  colorizeDataGridCellTypes: editColorizeDataGridCellTypes,
+  dataGridTypeColorSchemes: editDataGridTypeColorSchemes,
+  activeDataGridTypeColorSchemeId: editActiveDataGridTypeColorSchemeId,
+  showIndexIndicatorsInHeader: editShowIndexIndicatorsInHeader,
+  compactColumnHeaderActions: editCompactColumnHeaderActions,
+  dataGridQuickEntry: editDataGridQuickEntry,
+  dataGridFilterEditorView: editDataGridFilterEditorView,
+  dataGridKeepFilterEditorExpanded: editDataGridKeepFilterEditorExpanded,
+  dataGridTextFilterPanelHeight: editDataGridTextFilterPanelHeight,
+  defaultAutoKeepResults: editDefaultAutoKeepResults,
+  multiStatementDefaultView: editMultiStatementDefaultView,
+  dataGridAutoTransposeSingleRow: editDataGridAutoTransposeSingleRow,
+  dataGridCellDetailButtonVisible: editDataGridCellDetailButtonVisible,
+  dataGridCrosshairHighlight: editDataGridCrosshairHighlight,
+  pageSize: editPageSize,
+  tableOpenPageSize: editTableOpenPageSize,
+  queryResultMaxRowsEnabled: editQueryResultMaxRowsEnabled,
+  queryResultMaxRows: editQueryResultMaxRows,
+  externalSqlEditorMaxMb: editExternalSqlEditorMaxMb,
+  infiniteScroll: editInfiniteScroll,
+  regexMaxMatchCount: editRegexMaxMatchCount,
+  autoCalculateTotalRows: editAutoCalculateTotalRows,
+  flatteningMultiLineText: editFlatteningMultiLineText,
+  shortcuts: editShortcuts,
+  sqlFormatter: editSqlFormatter,
+  sidebarActivation: editSidebarActivation,
+  sidebarObjectDisplay: editSidebarObjectDisplay,
+  routineSourceOpenMode: editRoutineSourceOpenMode,
+  sidebarTableSearchEnabled: editSidebarTableSearchEnabled,
+  autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode,
+  sidebarBrowseObjectsOnDatabaseActivation: editSidebarBrowseObjectsOnDatabaseActivation,
+  openTabsRestoreMode: editOpenTabsRestoreMode,
+  disconnectTabHandlingMode: editDisconnectTabHandlingMode,
+  dataTabReuseMode: editDataTabReuseMode,
+  openDataTabsNextToActive: editOpenDataTabsNextToActive,
+  prefillNewQueryWithSelect: editPrefillNewQueryWithSelect,
+  generateSqlIncludeDatabaseName: editGenerateSqlIncludeDatabaseName,
+  generateSqlQuoteIdentifiers: editGenerateSqlQuoteIdentifiers,
+  formatSqlOnSqlFileSave: editFormatSqlOnSqlFileSave,
+  showTableDdlHoverPreview: editShowTableDdlHoverPreview,
+  updateNotificationsEnabled: editUpdateNotificationsEnabled,
+  sidebarObjectInfoMode: editSidebarObjectInfoMode,
+  sidebarAllowHorizontalScroll: editSidebarAllowHorizontalScroll,
+  sidebarShowTooltips: editSidebarShowTooltips,
+  sidebarIndent: editSidebarIndent,
+  sidebarFontSize: editSidebarFontSize,
+  sidebarHiddenTablePrefixes: editSidebarHiddenTablePrefixes,
+  sidebarCopyTableNameSeparator: editSidebarCopyTableNameSeparator,
+  sidebarCopyTableNameIncludeSchema: editSidebarCopyTableNameIncludeSchema,
+  redisKeyTemplates: editRedisKeyTemplates,
+  exportBatchSize: editExportBatchSize,
+  csvQuoteMode: editCsvQuoteMode,
+  exportRowLimitEnabled: editExportRowLimitEnabled,
+  exportRowLimit: editExportRowLimit,
+  queryExportKeysetOptimizationEnabled: editQueryExportKeysetOptimizationEnabled,
+  globalDateTimeDisplayFormat: editGlobalDateTimeDisplayFormat,
+  globalDateTimeExportFormat: editGlobalDateTimeExportFormat,
+  globalDateTimeImportFormat: editGlobalDateTimeImportFormat,
+  updateDownloadSource: editUpdateDownloadSource,
+  toolbarItems: editToolbarItems,
+  snippets: editSnippets,
+  sqlShortcuts: editSqlShortcuts,
+  sqlVariableSubstitutionEnabled: editSqlVariableSubstitutionEnabled,
+  sqlVariableSyntaxOverrides: editSqlVariableSyntaxOverrides,
+  continueOnErrorOnBatch: editContinueOnErrorOnBatch,
+  clickTableNavigationTarget: editClickTableNavigationTarget,
+  completionTriggerMode: editCompletionTriggerMode,
+  defaultTransactionMode: editDefaultTransactionMode,
+  tableColumnTemplateFields: editTableColumnTemplateRows,
+};
+
+function applyEditorSettingsKeysToRefs(draft: EditorSettingsDraft, keys: readonly EditorSettingsDraftKey[]) {
+  applyEditorSettingsDraftToRefs(draft, keys, editorSettingsDraftRefs, {
+    customThemes: (value) => [...(value as CustomTheme[])],
+    dataGridTypeColorSchemes: (value) => cloneDataGridTypeColorSchemes(value as DataGridTypeColorScheme[]),
+    tableColumnTemplateFields: (value) => tableColumnTemplateRowsFromSettings(value as string[]),
+    shortcuts: (value) => normalizeShortcutSettings(value as Parameters<typeof normalizeShortcutSettings>[0]),
+    sqlFormatter: (value) => normalizeSqlFormatterSettings(value as SqlFormatterSettings),
+    sidebarHiddenTablePrefixes: (value) => (value as string[]).join("\n"),
+    redisKeyTemplates: (value) => normalizeRedisKeyTemplates(value as string[]).join("\n"),
+    toolbarItems: (value) => ({ ...(value as EditorSettings["toolbarItems"]) }),
+    snippets: (value) => (value as SqlSnippet[]).map(editableSnippet),
+    sqlShortcuts: (value) => (value as SqlShortcutAction[]).map(editableSqlShortcut),
+    sqlVariableSyntaxOverrides: (value) => normalizeSqlVariableSyntaxOverrides(value as EditorSettings["sqlVariableSyntaxOverrides"]),
+    backgroundImage: (value) => cloneBackgroundImageDraft(value as BackgroundImageSettings),
+  });
+  if (keys.includes("sqlSemanticDiagnosticsMode")) {
+    editSqlSemanticDiagnosticsEnabled.value = editSqlSemanticDiagnosticsMode.value !== "disabled";
+  }
+}
 // Sync from store when dialog opens
 watch(
   () => settingsVisible.value,
@@ -1137,6 +1470,22 @@ watch(
       editMetadataCacheMaxMemoryMb.value = settingsStore.desktopSettings.metadata_cache_max_memory_mb;
       editDuckDbWorkerProcessIsolation.value = settingsStore.desktopSettings.duckdb_worker_process_isolation;
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
+    } else {
+      clearThemePalettePreview();
+      clearUiFontFamilyPreview();
+      restoreLocaleOptionPreview();
+    }
+  },
+  { immediate: true },
+);
+
+watch(
+  () => settingsStore.settingsPageActive,
+  (active) => {
+    if (isSettingsPage.value && !active) {
+      clearThemePalettePreview();
+      clearUiFontFamilyPreview();
+      restoreLocaleOptionPreview();
     }
   },
   { immediate: true },
@@ -1210,6 +1559,7 @@ const hasApplyBlocker = computed(() => hasBlockingShortcutConflicts.value || has
 
 function hasChanges(): boolean {
   return (
+    hasImportedSettingsPendingApply.value ||
     hasEditorDraftChanges.value ||
     editShowTrayIcon.value !== settingsStore.desktopSettings.show_tray_icon ||
     editQuitOnClose.value !== settingsStore.desktopSettings.quit_on_close ||
@@ -1232,6 +1582,11 @@ async function persistSettings() {
     await settingsStore.persistEditorSettings();
     editEditorSettingsBase.value = editorSettingsDraftFromSettings(settingsStore.editorSettings);
   }
+  if (pendingBackgroundImageCleanup) {
+    const cleanupPath = pendingBackgroundImageCleanup;
+    pendingBackgroundImageCleanup = null;
+    void clearBackgroundImage(cleanupPath).catch(() => {});
+  }
   const metadataCacheMaxMemoryMb = normalizeMetadataCacheMemoryMb(editMetadataCacheMaxMemoryMb.value);
   await settingsStore.updateDesktopSettings({
     show_tray_icon: editShowTrayIcon.value,
@@ -1246,6 +1601,7 @@ async function persistSettings() {
   });
   editMetadataCacheMaxMemoryMb.value = settingsStore.desktopSettings.metadata_cache_max_memory_mb;
   desktopCloseBehaviorResetPending.value = false;
+  hasImportedSettingsPendingApply.value = false;
   if (sidebarObjectDisplayChanged) {
     await connectionStore.refreshAllTree();
   } else if (sidebarTablePageSizeChanged) {
@@ -1325,6 +1681,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editAppCloseUnsavedTabsMode.value = DEFAULT_EDITOR_SETTINGS.appCloseUnsavedTabsMode;
     editSavedSqlOpenTargetMode.value = DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode;
     editShowTableDdlHoverPreview.value = DEFAULT_EDITOR_SETTINGS.showTableDdlHoverPreview;
+    editExternalSqlEditorMaxMb.value = DEFAULT_EDITOR_SETTINGS.externalSqlEditorMaxMb;
     editClickTableNavigationTarget.value = DEFAULT_EDITOR_SETTINGS.clickTableNavigationTarget;
     editSqlVariableSubstitutionEnabled.value = DEFAULT_EDITOR_SETTINGS.sqlVariableSubstitutionEnabled;
     editSqlVariableSyntaxOverrides.value = normalizeSqlVariableSyntaxOverrides(DEFAULT_EDITOR_SETTINGS.sqlVariableSyntaxOverrides);
@@ -1363,6 +1720,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
     editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
     editGenerateSqlIncludeDatabaseName.value = DEFAULT_EDITOR_SETTINGS.generateSqlIncludeDatabaseName;
+    editGenerateSqlQuoteIdentifiers.value = DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers;
     editFormatSqlOnSqlFileSave.value = DEFAULT_EDITOR_SETTINGS.formatSqlOnSqlFileSave;
     editClickTableNavigationTarget.value = DEFAULT_EDITOR_SETTINGS.clickTableNavigationTarget;
     editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
@@ -1386,7 +1744,9 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
     editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
     editDataGridFilterEditorView.value = DEFAULT_EDITOR_SETTINGS.dataGridFilterEditorView;
+    editDataGridKeepFilterEditorExpanded.value = DEFAULT_EDITOR_SETTINGS.dataGridKeepFilterEditorExpanded;
     editDataGridTextFilterPanelHeight.value = DEFAULT_EDITOR_SETTINGS.dataGridTextFilterPanelHeight;
+    editDefaultAutoKeepResults.value = DEFAULT_EDITOR_SETTINGS.defaultAutoKeepResults;
     editMultiStatementDefaultView.value = DEFAULT_EDITOR_SETTINGS.multiStatementDefaultView;
     editDataGridAutoTransposeSingleRow.value = DEFAULT_EDITOR_SETTINGS.dataGridAutoTransposeSingleRow;
     editDataGridCellDetailButtonVisible.value = DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible;
@@ -1472,7 +1832,9 @@ function resetAllDefaults() {
   editCompactColumnHeaderActions.value = DEFAULT_EDITOR_SETTINGS.compactColumnHeaderActions;
   editDataGridQuickEntry.value = DEFAULT_EDITOR_SETTINGS.dataGridQuickEntry;
   editDataGridFilterEditorView.value = DEFAULT_EDITOR_SETTINGS.dataGridFilterEditorView;
+  editDataGridKeepFilterEditorExpanded.value = DEFAULT_EDITOR_SETTINGS.dataGridKeepFilterEditorExpanded;
   editDataGridTextFilterPanelHeight.value = DEFAULT_EDITOR_SETTINGS.dataGridTextFilterPanelHeight;
+  editDefaultAutoKeepResults.value = DEFAULT_EDITOR_SETTINGS.defaultAutoKeepResults;
   editMultiStatementDefaultView.value = DEFAULT_EDITOR_SETTINGS.multiStatementDefaultView;
   editDataGridAutoTransposeSingleRow.value = DEFAULT_EDITOR_SETTINGS.dataGridAutoTransposeSingleRow;
   editDataGridCellDetailButtonVisible.value = DEFAULT_EDITOR_SETTINGS.dataGridCellDetailButtonVisible;
@@ -1482,6 +1844,7 @@ function resetAllDefaults() {
   editTableOpenPageSize.value = DEFAULT_EDITOR_SETTINGS.tableOpenPageSize;
   editQueryResultMaxRowsEnabled.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRowsEnabled;
   editQueryResultMaxRows.value = DEFAULT_EDITOR_SETTINGS.queryResultMaxRows;
+  editExternalSqlEditorMaxMb.value = DEFAULT_EDITOR_SETTINGS.externalSqlEditorMaxMb;
   editInfiniteScroll.value = DEFAULT_EDITOR_SETTINGS.infiniteScroll;
   editRegexMaxMatchCount.value = DEFAULT_EDITOR_SETTINGS.regexMaxMatchCount;
   editAutoCalculateTotalRows.value = DEFAULT_EDITOR_SETTINGS.autoCalculateTotalRows;
@@ -1501,6 +1864,7 @@ function resetAllDefaults() {
   editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
   editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
   editGenerateSqlIncludeDatabaseName.value = DEFAULT_EDITOR_SETTINGS.generateSqlIncludeDatabaseName;
+  editGenerateSqlQuoteIdentifiers.value = DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers;
   editFormatSqlOnSqlFileSave.value = DEFAULT_EDITOR_SETTINGS.formatSqlOnSqlFileSave;
   editShowTableDdlHoverPreview.value = DEFAULT_EDITOR_SETTINGS.showTableDdlHoverPreview;
   editUpdateNotificationsEnabled.value = DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled;
@@ -1679,7 +2043,10 @@ function onTableFontFamilyChange(v: any) {
 }
 
 function onUiFontFamilyChange(v: any) {
-  if (typeof v === "string") editUiFontFamily.value = v;
+  if (typeof v === "string") {
+    editUiFontFamily.value = v;
+    previewUiFontFamily(v);
+  }
 }
 
 const themeSelectValue = computed(() => {
@@ -1739,6 +2106,12 @@ function onDisconnectTabHandlingModeChange(v: any) {
 
 function onLocaleChange(v: any) {
   if (typeof v === "string") void setLocale(v as Locale);
+}
+
+function onUiScaleChange(value: unknown) {
+  const next = Number(value);
+  if (!Number.isFinite(next)) return;
+  editUiScale.value = next;
 }
 
 function onUpdateDownloadSourceChange(v: any) {
@@ -2101,6 +2474,54 @@ async function copyAppSupportInfo() {
   }
 }
 
+// --- Settings import / export (About page card) ---
+
+function buildSettingsExportPayload(): string {
+  return serializeSettingsTransfer(settingsStore.editorSettings, {
+    appVersion: props.appVersion || appSupportInfo.value?.appVersion || undefined,
+  });
+}
+
+// "Apply and export": reuse the regular apply flow so validation, persistence
+// and error toasts behave exactly like the footer Apply button. Returning null
+// aborts the export while keeping the draft editable.
+async function buildAppliedExportPayload(): Promise<string | null> {
+  // persistSettings() silently no-ops while a blocker (shortcut conflicts,
+  // invalid formatter config, row-limit conflict) is active — the footer Apply
+  // button is disabled in that state. Abort the export instead of writing a
+  // file that pretends the draft was applied.
+  if (hasApplyBlocker.value) {
+    toast(t("settings.settingsTransferApplyBlocked"), 5000);
+    return null;
+  }
+  if (!(await applySettingsForResult())) return null;
+  return buildSettingsExportPayload();
+}
+
+// Load validated imported values into the draft. Only the keys the file
+// actually contains are written: in-progress edits the file does not cover —
+// including state that a draft round-trip would drop, like a half-filled
+// table-column template row that has no field name yet — keep their exact
+// draft state. The base snapshot is untouched so everything stays unapplied
+// until the user clicks Apply (or discards via the close flow).
+function applyImportedEditorSettings(imported: Partial<EditorSettings>) {
+  const patch = editorSettingsDraftPatchFromSettings(imported);
+  applyEditorSettingsKeysToRefs(patch as EditorSettingsDraft, Object.keys(patch) as EditorSettingsDraftKey[]);
+  hasImportedSettingsPendingApply.value = true;
+}
+
+// Categories whose draft values differ from the saved base AND are covered by
+// the imported file — these draft changes will be replaced by the import.
+function getDraftConflictCategories(imported: Partial<EditorSettings>): SettingsTransferCategoryId[] {
+  const changedKeys = new Set(Object.keys(editorSettingsPatchFromDraft(currentEditorSettingsDraft(), editEditorSettingsBase.value)));
+  const conflicts = new Set<SettingsTransferCategoryId>();
+  for (const key of Object.keys(imported)) {
+    const category = transferCategoryForKey(key);
+    if (category && changedKeys.has(key)) conflicts.add(category);
+  }
+  return sortTransferCategories(conflicts);
+}
+
 function clearDebugLogs() {
   clearStoredDebugLogs();
   debugLogCopied.value = false;
@@ -2117,9 +2538,10 @@ async function exportDebugLogs() {
 }
 
 // ---------- MCP Server ----------
-type McpConfigTab = "claude" | "cursor" | "codebuddy" | "zcode" | "trae" | "vscode" | "windsurf" | "codex" | "deepseek-harness" | "opencode" | "pi" | "cherry-studio";
+type McpConfigTab = "claude" | "cursor" | "codebuddy" | "zcode" | "trae" | "vscode" | "windsurf" | "codex" | "deepseek-harness" | "opencode" | "pi" | "cherry-studio" | "qoder";
 type McpCopyKind = "install" | "uninstall" | "http-endpoint" | "http-token" | "http-config" | `${McpConfigTab}-config`;
 type McpTransportTab = "stdio" | "http";
+type McpManagementTab = "access" | "permissions";
 
 const mcpStatus = ref<McpServerStatus | null>(null);
 const mcpStatusLoading = ref(false);
@@ -2127,6 +2549,7 @@ const mcpStatusError = ref("");
 const mcpCopied = ref<"" | McpCopyKind>("");
 const mcpConfigTab = ref<McpConfigTab>("claude");
 const mcpTransportTab = ref<McpTransportTab>("stdio");
+const mcpManagementTab = ref<McpManagementTab>("access");
 const mcpHttpSettings = ref<McpHttpServerSettings>({
   enabled: false,
   host: "127.0.0.1",
@@ -2156,6 +2579,7 @@ const mcpInstallError = ref(false);
 const mcpExecutionMode = computed(() => mcpExecutionModeFromPolicy(settingsStore.mcpGlobalPolicy));
 const mcpExecutionModeOptions: McpExecutionMode[] = ["read_only", "safe_write", "high_risk_write"];
 const mcpAllowedConnectionIds = computed(() => settingsStore.mcpGlobalPolicy.allowedConnectionIds);
+const mcpAllowedGroupIds = computed(() => settingsStore.mcpGlobalPolicy.allowedGroupIds);
 const mcpQueryTimeoutInput = ref<string>(settingsStore.mcpGlobalPolicy.queryTimeoutSecs === null ? "" : String(settingsStore.mcpGlobalPolicy.queryTimeoutSecs));
 
 watch(
@@ -2165,23 +2589,94 @@ watch(
   },
 );
 
-function onMcpQueryTimeoutInput() {
-  const raw = mcpQueryTimeoutInput.value.trim();
+type McpQueryTimeoutSaveStatus = "idle" | "saving" | "saved" | "failed";
+const mcpQueryTimeoutSaveStatus = ref<McpQueryTimeoutSaveStatus>("idle");
+let mcpQueryTimeoutSavedStatusTimer: ReturnType<typeof setTimeout> | null = null;
+
+function setMcpQueryTimeoutSaveStatus(status: McpQueryTimeoutSaveStatus) {
+  if (mcpQueryTimeoutSavedStatusTimer !== null) {
+    clearTimeout(mcpQueryTimeoutSavedStatusTimer);
+    mcpQueryTimeoutSavedStatusTimer = null;
+  }
+  mcpQueryTimeoutSaveStatus.value = status;
+  if (status === "saved") {
+    mcpQueryTimeoutSavedStatusTimer = setTimeout(() => {
+      mcpQueryTimeoutSavedStatusTimer = null;
+      mcpQueryTimeoutSaveStatus.value = "idle";
+    }, 1600);
+  }
+}
+
+// Debounce the persist so rapid typing coalesces into a single SQLite write.
+// `flushMcpQueryTimeoutSave` runs on the settings-close path so a value typed
+// right before closing is still persisted (the legacy @change binding only
+// fired on blur/Enter, silently dropping the value when the window closed).
+const MCP_QUERY_TIMEOUT_SAVE_DEBOUNCE_MS = 300;
+let mcpQueryTimeoutSaveTimer: ReturnType<typeof setTimeout> | null = null;
+let mcpQueryTimeoutPendingValue: number | null | undefined;
+
+function onMcpQueryTimeoutInput(event: Event) {
+  // Read the value from the native input (not the ref). This handler runs in
+  // capture phase, before Input's passive v-model proxy updates the ref.
+  const target = event.currentTarget as HTMLInputElement;
+  // Number inputs expose incomplete/invalid edits as an empty value. Do not
+  // mistake that browser state for an explicit request to inherit the timeout.
+  if (target.validity.badInput) return;
+  const raw = target.value.trim();
+  setMcpQueryTimeoutSaveStatus("saving");
   if (raw === "") {
-    void saveMcpPolicy({ queryTimeoutSecs: null });
-    return;
+    mcpQueryTimeoutPendingValue = null;
+  } else {
+    const parsed = Number(raw);
+    // Backend stores the value as u64; keep out-of-range integers on the
+    // invalid-value path instead of failing serde later with a generic error.
+    if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed) || parsed > Number("18446744073709551615")) {
+      toast(t("settings.mcpQueryTimeoutInvalid"), 5000);
+      // Revert before Input's bubble-phase v-model handler sees the value, so
+      // the proxy and parent ref remain aligned.
+      const reverted = settingsStore.mcpGlobalPolicy.queryTimeoutSecs === null ? "" : String(settingsStore.mcpGlobalPolicy.queryTimeoutSecs);
+      mcpQueryTimeoutInput.value = reverted;
+      target.value = reverted;
+      mcpQueryTimeoutPendingValue = undefined;
+      setMcpQueryTimeoutSaveStatus("idle");
+      return;
+    }
+    mcpQueryTimeoutPendingValue = parsed;
   }
-  const parsed = Number(raw);
-  // Backend stores the value as u64; keep out-of-range integers on the
-  // invalid-value path instead of failing serde later with a generic error.
-  if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed) || parsed > Number("18446744073709551615")) {
-    toast(t("settings.mcpQueryTimeoutInvalid"), 5000);
-    mcpQueryTimeoutInput.value = settingsStore.mcpGlobalPolicy.queryTimeoutSecs === null ? "" : String(settingsStore.mcpGlobalPolicy.queryTimeoutSecs);
-    return;
+  if (mcpQueryTimeoutSaveTimer !== null) clearTimeout(mcpQueryTimeoutSaveTimer);
+  mcpQueryTimeoutSaveTimer = setTimeout(() => {
+    mcpQueryTimeoutSaveTimer = null;
+    flushMcpQueryTimeoutSave();
+  }, MCP_QUERY_TIMEOUT_SAVE_DEBOUNCE_MS);
+}
+
+function flushMcpQueryTimeoutSave() {
+  if (mcpQueryTimeoutSaveTimer !== null) {
+    clearTimeout(mcpQueryTimeoutSaveTimer);
+    mcpQueryTimeoutSaveTimer = null;
   }
-  void saveMcpPolicy({ queryTimeoutSecs: parsed });
+  if (mcpQueryTimeoutPendingValue === undefined) return;
+  // Another MCP policy mutation may be in flight. Retain the value until the
+  // shared mutation gate reopens; saveMcpPolicy's finally block retries it.
+  if (mcpPolicyControlsDisabled.value) return;
+  const value = mcpQueryTimeoutPendingValue;
+  mcpQueryTimeoutPendingValue = undefined;
+  void saveMcpPolicy(
+    { queryTimeoutSecs: value },
+    {
+      onSuccess: () => setMcpQueryTimeoutSaveStatus("saved"),
+      onFailure: () => setMcpQueryTimeoutSaveStatus("failed"),
+    },
+  );
 }
 const mcpSelectableConnections = computed(() => connectionStore.connections);
+const mcpGroupRows = computed(() => connectionGroupDestinationRows(connectionStore.sidebarLayout));
+const mcpConnectionGroupIdPaths = computed(() => buildConnectionGroupIdPathMap(connectionStore.sidebarLayout));
+const mcpConnectionsInheritedFromGroups = computed(() => new Set(connectionIdsInGroups(connectionStore.sidebarLayout, mcpAllowedGroupIds.value)));
+const mcpEffectiveAllowedConnectionIds = computed(() => {
+  if (mcpAllowedConnectionIds.value === null) return null;
+  return [...new Set([...mcpAllowedConnectionIds.value, ...mcpConnectionsInheritedFromGroups.value])];
+});
 const mcpPolicyControlsDisabled = computed(() =>
   isMcpPolicyMutationBlocked({
     loading: mcpPolicyLoading.value,
@@ -2227,31 +2722,41 @@ const mcpHttpHasUnsavedChanges = computed(() => {
 
 const webMcpEndpoint = computed(() => (webMcpHttpStatus.value ? `${window.location.origin}${webMcpHttpStatus.value.endpointPath}` : ""));
 
-async function saveMcpPolicy(partial: {
-  readOnly?: boolean;
-  allowDangerousSql?: boolean;
-  allowedConnectionIds?: string[] | null;
-  allowedToolNames?: string[] | null;
-  connectionPolicies?: {
-    connectionId: string;
-    readOnly: boolean;
-    allowDangerousSql: boolean;
-    executionModeConfigured: boolean;
-    executionModePolicyVersion: number | null;
-    databaseScope: "all" | "selected" | "none";
-    allowedDatabases: string[];
-    databasePolicies: { databaseName: string; readOnly: boolean; allowDangerousSql: boolean }[];
-  }[];
-  queryTimeoutSecs?: number | null;
-}) {
+async function saveMcpPolicy(
+  partial: {
+    readOnly?: boolean;
+    allowDangerousSql?: boolean;
+    allowedConnectionIds?: string[] | null;
+    allowedGroupIds?: string[];
+    allowedToolNames?: string[] | null;
+    connectionPolicies?: {
+      connectionId: string;
+      readOnly: boolean;
+      allowDangerousSql: boolean;
+      executionModeConfigured: boolean;
+      executionModePolicyVersion: number | null;
+      databaseScope: "all" | "selected" | "none";
+      allowedDatabases: string[];
+      databasePolicies: { databaseName: string; readOnly: boolean; allowDangerousSql: boolean }[];
+    }[];
+    groupPolicies?: McpGroupPolicy[];
+    queryTimeoutSecs?: number | null;
+  },
+  callbacks?: { onSuccess?: () => void; onFailure?: () => void },
+) {
   if (mcpPolicyControlsDisabled.value) return;
   mcpPolicySaving.value = true;
   try {
     await settingsStore.updateMcpGlobalPolicy(partial);
+    callbacks?.onSuccess?.();
   } catch (e: any) {
     toast(t("settings.mcpPolicySaveFailed", { error: e?.message || String(e) }), 5000);
+    callbacks?.onFailure?.();
   } finally {
     mcpPolicySaving.value = false;
+    // A query-timeout edit can have debounced while another policy write held
+    // the shared gate. Persist it once that write releases the gate.
+    if (mcpQueryTimeoutPendingValue !== undefined) flushMcpQueryTimeoutSave();
   }
 }
 
@@ -2283,31 +2788,13 @@ function onMcpExecutionModeKeydown(event: KeyboardEvent, mode: McpExecutionMode)
   onMcpExecutionModeChange(nextMode);
 }
 
-function onMcpAllowedConnectionIdsChange(allowedConnectionIds: string[] | null) {
-  void saveMcpPolicy({ allowedConnectionIds });
+function onMcpResourceScopeChange(scope: { allowedGroupIds: string[]; allowedConnectionIds: string[] | null }) {
+  void saveMcpPolicy(scope);
 }
 
 type McpConnectionExecutionMode = "read_only" | "safe_write" | "high_risk_write";
 
-const mcpToolOptions = [
-  { name: "dbx_list_connections", labelKey: "settings.mcpToolListConnections" },
-  { name: "dbx_list_databases", labelKey: "settings.mcpToolListDatabases" },
-  { name: "dbx_list_tables", labelKey: "settings.mcpToolListTables" },
-  { name: "dbx_describe_table", labelKey: "settings.mcpToolDescribeTable" },
-  { name: "dbx_list_routines", labelKey: "settings.mcpToolListRoutines" },
-  { name: "dbx_get_routine_source", labelKey: "settings.mcpToolGetRoutineSource" },
-  { name: "dbx_get_schema_context", labelKey: "settings.mcpToolGetSchemaContext" },
-  { name: "dbx_execute_query", labelKey: "settings.mcpToolExecuteQuery" },
-  { name: "dbx_open_session", labelKey: "settings.mcpToolOpenSession" },
-  { name: "dbx_close_session", labelKey: "settings.mcpToolCloseSession" },
-  { name: "dbx_execute_redis_command", labelKey: "settings.mcpToolExecuteRedisCommand" },
-  { name: "dbx_send_message", labelKey: "settings.mcpToolSendMessage" },
-  { name: "dbx_add_connection", labelKey: "settings.mcpToolAddConnection" },
-  { name: "dbx_duplicate_connection", labelKey: "settings.mcpToolDuplicateConnection" },
-  { name: "dbx_remove_connection", labelKey: "settings.mcpToolRemoveConnection" },
-  { name: "dbx_open_table", labelKey: "settings.mcpToolOpenTable" },
-  { name: "dbx_execute_and_show", labelKey: "settings.mcpToolExecuteAndShow" },
-] as const;
+const mcpToolOptions = MCP_TOOL_OPTIONS;
 
 const mcpAllowedToolNames = computed(() => settingsStore.mcpGlobalPolicy.allowedToolNames);
 
@@ -2316,39 +2803,41 @@ function mcpToolAllowed(name: string): boolean {
 }
 
 function onMcpToolAllowedChange(name: string, allowed: boolean) {
-  const current = mcpAllowedToolNames.value ?? mcpToolOptions.map((tool) => tool.name);
-  const next = allowed ? [...new Set([...current, name])] : current.filter((tool) => tool !== name);
-  void saveMcpPolicy({ allowedToolNames: next });
+  void saveMcpPolicy({ allowedToolNames: toggleMcpAllowedToolName(mcpAllowedToolNames.value, name, allowed) });
 }
 
 const mcpConnectionPolicyConnections = computed(() => {
-  const allowed = mcpAllowedConnectionIds.value;
+  const allowed = mcpEffectiveAllowedConnectionIds.value;
   return allowed === null ? mcpSelectableConnections.value : mcpSelectableConnections.value.filter((connection) => allowed.includes(connection.id));
 });
-const MCP_CONNECTION_POLICY_PAGE_SIZE_OPTIONS = [6, 10, 20] as const;
-const mcpConnectionPolicyPageSize = ref<number>(MCP_CONNECTION_POLICY_PAGE_SIZE_OPTIONS[0]);
-const mcpConnectionPolicyPage = ref(1);
-const mcpConnectionPolicyPageCount = computed(() => Math.max(1, Math.ceil(mcpConnectionPolicyConnections.value.length / mcpConnectionPolicyPageSize.value)));
-const pagedMcpConnectionPolicyConnections = computed(() => {
-  const start = (mcpConnectionPolicyPage.value - 1) * mcpConnectionPolicyPageSize.value;
-  return mcpConnectionPolicyConnections.value.slice(start, start + mcpConnectionPolicyPageSize.value);
-});
-
-function setMcpConnectionPolicyPage(page: number) {
-  mcpConnectionPolicyPage.value = Math.min(Math.max(1, page), mcpConnectionPolicyPageCount.value);
-}
-
-watch(mcpConnectionPolicyPageSize, () => {
-  mcpConnectionPolicyPage.value = 1;
-});
-
-watch(mcpConnectionPolicyPageCount, () => setMcpConnectionPolicyPage(mcpConnectionPolicyPage.value));
-
 function mcpConnectionExecutionMode(connectionId: string): McpConnectionExecutionMode | "inherit" {
   const rule = settingsStore.mcpGlobalPolicy.connectionPolicies.find((item) => item.connectionId === connectionId);
   if (!rule || !rule.executionModeConfigured) return "inherit";
   if (rule.readOnly) return "read_only";
   return rule.allowDangerousSql ? "high_risk_write" : "safe_write";
+}
+
+function mcpGroupExecutionMode(groupId: string): McpConnectionExecutionMode | "inherit" {
+  const rule = settingsStore.mcpGlobalPolicy.groupPolicies.find((item) => item.groupId === groupId);
+  if (!rule) return "inherit";
+  if (rule.readOnly) return "read_only";
+  return rule.allowDangerousSql ? "high_risk_write" : "safe_write";
+}
+
+function mcpInheritedGroupPolicy(connectionId: string): { mode: McpConnectionExecutionMode | "inherit"; source: string } {
+  const path = mcpConnectionGroupIdPaths.value.get(connectionId) ?? [];
+  for (let index = path.length - 1; index >= 0; index -= 1) {
+    const mode = mcpGroupExecutionMode(path[index]);
+    if (mode !== "inherit") {
+      const group = mcpGroupRows.value.find((item) => item.id === path[index]);
+      return { mode, source: group?.path.join(" / ") ?? path[index] };
+    }
+  }
+  return { mode: "inherit", source: "" };
+}
+
+function mcpInheritedGroupExecutionMode(connectionId: string): McpConnectionExecutionMode | "inherit" {
+  return mcpInheritedGroupPolicy(connectionId).mode;
 }
 
 function mcpExecutionModeRank(mode: McpConnectionExecutionMode): number {
@@ -2357,8 +2846,10 @@ function mcpExecutionModeRank(mode: McpConnectionExecutionMode): number {
 
 function migrateLegacyMcpConnectionPolicy(policy: McpConnectionPolicy) {
   const connectionMode = mcpConnectionExecutionMode(policy.connectionId);
-  const legacyMode = connectionMode === "inherit" ? mcpExecutionMode.value : connectionMode;
-  const effectiveMode = mcpExecutionModeRank(legacyMode) < mcpExecutionModeRank(mcpExecutionMode.value) ? legacyMode : mcpExecutionMode.value;
+  const groupMode = mcpInheritedGroupExecutionMode(policy.connectionId);
+  const inheritedMode = groupMode === "inherit" ? mcpExecutionMode.value : groupMode;
+  const legacyMode = connectionMode === "inherit" ? inheritedMode : connectionMode;
+  const effectiveMode = mcpExecutionModeRank(legacyMode) < mcpExecutionModeRank(inheritedMode) ? legacyMode : inheritedMode;
   const databasePolicies = policy.databasePolicies.map((databasePolicy) => {
     const databaseMode: McpConnectionExecutionMode = databasePolicy.readOnly ? "read_only" : databasePolicy.allowDangerousSql ? "high_risk_write" : "safe_write";
     const effectiveDatabaseMode = mcpExecutionModeRank(databaseMode) < mcpExecutionModeRank(effectiveMode) ? databaseMode : effectiveMode;
@@ -2380,8 +2871,15 @@ function mcpExecutionModeLabel(mode: McpConnectionExecutionMode): string {
   return t(mode === "read_only" ? "settings.mcpExecutionModeReadOnly" : mode === "safe_write" ? "settings.mcpExecutionModeSafeWrite" : "settings.mcpExecutionModeHighRiskWrite");
 }
 
-function mcpEffectiveExecutionMode(connectionMode: McpConnectionExecutionMode | "inherit", databaseMode: McpConnectionExecutionMode | "inherit"): McpConnectionExecutionMode {
-  return databaseMode !== "inherit" ? databaseMode : connectionMode !== "inherit" ? connectionMode : mcpExecutionMode.value;
+function mcpEffectiveExecutionMode(groupMode: McpConnectionExecutionMode | "inherit", connectionMode: McpConnectionExecutionMode | "inherit", databaseMode: McpConnectionExecutionMode | "inherit"): McpConnectionExecutionMode {
+  return databaseMode !== "inherit" ? databaseMode : connectionMode !== "inherit" ? connectionMode : groupMode !== "inherit" ? groupMode : mcpExecutionMode.value;
+}
+
+function mcpPermissionSource(row: { databaseMode: McpConnectionExecutionMode | "inherit"; connectionMode: McpConnectionExecutionMode | "inherit"; groupMode: McpConnectionExecutionMode | "inherit"; groupSource: string }): string {
+  if (row.databaseMode !== "inherit") return t("settings.mcpPermissionSourceDatabase");
+  if (row.connectionMode !== "inherit") return t("settings.mcpPermissionSourceConnection");
+  if (row.groupMode !== "inherit") return t("settings.mcpPermissionSourceGroup", { group: row.groupSource });
+  return t("settings.mcpPermissionSourceGlobal");
 }
 
 const mcpPermissionPreviewSearchQuery = ref("");
@@ -2389,17 +2887,22 @@ const mcpPermissionPreviewRows = computed(() =>
   mcpConnectionPolicyConnections.value.flatMap((connection) => {
     const rule = settingsStore.mcpGlobalPolicy.connectionPolicies.find((item) => item.connectionId === connection.id);
     const connectionMode = mcpConnectionExecutionMode(connection.id);
+    const groupPolicy = mcpInheritedGroupPolicy(connection.id);
+    const groupMode = groupPolicy.mode;
     if (rule?.databaseScope === "none") return [];
     const databases = rule?.databaseScope === "selected" ? rule.allowedDatabases : [t("settings.mcpDatabaseScopeSummaryAll")];
     return databases.map((database) => {
       const databasePolicy = rule?.databasePolicies.find((item) => item.databaseName === database);
       const databaseMode: McpConnectionExecutionMode | "inherit" = !databasePolicy ? "inherit" : databasePolicy.readOnly ? "read_only" : databasePolicy.allowDangerousSql ? "high_risk_write" : "safe_write";
       return {
+        connectionId: connection.id,
         connection: connection.name,
         database,
+        groupMode,
+        groupSource: groupPolicy.source,
         connectionMode,
         databaseMode,
-        effectiveMode: mcpEffectiveExecutionMode(connectionMode, databaseMode),
+        effectiveMode: mcpEffectiveExecutionMode(groupMode, connectionMode, databaseMode),
       };
     });
   }),
@@ -2407,10 +2910,24 @@ const mcpPermissionPreviewRows = computed(() =>
 const filteredMcpPermissionPreviewRows = computed(() => {
   const query = mcpPermissionPreviewSearchQuery.value.trim().toLocaleLowerCase();
   if (!query) return mcpPermissionPreviewRows.value;
-  return mcpPermissionPreviewRows.value.filter((row) => [row.connection, row.database].some((value) => value.toLocaleLowerCase().includes(query)));
+  return mcpPermissionPreviewRows.value.filter((row) => [row.connection, row.database, row.groupSource].some((value) => value.toLocaleLowerCase().includes(query)));
 });
 
+function onMcpGroupExecutionModeChange(groupId: string, mode: McpConnectionExecutionMode | "inherit") {
+  if (mode === "high_risk_write" && !window.confirm(t("settings.mcpGroupPolicyHighRiskConfirm"))) return;
+  const groupPolicies = settingsStore.mcpGlobalPolicy.groupPolicies.filter((item) => item.groupId !== groupId);
+  if (mode !== "inherit") {
+    groupPolicies.push({
+      groupId,
+      readOnly: mode === "read_only",
+      allowDangerousSql: mode === "high_risk_write",
+    });
+  }
+  void saveMcpPolicy({ groupPolicies });
+}
+
 function onMcpConnectionExecutionModeChange(connectionId: string, mode: McpConnectionExecutionMode | "inherit") {
+  if (mode === "high_risk_write" && !window.confirm(t("settings.mcpExecutionModeHighRiskConfirm"))) return;
   const existing = settingsStore.mcpGlobalPolicy.connectionPolicies.find((item) => item.connectionId === connectionId);
   const rules = settingsStore.mcpGlobalPolicy.connectionPolicies.filter((item) => item.connectionId !== connectionId);
   const migrated = existing && existing.executionModePolicyVersion !== 1 ? migrateLegacyMcpConnectionPolicy(existing) : null;
@@ -2433,7 +2950,27 @@ function onMcpConnectionExecutionModeChange(connectionId: string, mode: McpConne
     allowedDatabases: existing?.allowedDatabases ?? [],
     databasePolicies: selectedMode.databasePolicies,
   };
-  if (next.executionModeConfigured || next.databaseScope !== "all") rules.push(next);
+  if (next.executionModeConfigured || next.databaseScope !== "all" || next.databasePolicies.length > 0) rules.push(next);
+  void saveMcpPolicy({ connectionPolicies: rules });
+}
+
+function onMcpDatabaseExecutionModeChange(connectionId: string, databaseName: string, mode: McpConnectionExecutionMode | "inherit") {
+  if (mode === "high_risk_write" && !window.confirm(t("settings.mcpDatabasePolicyHighRiskConfirm"))) return;
+  const existing = settingsStore.mcpGlobalPolicy.connectionPolicies.find((item) => item.connectionId === connectionId);
+  if (!existing || existing.databaseScope !== "selected" || !existing.allowedDatabases.includes(databaseName)) return;
+  const migrated = existing.executionModePolicyVersion === 1 ? null : migrateLegacyMcpConnectionPolicy(existing);
+  const databasePolicies = (migrated?.databasePolicies ?? existing.databasePolicies).filter((policy) => policy.databaseName !== databaseName);
+  if (mode !== "inherit") {
+    databasePolicies.push({ databaseName, readOnly: mode === "read_only", allowDangerousSql: mode === "high_risk_write" });
+  }
+  const next = {
+    ...existing,
+    ...(migrated ?? {}),
+    executionModePolicyVersion: 1,
+    databasePolicies,
+  };
+  const rules = settingsStore.mcpGlobalPolicy.connectionPolicies.filter((item) => item.connectionId !== connectionId);
+  if (next.executionModeConfigured || next.databaseScope !== "all" || next.databasePolicies.length > 0) rules.push(next);
   void saveMcpPolicy({ connectionPolicies: rules });
 }
 
@@ -2568,6 +3105,12 @@ const mcpTraeRecommendedConfig = computed(() => {
   // TRAE currently splits Windows executable paths containing spaces, so bypass Node and launch the native MCP binary directly.
   const nativeBinPath = !isWeb && isWindows() ? mcpStatus.value?.native_bin_path : undefined;
   return buildMcpTraeConfig(mcpLaunchConfig.value, nativeBinPath ?? undefined);
+});
+
+const mcpQoderRecommendedConfig = computed(() => {
+  // Qoder follows TRAE's mcpServers JSON format and has the same Windows path parsing limitation.
+  const nativeBinPath = !isWeb && isWindows() ? mcpStatus.value?.native_bin_path : undefined;
+  return buildMcpQoderConfig(mcpLaunchConfig.value, nativeBinPath ?? undefined);
 });
 
 const mcpVsCodeRecommendedConfig = computed(() => buildMcpVsCodeConfig(mcpLaunchConfig.value));
@@ -3074,7 +3617,7 @@ watch(
       mcpPolicyLoadError.value = "";
       aiConfigListMode.value = "list";
       aiEditConfigId.value = null;
-      activeSettingsTab.value = props.initialTab || "appearance";
+      activeSettingsTab.value = resolveSettingsCategory(props.initialTab);
       passwordMessage.value = "";
       oldPassword.value = "";
       newPassword.value = "";
@@ -3144,7 +3687,7 @@ watch(
   () => props.initialTab,
   (tab) => {
     if (!settingsVisible.value || !tab) return;
-    activeSettingsTab.value = tab;
+    activeSettingsTab.value = resolveSettingsCategory(tab);
     void scrollToInitialSettingsSection();
   },
 );
@@ -3153,7 +3696,7 @@ watch(
   () => props.navigationRequestId,
   () => {
     if (!settingsVisible.value || !props.initialTab) return;
-    activeSettingsTab.value = props.initialTab;
+    activeSettingsTab.value = resolveSettingsCategory(props.initialTab);
     void scrollToInitialSettingsSection();
   },
 );
@@ -3199,6 +3742,7 @@ watch(activeSettingsTab, async (tab) => {
     await promptTemplateStore.ensureLoaded();
     editGlobalInstructions.value = promptTemplateStore.globalInstructions;
   }
+  if (tab === "data" && isWeb) void loadWebSqlFileUploadMaxMbSetting();
   if (tab === "about" && !appSupportInfo.value) void refreshAppSupportInfo();
   if (tab === "appearance") {
     checkLayoutDescTruncation();
@@ -3231,9 +3775,13 @@ onMounted(() => {
   void refreshWebDavPasswordStatus();
   checkLayoutDescTruncation();
   initTruncationObservers();
+  void checkBackgroundImageFileExists();
 });
 
 onUnmounted(() => {
+  clearThemePalettePreview();
+  clearUiFontFamilyPreview();
+  restoreLocaleOptionPreview();
   cleanupTableColumnTemplatePointerDrag();
   cleanupTruncationObservers();
 });
@@ -3503,6 +4051,52 @@ function normalizeMaxRetries(value: number | undefined): number {
   return Math.min(10, Math.max(0, rounded));
 }
 
+const editWebSqlFileUploadMaxMb = ref<number | undefined>(undefined);
+const webSqlFileUploadMaxMbSaving = ref(false);
+const webSqlFileUploadMaxMbLoaded = ref(false);
+const webSqlFileUploadMaxMbLoading = ref(false);
+const webSqlFileUploadMaxMbLoadError = ref("");
+
+async function loadWebSqlFileUploadMaxMbSetting() {
+  if (webSqlFileUploadMaxMbLoaded.value || webSqlFileUploadMaxMbLoading.value) return;
+  webSqlFileUploadMaxMbLoading.value = true;
+  webSqlFileUploadMaxMbLoadError.value = "";
+  try {
+    const bytes = await loadSqlFileUploadMaxBytes();
+    editWebSqlFileUploadMaxMb.value = Math.round(bytes / (1024 * 1024));
+    webSqlFileUploadMaxMbLoaded.value = true;
+  } catch (e: any) {
+    webSqlFileUploadMaxMbLoadError.value = e?.message || String(e);
+    toast(webSqlFileUploadMaxMbLoadError.value, 5000);
+  } finally {
+    webSqlFileUploadMaxMbLoading.value = false;
+  }
+}
+
+function normalizeWebSqlFileUploadMaxMb(value: number | undefined): number {
+  const rounded = typeof value === "number" && Number.isFinite(value) ? Math.round(value) : 200;
+  return Math.min(MAX_EXTERNAL_SQL_EDITOR_FILE_MB, Math.max(MIN_EXTERNAL_SQL_EDITOR_FILE_MB, rounded));
+}
+
+function webSqlFileUploadMaxMbOutOfRange(value: number | undefined): boolean {
+  return typeof value === "number" && (value < MIN_EXTERNAL_SQL_EDITOR_FILE_MB || value > MAX_EXTERNAL_SQL_EDITOR_FILE_MB);
+}
+
+async function saveWebSqlFileUploadMaxMbSetting() {
+  if (!webSqlFileUploadMaxMbLoaded.value) return;
+  const clamped = normalizeWebSqlFileUploadMaxMb(editWebSqlFileUploadMaxMb.value);
+  webSqlFileUploadMaxMbSaving.value = true;
+  try {
+    await saveSqlFileUploadMaxMb(clamped);
+    editWebSqlFileUploadMaxMb.value = clamped;
+    toast(t("settings.sqlFileUploadMaxMbSaved"));
+  } catch (e: any) {
+    toast(e?.message || String(e), 5000);
+  } finally {
+    webSqlFileUploadMaxMbSaving.value = false;
+  }
+}
+
 // AI Config Delete Confirmation
 const aiDeleteConfirmOpen = ref(false);
 const aiDeleteConfigId = ref<string | null>(null);
@@ -3524,6 +4118,7 @@ const aiEditApiStyle = ref<AiApiStyle>("completions");
 const aiEditCustomHeaderRows = ref<AiHeaderRow[]>([]);
 const aiEditProxyEnabled = ref(false);
 const aiEditProxyUrl = ref("");
+const aiEditSkipTlsVerify = ref(false);
 const aiEditEnableThinking = ref(true);
 const aiEditReasoningLevel = ref<AiReasoningLevel>("default");
 const aiEditMaxOutputTokens = ref<number | undefined>(undefined);
@@ -3583,6 +4178,8 @@ const aiIsGrokCli = computed(() => aiEditProvider.value === "grok-cli");
 const aiIsCodeBuddyCli = computed(() => aiEditProvider.value === "codebuddy-cli");
 const aiIsQoderCli = computed(() => aiEditProvider.value === "qoder-cli");
 const aiIsCliProvider = computed(() => CLI_AI_PROVIDERS.has(aiEditProvider.value));
+
+const aiSupportsSkipTlsVerify = computed(() => aiEditProvider.value === "custom" || aiEditProvider.value === "openai-compatible" || aiEditProvider.value === "anthropic-compatible");
 const aiCliProviderLabel = computed(() => selectedAiProviderPreset.value.label);
 const aiCliCommandName = computed(() => {
   if (aiIsClaudeCodeCli.value) return "claude";
@@ -3809,6 +4406,7 @@ function currentAiEditConfig() {
     customHeaders: customHeadersFromRows(),
     proxyEnabled: aiEditProxyEnabled.value,
     proxyUrl: aiEditProxyUrl.value,
+    skipTlsVerify: aiSupportsSkipTlsVerify.value && aiEditSkipTlsVerify.value,
     enableThinking: aiEditEnableThinking.value,
     reasoningLevel: aiEditReasoningLevel.value,
     maxOutputTokens: aiEditMaxOutputTokens.value || undefined,
@@ -3852,11 +4450,12 @@ function aiSelectProvider(presetId: string) {
   aiEditProvider.value = provider;
   aiEditApiKey.value = "";
   aiEditAuthMethod.value = preset.authMethod;
-  aiEditEndpoint.value = preset.endpoint;
+  aiEditEndpoint.value = getAiProviderPresetDefaultEndpoint(preset, locale.value);
   aiEditModel.value = preset.group === "partner" ? preset.model : "";
   aiEditLegacyModels.value = preset.group === "partner" ? [...(preset.models ?? [])] : [];
   aiEditApiStyle.value = preset.apiStyle;
   aiEditCustomHeaderRows.value = [];
+  aiEditSkipTlsVerify.value = false;
   aiEditEnableThinking.value = true;
   aiEditReasoningLevel.value = "default";
   if (CLI_AI_PROVIDERS.has(provider)) void ensureCliMcpStatus();
@@ -3896,6 +4495,7 @@ function aiEnterEditMode(configId?: string) {
       aiEditCustomHeaderRows.value = aiHeaderRowsFromConfig(config.customHeaders);
       aiEditProxyEnabled.value = config.proxyEnabled ?? false;
       aiEditProxyUrl.value = config.proxyUrl ?? "";
+      aiEditSkipTlsVerify.value = config.skipTlsVerify ?? false;
       aiEditEnableThinking.value = config.enableThinking ?? true;
       aiEditReasoningLevel.value = config.reasoningLevel ?? "default";
       aiEditMaxOutputTokens.value = config.maxOutputTokens;
@@ -3930,6 +4530,7 @@ function aiEnterEditMode(configId?: string) {
     aiEditCustomHeaderRows.value = [];
     aiEditProxyEnabled.value = false;
     aiEditProxyUrl.value = "";
+    aiEditSkipTlsVerify.value = false;
     aiEditEnableThinking.value = true;
     aiEditReasoningLevel.value = "default";
     aiEditMaxOutputTokens.value = undefined;
@@ -3959,6 +4560,7 @@ async function applyPendingAiConfigDeepLinkDraft() {
   if (!settingsVisible.value || !requestId || requestId === handledAiConfigRequestId || !draft) return;
 
   handledAiConfigRequestId = requestId;
+  emit("ai-config-deep-link-handled");
   activeSettingsTab.value = "ai";
   aiEnterEditMode();
   aiEditConfigName.value = draft.name;
@@ -4514,6 +5116,8 @@ watch(
 );
 
 onUnmounted(() => {
+  flushMcpQueryTimeoutSave();
+  if (mcpQueryTimeoutSavedStatusTimer !== null) clearTimeout(mcpQueryTimeoutSavedStatusTimer);
   cleanupPreviewEditor();
   resetSettingsSearchState();
 });
@@ -4687,7 +5291,7 @@ onUnmounted(() => {
               </div>
 
               <div class="grid grid-cols-2 gap-2 lg:grid-cols-4" data-editor-preview-controls>
-                <div class="flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
+                <div class="settings-item flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
                   <div class="flex min-w-0 items-center gap-1">
                     <Label for="editor-show-statement-run-buttons" class="truncate text-xs">{{ t("settings.showStatementRunButtons") }}</Label>
                     <HelpTooltip :label="t('settings.showStatementRunButtons')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
@@ -4697,7 +5301,7 @@ onUnmounted(() => {
                   <Switch id="editor-show-statement-run-buttons" v-model="editShowStatementRunButtons" size="sm" />
                 </div>
 
-                <div class="flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
+                <div class="settings-item flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
                   <div class="flex min-w-0 items-center gap-1">
                     <Label for="editor-show-line-numbers" class="truncate text-xs">{{ t("settings.showLineNumbers") }}</Label>
                     <HelpTooltip :label="t('settings.showLineNumbers')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
@@ -4707,7 +5311,7 @@ onUnmounted(() => {
                   <Switch id="editor-show-line-numbers" v-model="editShowLineNumbers" size="sm" />
                 </div>
 
-                <div class="flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
+                <div class="settings-item flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
                   <div class="flex min-w-0 items-center gap-1">
                     <Label for="editor-show-current-statement-frame" class="truncate text-xs">{{ t("settings.showCurrentStatementFrame") }}</Label>
                     <HelpTooltip :label="t('settings.showCurrentStatementFrame')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
@@ -4717,7 +5321,7 @@ onUnmounted(() => {
                   <Switch id="editor-show-current-statement-frame" v-model="editShowCurrentStatementFrame" size="sm" />
                 </div>
 
-                <div class="flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
+                <div class="settings-item flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
                   <div class="flex min-w-0 items-center gap-1">
                     <Label for="editor-sql-semantic-diagnostics" class="truncate text-xs">{{ t("settings.sqlSemanticDiagnosticsEnabled") }}</Label>
                     <HelpTooltip :label="t('settings.sqlSemanticDiagnosticsEnabled')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
@@ -4727,7 +5331,7 @@ onUnmounted(() => {
                   <Switch id="editor-sql-semantic-diagnostics" :model-value="editSqlSemanticDiagnosticsEnabled" size="sm" @update:model-value="onSqlSemanticDiagnosticsEnabledChange" />
                 </div>
 
-                <div class="flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
+                <div class="settings-item flex min-w-0 items-center justify-between gap-2 rounded-md border bg-muted/20 px-2 py-1.5">
                   <div class="flex min-w-0 items-center gap-1">
                     <Label for="editor-show-table-ddl-hover-preview" class="truncate text-xs">{{ t("settings.showTableDdlHoverPreview") }}</Label>
                     <HelpTooltip :label="t('settings.showTableDdlHoverPreview')" trigger-class="[&_svg]:h-3 [&_svg]:w-3" content-class="max-w-64">
@@ -4741,7 +5345,7 @@ onUnmounted(() => {
               <Separator />
 
               <div class="grid gap-4 md:grid-cols-2" data-editor-execution-settings>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2 md:col-span-2" data-editor-execute-mode>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2 md:col-span-2" data-editor-execute-mode>
                   <div class="min-w-0 space-y-1">
                     <Label>{{ executeModeLabel }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4759,7 +5363,7 @@ onUnmounted(() => {
                   </Select>
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" data-editor-default-transaction-mode>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" data-editor-default-transaction-mode>
                   <div class="min-w-0 space-y-1">
                     <Label for="editor-default-transaction-mode">{{ t("settings.defaultTransactionMode") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4777,7 +5381,7 @@ onUnmounted(() => {
                   </Select>
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" :class="{ 'opacity-50': editExecuteMode !== 'current' }">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" :class="{ 'opacity-50': editExecuteMode !== 'current' }">
                   <div class="space-y-1">
                     <Label for="editor-execute-all-on-blank-line">{{ t("settings.executeAllOnBlankLine") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4787,7 +5391,7 @@ onUnmounted(() => {
                   <Switch id="editor-execute-all-on-blank-line" v-model="editExecuteAllOnBlankLine" :disabled="editExecuteMode !== 'current'" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-show-execution-target-picker">{{ t("settings.showExecutionTargetPicker") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4797,7 +5401,7 @@ onUnmounted(() => {
                   <Switch id="editor-show-execution-target-picker" v-model="editShowExecutionTargetPicker" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-confirm-dangerous-sql">{{ t("settings.confirmDangerousSqlExecution") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4807,7 +5411,7 @@ onUnmounted(() => {
                   <Switch id="editor-confirm-dangerous-sql" v-model="editConfirmDangerousSqlExecution" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-continue-on-error">{{ t("settings.continueOnErrorOnBatch") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4821,7 +5425,7 @@ onUnmounted(() => {
               <Separator />
 
               <div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]" data-editor-sql-completion-settings>
-                <div class="flex items-start justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" data-editor-completion-trigger-mode>
+                <div class="settings-item flex items-start justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" data-editor-completion-trigger-mode>
                   <div class="min-w-0 space-y-1">
                     <Label>{{ t("settings.completionTriggerMode") }}</Label>
                     <p class="text-xs leading-tight text-muted-foreground">
@@ -4840,7 +5444,7 @@ onUnmounted(() => {
                   </Select>
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-select-first-completion-on-open">{{ t("settings.selectFirstCompletionOnOpen") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4850,7 +5454,7 @@ onUnmounted(() => {
                   <Switch id="editor-select-first-completion-on-open" v-model="editSelectFirstCompletionOnOpen" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-auto-close-brackets">{{ t("settings.autoCloseBrackets") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4860,7 +5464,7 @@ onUnmounted(() => {
                   <Switch id="editor-auto-close-brackets" v-model="editAutoCloseBrackets" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-insert-space-after-completion">{{ t("settings.insertSpaceAfterCompletion") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4870,7 +5474,7 @@ onUnmounted(() => {
                   <Switch id="editor-insert-space-after-completion" v-model="editInsertSpaceAfterCompletion" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-sort-completion-columns-alphabetically">{{ t("settings.sortCompletionColumnsAlphabetically") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4880,7 +5484,7 @@ onUnmounted(() => {
                   <Switch id="editor-sort-completion-columns-alphabetically" v-model="editSortCompletionColumnsAlphabetically" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-auto-alias-tables">{{ t("settings.autoAliasTables") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4894,7 +5498,7 @@ onUnmounted(() => {
               <Separator />
 
               <div class="grid gap-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]" data-editor-other-settings>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-show-insert-value-hints">{{ t("settings.showInsertValueHints") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4904,7 +5508,7 @@ onUnmounted(() => {
                   <Switch id="editor-show-insert-value-hints" v-model="editShowInsertValueHints" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-word-wrap">{{ t("settings.wordWrap") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4914,7 +5518,7 @@ onUnmounted(() => {
                   <Switch id="editor-word-wrap" v-model="editWordWrap" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-vim-mode">{{ t("settings.vimMode") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4924,7 +5528,7 @@ onUnmounted(() => {
                   <Switch id="editor-vim-mode" v-model="editVimModeEnabled" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="regex-max-match-count">{{ t("settings.regexMaxMatchCount") }}</Label>
                     <p class="text-xs text-muted-foreground">{{ t("settings.regexMaxMatchCountDescription") }}</p>
@@ -4944,7 +5548,7 @@ onUnmounted(() => {
               <Separator />
 
               <div class="grid gap-3 md:grid-cols-2">
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2 md:col-span-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2 md:col-span-2">
                   <div class="min-w-0 space-y-1">
                     <Label for="editor-saved-sql-open-target">{{ t("settings.savedSqlOpenTarget") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -4962,7 +5566,7 @@ onUnmounted(() => {
                   </Select>
                 </div>
 
-                <div class="rounded-md border bg-muted/20 p-3 md:col-span-2" data-editor-unsaved-sql-settings>
+                <div class="settings-item rounded-md border bg-muted/20 p-3 md:col-span-2" data-editor-unsaved-sql-settings>
                   <div class="grid gap-4 md:grid-cols-2">
                     <div class="flex min-w-0 items-start justify-between gap-4">
                       <div class="min-w-0 space-y-1">
@@ -4999,7 +5603,7 @@ onUnmounted(() => {
                   </div>
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="generate-sql-include-database-name">{{ t("settings.generateSqlIncludeDatabaseName") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -5009,7 +5613,17 @@ onUnmounted(() => {
                   <Switch id="generate-sql-include-database-name" v-model="editGenerateSqlIncludeDatabaseName" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="generate-sql-quote-identifiers">{{ t("settings.generateSqlQuoteIdentifiers") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.generateSqlQuoteIdentifiersDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="generate-sql-quote-identifiers" v-model="editGenerateSqlQuoteIdentifiers" class="mt-0.5" />
+                </div>
+
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="format-sql-on-sql-file-save">{{ t("settings.formatSqlOnSqlFileSave") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -5052,7 +5666,7 @@ onUnmounted(() => {
                   </div>
                 </div>
                 <div class="grid gap-3 md:grid-cols-2">
-                  <div v-for="key in SQL_VARIABLE_SYNTAX_KEYS" :key="key" class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" :class="{ 'opacity-50': !editSqlVariableSubstitutionEnabled }">
+                  <div v-for="key in SQL_VARIABLE_SYNTAX_KEYS" :key="key" class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" :class="{ 'opacity-50': !editSqlVariableSubstitutionEnabled }">
                     <div class="min-w-0 space-y-1">
                       <Label :for="`sql-var-syntax-${key}`" class="flex items-center gap-1.5">
                         <span class="font-mono text-xs text-primary">{{ SQL_VARIABLE_SYNTAX_TOKENS[key] }}</span>
@@ -5064,6 +5678,34 @@ onUnmounted(() => {
                     </div>
                     <Switch :id="`sql-var-syntax-${key}`" :model-value="sqlVariableSyntaxToggle(key)" :disabled="!editSqlVariableSubstitutionEnabled" class="mt-0.5 shrink-0" @update:model-value="(value) => setSqlVariableSyntaxToggle(key, value as boolean)" />
                   </div>
+                </div>
+              </div>
+
+              <Separator />
+
+              <div data-settings-search-id="editor-sql-file" :class="['space-y-3', settingsSearchTargetClass('editor-sql-file')]">
+                <div class="text-sm font-medium text-muted-foreground">
+                  {{ t("settings.sqlFileSection") }}
+                </div>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="external-sql-editor-max-mb">
+                      {{ t("settings.externalSqlEditorMaxMb") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.externalSqlEditorMaxMbDescription", { min: MIN_EXTERNAL_SQL_EDITOR_FILE_MB, max: MAX_EXTERNAL_SQL_EDITOR_FILE_MB }) }}
+                    </p>
+                  </div>
+                  <Input
+                    id="external-sql-editor-max-mb"
+                    type="number"
+                    inputmode="numeric"
+                    class="h-7 w-[130px] px-2 text-left text-xs tabular-nums"
+                    :min="MIN_EXTERNAL_SQL_EDITOR_FILE_MB"
+                    :max="MAX_EXTERNAL_SQL_EDITOR_FILE_MB"
+                    :model-value="editExternalSqlEditorMaxMb"
+                    @input="updateExternalSqlEditorMaxMbInput"
+                  />
                 </div>
               </div>
             </section>
@@ -5151,7 +5793,7 @@ onUnmounted(() => {
                   <div class="flex h-9 items-end">
                     <Label class="whitespace-normal leading-tight">{{ t("settings.languageTitle") }}</Label>
                   </div>
-                  <Select :model-value="currentLocale()" @update:model-value="onLocaleChange">
+                  <Select :model-value="currentLocale()" @update:model-value="onLocaleChange" @update:open="onLocaleOpenChange">
                     <SelectTrigger class="h-8 w-full gap-0.5 px-0.5">
                       <SelectValue>
                         <span v-if="selectedLocaleOption" class="flex min-w-0 items-center gap-0.5">
@@ -5162,8 +5804,8 @@ onUnmounted(() => {
                         </span>
                       </SelectValue>
                     </SelectTrigger>
-                    <SelectContent class="w-[150px]">
-                      <SelectItem v-for="locale in LOCALE_OPTIONS" :key="locale.value" :value="locale.value">
+                    <SelectContent class="w-[150px]" @pointerleave="restoreLocaleOptionPreview">
+                      <SelectItem v-for="locale in LOCALE_OPTIONS" :key="locale.value" :value="locale.value" @pointerenter="previewLocaleOption(locale.value)" @focus="previewLocaleOption(locale.value)">
                         <div class="flex items-center gap-1">
                           <span class="inline-flex h-5 w-6 shrink-0 items-center justify-center text-sm font-medium leading-none">
                             {{ locale.flag }}
@@ -5181,7 +5823,7 @@ onUnmounted(() => {
                   </div>
                   <div class="flex items-center gap-2">
                     <div class="min-w-0 flex-1">
-                      <Select :model-value="themePalette" @update:model-value="(value) => setThemePalette(value as AppThemePalette)">
+                      <Select :model-value="themePalette" @update:model-value="onThemePaletteSelect" @update:open="onThemePaletteOpenChange">
                         <SelectTrigger class="h-8 w-full gap-1">
                           <SelectValue :placeholder="t('settings.selectColorTheme')">
                             <span v-if="selectedThemePaletteOption" class="flex min-w-0 items-center gap-1">
@@ -5195,8 +5837,8 @@ onUnmounted(() => {
                             </span>
                           </SelectValue>
                         </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem v-for="option in appThemePaletteOptions" :key="option.value" :value="option.value">
+                        <SelectContent @pointerleave="clearThemePalettePreview">
+                          <SelectItem v-for="option in appThemePaletteOptions" :key="option.value" :value="option.value" @pointerenter="previewThemePalette(option.value)" @focus="previewThemePalette(option.value)">
                             <div class="flex items-center gap-2">
                               <span class="h-3 w-3 rounded-full border border-border shadow-xs" :style="{ background: option.previewColor }" />
                               {{ option.label }}
@@ -5220,15 +5862,7 @@ onUnmounted(() => {
                       </HelpTooltip>
                     </div>
                   </div>
-                  <Select
-                    :model-value="String(editUiScale)"
-                    @update:model-value="
-                      (value: any) => {
-                        const next = Number(value);
-                        if (Number.isFinite(next)) editUiScale = next;
-                      }
-                    "
-                  >
+                  <Select :model-value="String(editUiScale)" @update:model-value="onUiScaleChange">
                     <SelectTrigger class="h-8 w-full">
                       <SelectValue>{{ Math.round(editUiScale * 100) }}%</SelectValue>
                     </SelectTrigger>
@@ -5274,8 +5908,12 @@ onUnmounted(() => {
                     :trigger-class="appearanceFontSearchTriggerClass"
                     :trigger-icon-class="appearanceFontSearchTriggerIconClass"
                     content-class="w-[var(--reka-popover-trigger-width)] min-w-[260px]"
+                    :content-style="{ fontFamily: editUiFontFamily || DEFAULT_UI_FONT_FAMILY }"
                     @update:model-value="onUiFontFamilyChange"
-                    @update:open="(open: boolean) => open && loadSystemFontOptions()"
+                    @update:open="onUiFontFamilyOpenChange"
+                    @option-hover="previewUiFontOption"
+                    @option-highlight="previewUiFontOption"
+                    @option-leave="restoreUiFontFamilyPreview"
                   >
                     <template #trigger-label="{ label, loading }">
                       <span class="truncate" :style="{ fontFamily: editUiFontFamily }">
@@ -5467,6 +6105,7 @@ onUnmounted(() => {
                       <SelectContent>
                         <SelectItem value="none">{{ t("settings.tabGroupNone") }}</SelectItem>
                         <SelectItem value="database-type">{{ t("settings.tabGroupDatabaseType") }}</SelectItem>
+                        <SelectItem value="database">{{ t("settings.tabGroupDatabase") }}</SelectItem>
                         <SelectItem value="connection">{{ t("settings.tabGroupConnection") }}</SelectItem>
                       </SelectContent>
                     </Select>
@@ -5489,7 +6128,7 @@ onUnmounted(() => {
                 </div>
               </div>
 
-              <div v-if="!isWeb" class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div v-if="!isWeb" class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="show-tray-icon">{{ t("settings.showTrayIcon") }}</Label>
                   <p class="text-xs text-muted-foreground">
@@ -5499,7 +6138,7 @@ onUnmounted(() => {
                 <Switch id="show-tray-icon" v-model="editShowTrayIcon" />
               </div>
 
-              <div v-if="!isWeb" class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div v-if="!isWeb" class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="quit-on-close">{{ t("settings.quitOnClose") }}</Label>
                   <p class="text-xs text-muted-foreground">
@@ -5509,7 +6148,7 @@ onUnmounted(() => {
                 <Switch id="quit-on-close" v-model="editQuitOnClose" />
               </div>
 
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="update-notifications-enabled">{{ t("settings.updateNotificationsEnabled") }}</Label>
                   <p class="text-xs text-muted-foreground">
@@ -5519,7 +6158,7 @@ onUnmounted(() => {
                 <Switch id="update-notifications-enabled" v-model="editUpdateNotificationsEnabled" />
               </div>
 
-              <div v-if="!isWeb" class="flex flex-col gap-3 rounded-md border bg-muted/20 px-3 py-2">
+              <div v-if="!isWeb" class="settings-item flex flex-col gap-3 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center justify-between gap-4">
                   <div class="space-y-1">
                     <Label for="debug-logging-enabled">{{ t("settings.debugLoggingEnabled") }}</Label>
@@ -5574,6 +6213,55 @@ onUnmounted(() => {
                 </div>
               </div>
 
+              <div v-if="!isWeb" class="settings-appearance-group" data-background-image-settings>
+                <Label>{{ t("settings.backgroundImage") }}</Label>
+                <p class="text-xs text-muted-foreground">{{ t("settings.backgroundImageDescription") }}</p>
+                <div class="flex flex-wrap items-center gap-2">
+                  <Button type="button" variant="outline" size="sm" class="h-8" @click="pickBackgroundImage">
+                    {{ t("settings.backgroundImageChoose") }}
+                  </Button>
+                  <Button v-if="editBackgroundImage.filePath" type="button" variant="outline" size="sm" class="h-8" @click="clearBackgroundImageDraft">
+                    {{ t("settings.backgroundImageClear") }}
+                  </Button>
+                  <span v-if="editBackgroundImage.fileName" class="min-w-0 truncate text-xs text-muted-foreground" :title="editBackgroundImage.fileName">
+                    {{ editBackgroundImage.fileName }}
+                  </span>
+                  <span v-else class="text-xs text-muted-foreground">{{ t("settings.backgroundImageNone") }}</span>
+                </div>
+                <p v-if="backgroundImageFileMissing" class="text-xs text-destructive">
+                  {{ t("settings.backgroundImageMissing") }}
+                </p>
+                <div class="space-y-1">
+                  <Label for="background-image-display-mode">{{ t("settings.backgroundImageDisplayMode") }}</Label>
+                  <Select :model-value="editBackgroundImage.displayMode" @update:model-value="updateBackgroundImageDisplayMode">
+                    <SelectTrigger id="background-image-display-mode" class="h-8 w-48">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem v-for="mode in BACKGROUND_IMAGE_DISPLAY_MODES" :key="mode" :value="mode">
+                        {{ t(`settings.backgroundImageMode${mode.charAt(0).toUpperCase()}${mode.slice(1)}`) }}
+                      </SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div class="grid gap-3 sm:grid-cols-2">
+                  <div class="space-y-1">
+                    <div class="flex items-center justify-between gap-2">
+                      <Label for="background-image-transparency" class="text-xs text-muted-foreground">{{ t("settings.backgroundImageTransparency") }}</Label>
+                      <span class="text-xs text-muted-foreground">{{ backgroundImageTransparencyPercent }}%</span>
+                    </div>
+                    <input id="background-image-transparency" type="range" min="0" max="95" step="1" :value="backgroundImageTransparencyPercent" class="w-full accent-primary" @input="updateBackgroundImageTransparency(Number(($event.target as HTMLInputElement).value))" />
+                  </div>
+                  <div class="space-y-1">
+                    <div class="flex items-center justify-between gap-2">
+                      <Label for="background-image-blur" class="text-xs text-muted-foreground">{{ t("settings.backgroundImageBlur") }}</Label>
+                      <span class="text-xs text-muted-foreground">{{ editBackgroundImage.blur }}px</span>
+                    </div>
+                    <input id="background-image-blur" type="range" min="0" max="20" step="1" :value="editBackgroundImage.blur" class="w-full accent-primary" @input="updateBackgroundImageBlur(Number(($event.target as HTMLInputElement).value))" />
+                  </div>
+                </div>
+              </div>
+
               <Separator />
 
               <div class="space-y-2">
@@ -5583,7 +6271,7 @@ onUnmounted(() => {
                     <p>{{ t("settings.toolbarHiddenHint") }}</p>
                   </HelpTooltip>
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border border-border/60 p-3">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border border-border/60 p-3">
                   <div class="space-y-1">
                     <Label for="exclusive-right-sidebar-panels" class="text-sm cursor-pointer">{{ t("settings.exclusiveRightSidebarPanels") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -5627,7 +6315,7 @@ onUnmounted(() => {
                   </Button>
                 </div>
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="sidebar-browse-objects-on-database-activation">{{ t("settings.sidebarBrowseObjectsOnDatabaseActivation") }}</Label>
                   <HelpTooltip :label="t('settings.sidebarBrowseObjectsOnDatabaseActivation')">
@@ -5697,7 +6385,7 @@ onUnmounted(() => {
                   </Button>
                 </div>
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="open-data-tabs-next-to-active">{{ t("settings.openDataTabsNextToActive") }}</Label>
                   <HelpTooltip :label="t('settings.openDataTabsNextToActive')">
@@ -5776,7 +6464,7 @@ onUnmounted(() => {
                 </div>
               </div>
               <div class="grid gap-3 md:grid-cols-2">
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-click-table-navigation-ddl">{{ t("settings.clickTableNavigationTarget") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -5786,7 +6474,7 @@ onUnmounted(() => {
                   <Switch id="editor-click-table-navigation-ddl" :model-value="editClickTableNavigationTarget === 'ddl'" @update:model-value="editClickTableNavigationTarget = $event ? 'ddl' : 'data'" class="mt-0.5" />
                 </div>
 
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="editor-prefill-new-query">{{ t("settings.prefillNewQueryWithSelect") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -5796,7 +6484,7 @@ onUnmounted(() => {
                   <Switch id="editor-prefill-new-query" v-model="editPrefillNewQueryWithSelect" class="mt-0.5" />
                 </div>
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="sidebar-table-search-enabled">{{ t("settings.sidebarTableSearchEnabled") }}</Label>
                   <HelpTooltip :label="t('settings.sidebarTableSearchEnabled')">
@@ -5805,7 +6493,7 @@ onUnmounted(() => {
                 </div>
                 <Switch id="sidebar-table-search-enabled" v-model="editSidebarTableSearchEnabled" />
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="auto-select-active-sidebar-node">{{ t("settings.autoSelectActiveSidebarNode") }}</Label>
                   <HelpTooltip :label="t('settings.autoSelectActiveSidebarNode')">
@@ -5814,7 +6502,7 @@ onUnmounted(() => {
                 </div>
                 <Switch id="auto-select-active-sidebar-node" v-model="editAutoSelectActiveSidebarNode" />
               </div>
-              <div class="space-y-2 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="open-tabs-restore-mode">{{ t("settings.openTabsRestoreMode") }}</Label>
                   <HelpTooltip :label="t('settings.openTabsRestoreMode')">
@@ -5835,7 +6523,7 @@ onUnmounted(() => {
                   {{ t("settings.openTabsRestoreModeHint") }}
                 </p>
               </div>
-              <div class="space-y-2 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="disconnect-tab-handling-mode">{{ t("settings.disconnectTabHandlingMode") }}</Label>
                   <HelpTooltip :label="t('settings.disconnectTabHandlingMode')">
@@ -5860,7 +6548,7 @@ onUnmounted(() => {
                   {{ t(`settings.${disconnectTabHandlingModeDescriptionKey}`) }}
                 </p>
               </div>
-              <div class="space-y-2 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="sidebar-object-info-mode">{{ t("settings.sidebarObjectInfoMode") }}</Label>
                   <HelpTooltip :label="t('settings.sidebarObjectInfoMode')">
@@ -5880,7 +6568,7 @@ onUnmounted(() => {
                   </SelectContent>
                 </Select>
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="sidebar-allow-horizontal-scroll">
                     {{ t("settings.sidebarAllowHorizontalScroll") }}
@@ -5891,7 +6579,7 @@ onUnmounted(() => {
                 </div>
                 <Switch id="sidebar-allow-horizontal-scroll" v-model="editSidebarAllowHorizontalScroll" />
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">
                   <Label for="sidebar-show-tooltips">
                     {{ t("settings.sidebarShowTooltips") }}
@@ -5902,7 +6590,7 @@ onUnmounted(() => {
                 </div>
                 <Switch id="sidebar-show-tooltips" v-model="editSidebarShowTooltips" />
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="sidebar-indent">{{ t("settings.sidebarIndent") }}</Label>
                   <p class="text-xs text-muted-foreground">
@@ -5925,7 +6613,7 @@ onUnmounted(() => {
                   "
                 />
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="sidebar-font-size">{{ t("settings.sidebarFontSize") }}</Label>
                   <p class="text-xs text-muted-foreground">
@@ -5960,7 +6648,7 @@ onUnmounted(() => {
                   {{ t("settings.sidebarHiddenTablePrefixesDescription") }}
                 </p>
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="sidebar-copy-table-name-separator">{{ t("settings.sidebarCopyTableNameSeparator") }}</Label>
                   <p class="text-xs text-muted-foreground">
@@ -5985,7 +6673,7 @@ onUnmounted(() => {
                   </SelectContent>
                 </Select>
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="sidebar-copy-table-name-include-schema">{{ t("settings.sidebarCopyTableNameIncludeSchema") }}</Label>
                   <p class="text-xs text-muted-foreground">
@@ -5994,7 +6682,7 @@ onUnmounted(() => {
                 </div>
                 <Switch id="sidebar-copy-table-name-include-schema" v-model="editSidebarCopyTableNameIncludeSchema" class="mt-0.5" />
               </div>
-              <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="space-y-1">
                   <Label for="sidebar-table-page-size">{{ t("settings.sidebarTablePageSize") }}</Label>
                   <p class="text-xs text-muted-foreground">
@@ -6079,6 +6767,13 @@ onUnmounted(() => {
                       <span class="truncate">{{ t("grid.filterTextView") }}</span>
                     </Button>
                   </div>
+                  <div v-if="editDataGridFilterEditorView !== 'quick'" class="settings-item flex items-center justify-between gap-4 rounded-md border bg-background px-3 py-2">
+                    <div class="space-y-1">
+                      <Label for="data-grid-keep-filter-editor-expanded">{{ t("settings.dataGridKeepFilterEditorExpanded") }}</Label>
+                      <p class="text-xs text-muted-foreground">{{ t("settings.dataGridKeepFilterEditorExpandedDescription") }}</p>
+                    </div>
+                    <Switch id="data-grid-keep-filter-editor-expanded" v-model="editDataGridKeepFilterEditorExpanded" />
+                  </div>
                 </div>
 
                 <div v-if="dataGridFilterViewPreviewExpanded" class="pointer-events-none select-none overflow-hidden border-t bg-background" data-data-grid-filter-view-preview>
@@ -6155,7 +6850,7 @@ onUnmounted(() => {
                 <div class="text-sm font-medium text-muted-foreground">
                   {{ t("settings.dataGridDisplay") }}
                 </div>
-                <div data-settings-search-id="data-grid-type-colors" :class="['flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('data-grid-type-colors')]">
+                <div data-settings-search-id="data-grid-type-colors" :class="['settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('data-grid-type-colors')]">
                   <div class="space-y-1 min-w-0">
                     <Label>{{ t("settings.dataGridTypeColorScheme") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -6170,7 +6865,7 @@ onUnmounted(() => {
                     </Button>
                   </div>
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="table-open-page-size">
                       {{ t("settings.tableOpenPageSize") }}
@@ -6181,7 +6876,7 @@ onUnmounted(() => {
                   </div>
                   <Input id="table-open-page-size" type="number" inputmode="numeric" class="h-7 w-24 px-2 text-left text-xs tabular-nums" :min="MIN_RESULT_PAGE_SIZE" :max="MAX_RESULT_PAGE_SIZE" :model-value="editTableOpenPageSize" @update:model-value="updateTableOpenPageSizeDraft" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="query-page-size">
                       {{ t("settings.queryPageSize") }}
@@ -6202,7 +6897,14 @@ onUnmounted(() => {
                     @update:model-value="updatePageSizeDraft"
                   />
                 </div>
-                <div data-settings-search-id="multi-statement-default-view" :class="['flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('multi-statement-default-view')]">
+                <div data-settings-search-id="default-auto-keep-results" :class="['settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('default-auto-keep-results')]">
+                  <div class="min-w-0 space-y-1">
+                    <Label for="default-auto-keep-results">{{ t("settings.defaultAutoKeepResults") }}</Label>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.defaultAutoKeepResultsDescription") }}</p>
+                  </div>
+                  <Switch id="default-auto-keep-results" v-model="editDefaultAutoKeepResults" :aria-label="t('settings.defaultAutoKeepResults')" />
+                </div>
+                <div data-settings-search-id="multi-statement-default-view" :class="['settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('multi-statement-default-view')]">
                   <div class="min-w-0 space-y-1">
                     <Label for="multi-statement-default-view">{{ t("settings.multiStatementDefaultView") }}</Label>
                     <p class="text-xs text-muted-foreground">{{ t("settings.multiStatementDefaultViewDescription") }}</p>
@@ -6217,7 +6919,7 @@ onUnmounted(() => {
                     </SelectContent>
                   </Select>
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="query-result-max-rows-enabled">
                       {{ t("settings.queryResultMaxRows") }}
@@ -6242,7 +6944,7 @@ onUnmounted(() => {
                     <Switch id="query-result-max-rows-enabled" v-model="editQueryResultMaxRowsEnabled" :aria-label="t('settings.queryResultMaxRowsEnabled')" />
                   </div>
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="infinite-scroll">
                       {{ t("settings.infiniteScroll") }}
@@ -6253,7 +6955,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="infinite-scroll" v-model="editInfiniteScroll" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="auto-calculate-total-rows">
                       {{ t("settings.autoCalculateTotalRows") }}
@@ -6264,7 +6966,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="auto-calculate-total-rows" v-model="editAutoCalculateTotalRows" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="show-column-comments-in-header">
                       {{ t("settings.showColumnCommentsInHeader") }}
@@ -6275,7 +6977,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="show-column-comments-in-header" v-model="editShowColumnCommentsInHeader" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="show-column-types-in-header">
                       {{ t("settings.showColumnTypesInHeader") }}
@@ -6286,7 +6988,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="show-column-types-in-header" v-model="editShowColumnTypesInHeader" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="data-grid-show-transpose-field-metadata">
                       {{ t("settings.dataGridShowTransposeFieldMetadata") }}
@@ -6297,7 +6999,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="data-grid-show-transpose-field-metadata" v-model="editDataGridShowTransposeFieldMetadata" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="colorize-data-grid-cell-types">
                       {{ t("settings.colorizeDataGridCellTypes") }}
@@ -6308,7 +7010,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="colorize-data-grid-cell-types" v-model="editColorizeDataGridCellTypes" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="show-index-indicators-in-header">
                       {{ t("settings.showIndexIndicatorsInHeader") }}
@@ -6319,7 +7021,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="show-index-indicators-in-header" v-model="editShowIndexIndicatorsInHeader" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="compact-column-header-actions">
                       {{ t("settings.compactColumnHeaderActions") }}
@@ -6330,7 +7032,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="compact-column-header-actions" v-model="editCompactColumnHeaderActions" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="data-grid-quick-entry">
                       {{ t("settings.dataGridQuickEntry") }}
@@ -6341,7 +7043,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="data-grid-quick-entry" v-model="editDataGridQuickEntry" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="data-grid-auto-transpose-single-row">
                       {{ t("settings.dataGridAutoTransposeSingleRow") }}
@@ -6352,7 +7054,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="data-grid-auto-transpose-single-row" v-model="editDataGridAutoTransposeSingleRow" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="data-grid-cell-detail-button-visible">
                       {{ t("settings.dataGridCellDetailButtonVisible") }}
@@ -6363,7 +7065,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="data-grid-cell-detail-button-visible" v-model="editDataGridCellDetailButtonVisible" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="data-grid-crosshair-highlight">
                       {{ t("settings.dataGridCrosshairHighlight") }}
@@ -6374,7 +7076,7 @@ onUnmounted(() => {
                   </div>
                   <Switch id="data-grid-crosshair-highlight" v-model="editDataGridCrosshairHighlight" />
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
                     <Label for="flattening-multi-line">
                       {{ t("settings.flatteningMultiLineText") }}
@@ -6390,7 +7092,7 @@ onUnmounted(() => {
               <template v-if="!isWeb">
                 <div class="space-y-3">
                   <div class="text-sm font-medium text-muted-foreground">DuckDB</div>
-                  <div class="space-y-3 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="settings-item space-y-3 rounded-md border bg-muted/20 px-3 py-2">
                     <div class="flex items-start justify-between gap-4">
                       <div class="space-y-1">
                         <Label for="duckdb-worker-process-isolation">
@@ -6442,7 +7144,7 @@ onUnmounted(() => {
                 <div class="text-sm font-medium text-muted-foreground">
                   {{ t("settings.dateTimeSection") }}
                 </div>
-                <div class="grid gap-3 rounded-md border bg-muted/20 px-3 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(220px,0.8fr)] sm:items-center">
+                <div class="settings-item grid gap-3 rounded-md border bg-muted/20 px-3 py-3 sm:grid-cols-[minmax(0,1fr)_minmax(220px,0.8fr)] sm:items-center">
                   <div>
                     <Label>{{ t("settings.globalDateTimeDisplayFormat") }}</Label>
                     <p class="mt-1 text-xs text-muted-foreground">
@@ -6592,11 +7294,45 @@ onUnmounted(() => {
 
               <Separator />
 
+              <div v-if="isWeb" data-settings-search-id="data-sql-file-upload" :class="['space-y-3', settingsSearchTargetClass('data-sql-file-upload')]">
+                <div class="text-sm font-medium text-muted-foreground">
+                  {{ t("settings.sqlFileSection") }}
+                </div>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" :class="{ 'settings-item-disabled': !webSqlFileUploadMaxMbLoaded || webSqlFileUploadMaxMbLoading }">
+                  <div class="space-y-1">
+                    <Label for="web-sql-file-upload-max-mb">
+                      {{ t("settings.webSqlFileUploadMaxMb") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.webSqlFileUploadMaxMbDescription", { min: MIN_EXTERNAL_SQL_EDITOR_FILE_MB, max: MAX_EXTERNAL_SQL_EDITOR_FILE_MB }) }}
+                    </p>
+                  </div>
+                  <div class="flex shrink-0 items-center gap-2">
+                    <Input
+                      id="web-sql-file-upload-max-mb"
+                      v-model.number="editWebSqlFileUploadMaxMb"
+                      type="number"
+                      inputmode="numeric"
+                      class="h-7 w-[130px] px-2 text-left text-xs tabular-nums"
+                      :min="MIN_EXTERNAL_SQL_EDITOR_FILE_MB"
+                      :max="MAX_EXTERNAL_SQL_EDITOR_FILE_MB"
+                      :disabled="!webSqlFileUploadMaxMbLoaded || webSqlFileUploadMaxMbLoading"
+                      :aria-invalid="webSqlFileUploadMaxMbOutOfRange(editWebSqlFileUploadMaxMb)"
+                    />
+                    <Button type="button" size="sm" variant="outline" :disabled="!webSqlFileUploadMaxMbLoaded || webSqlFileUploadMaxMbSaving || webSqlFileUploadMaxMbOutOfRange(editWebSqlFileUploadMaxMb)" @click="saveWebSqlFileUploadMaxMbSetting">
+                      {{ t("settings.save") }}
+                    </Button>
+                  </div>
+                </div>
+              </div>
+
+              <Separator />
+
               <div data-settings-search-id="data-performance" :class="['space-y-3', settingsSearchTargetClass('data-performance')]">
                 <div class="text-sm font-medium text-muted-foreground">
                   {{ t("settings.performanceSection") }}
                 </div>
-                <div class="flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="min-w-0 space-y-1">
                     <Label for="metadata-cache-memory-limit">{{ t("settings.metadataCacheMemoryLimit") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -6616,7 +7352,7 @@ onUnmounted(() => {
                 <div class="text-sm font-medium text-muted-foreground">
                   {{ t("settings.tableStructureSection") }}
                 </div>
-                <div ref="tableColumnTemplateSectionRef" data-settings-search-id="table-column-templates" :class="['space-y-2 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('table-column-templates')]">
+                <div ref="tableColumnTemplateSectionRef" data-settings-search-id="table-column-templates" :class="['settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2', settingsSearchTargetClass('table-column-templates')]">
                   <div class="flex items-start justify-between gap-3">
                     <div class="space-y-1">
                       <Label>{{ t("settings.tableColumnTemplateFields") }}</Label>
@@ -6873,6 +7609,15 @@ onUnmounted(() => {
                   {{ t("settings.snippetsAdd") }}
                 </Button>
               </div>
+              <div class="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                <p>{{ t("settings.snippetsPlaceholderHint") }}</p>
+                <pre class="mt-2 overflow-x-auto whitespace-pre-wrap rounded bg-background/70 px-2 py-1.5 font-mono text-[11px] leading-relaxed text-foreground">
+SELECT t.*
+FROM ${1:table} t
+WHERE t.del_flag = 0
+LIMIT 100;</pre
+                >
+              </div>
 
               <div class="overflow-x-auto rounded-md border">
                 <table class="w-full min-w-[720px] text-sm">
@@ -7001,7 +7746,7 @@ onUnmounted(() => {
                         {{ t("settings.syncRemotePathDescription") }}
                       </p>
                     </div>
-                    <div class="space-y-2 md:col-span-2 rounded-md border bg-muted/20 px-3 py-3">
+                    <div class="settings-item space-y-2 md:col-span-2 rounded-md border bg-muted/20 px-3 py-3">
                       <label class="flex items-center gap-2 text-xs">
                         <input v-model="webdavAutoUploadEnabled" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
                         <span class="font-medium">{{ t("settings.syncAutoUpload") }}</span>
@@ -7158,7 +7903,7 @@ onUnmounted(() => {
                 </TabsContent>
               </Tabs>
 
-              <div class="mt-5 space-y-3 rounded-md border bg-muted/20 px-3 py-3">
+              <div class="settings-item mt-5 space-y-3 rounded-md border bg-muted/20 px-3 py-3">
                 <div class="flex items-center justify-between gap-4">
                   <div class="space-y-1">
                     <Label for="sync-secrets">{{ t("settings.syncSecrets") }}</Label>
@@ -7301,6 +8046,22 @@ onUnmounted(() => {
                     </button>
                   </div>
                   <div class="flex-1"></div>
+                </div>
+              </div>
+
+              <!-- Restore last AI conversation (list mode, global) -->
+              <div v-if="aiConfigListMode === 'list'" class="space-y-3">
+                <Separator />
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="ai-restore-last-conversation">
+                      {{ t("ai.restoreLastConversation") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("ai.restoreLastConversationDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="ai-restore-last-conversation" :model-value="settingsStore.restoreLastConversation" @update:model-value="(value) => settingsStore.setRestoreLastConversation(Boolean(value))" />
                 </div>
               </div>
 
@@ -7536,7 +8297,7 @@ onUnmounted(() => {
                     </Select>
                     <div v-if="selectedAiPartnerPreset" class="flex items-center gap-3 rounded-md border border-primary/20 bg-primary/5 px-3 py-2">
                       <div class="min-w-0 flex-1">
-                        <p class="text-[11px] leading-4 text-muted-foreground">{{ t(selectedAiPartnerPreset.descriptionKey) }}</p>
+                        <p class="whitespace-pre-line text-[11px] leading-4 text-muted-foreground">{{ t(selectedAiPartnerPreset.descriptionKey) }}</p>
                       </div>
                       <Button type="button" variant="ghost" size="icon" class="h-7 w-7 shrink-0" :title="t('ai.visitPartner')" :aria-label="t('ai.visitPartner')" @click="openExternalUrl(selectedAiPartnerPreset.websiteUrl)">
                         <ExternalLink class="h-3.5 w-3.5" />
@@ -7766,11 +8527,23 @@ onUnmounted(() => {
                   <Label class="text-right text-xs">{{ t("ai.proxyUrl") }}</Label>
                   <Input v-model="aiEditProxyUrl" autocomplete="off" class="col-span-2" inputClass="h-8 text-xs" placeholder="socks5://127.0.0.1:7890" :disabled="!aiEditProxyEnabled" />
                 </div>
+
+                <!-- Skip TLS Verify -->
+                <div v-if="aiSupportsSkipTlsVerify" class="grid grid-cols-3 items-start gap-3">
+                  <Label class="text-right text-xs">{{ t("ai.sslVerification") }}</Label>
+                  <div class="col-span-2">
+                    <label class="flex items-center gap-2 text-xs text-muted-foreground">
+                      <input v-model="aiEditSkipTlsVerify" type="checkbox" class="h-4 w-4 shrink-0 accent-primary" />
+                      {{ t("ai.skipTlsVerify") }}
+                    </label>
+                    <p class="mt-1 text-xs text-muted-foreground">{{ t("ai.skipTlsVerifyHint") }}</p>
+                  </div>
+                </div>
               </div>
             </section>
 
             <section v-else-if="activeSettingsTab === 'mcp'" data-settings-search-id="mcp" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('mcp')]">
-              <div class="rounded-md border bg-muted/20 p-4">
+              <div class="rounded-lg border border-border/70 bg-card/70 p-4 shadow-[0_1px_2px_hsl(var(--foreground)/0.04)]">
                 <div class="flex items-start justify-between gap-4">
                   <div class="min-w-0 space-y-2">
                     <div class="flex items-center gap-2">
@@ -7781,7 +8554,12 @@ onUnmounted(() => {
                       </HelpTooltip>
                     </div>
                   </div>
-                  <Badge v-if="!isWeb" variant="outline" class="shrink-0 rounded-md" :class="mcpStatusTone === 'ok' ? 'border-green-500/40 text-green-600 dark:text-green-400' : mcpStatusTone === 'warning' ? 'border-amber-500/40 text-amber-600 dark:text-amber-400' : 'text-muted-foreground'">
+                  <Badge
+                    v-if="!isWeb && mcpManagementTab === 'access' && mcpTransportTab === 'stdio'"
+                    variant="outline"
+                    class="shrink-0 rounded-md"
+                    :class="mcpStatusTone === 'ok' ? 'border-green-500/40 text-green-600 dark:text-green-400' : mcpStatusTone === 'warning' ? 'border-amber-500/40 text-amber-600 dark:text-amber-400' : 'text-muted-foreground'"
+                  >
                     <Loader2 v-if="mcpStatusLoading" class="mr-1 h-3 w-3 animate-spin" />
                     <CheckCircle2 v-else-if="mcpStatusTone === 'ok'" class="mr-1 h-3 w-3" />
                     <AlertTriangle v-else-if="mcpStatusTone === 'warning'" class="mr-1 h-3 w-3" />
@@ -7790,489 +8568,368 @@ onUnmounted(() => {
                 </div>
               </div>
 
-              <Tabs v-model="mcpTransportTab" class="space-y-3">
+              <Tabs v-model="mcpManagementTab" class="space-y-4">
                 <TabsList class="grid h-9 w-full grid-cols-2">
-                  <TabsTrigger value="stdio">{{ t("settings.mcpTransportLocalStdio") }}</TabsTrigger>
-                  <TabsTrigger value="http">{{ t("settings.mcpTransportHttpService") }}</TabsTrigger>
+                  <TabsTrigger value="access">{{ t("settings.mcpManagementAccess") }}</TabsTrigger>
+                  <TabsTrigger value="permissions">{{ t("settings.mcpManagementPermissions") }}</TabsTrigger>
                 </TabsList>
-              </Tabs>
 
-              <div v-if="isWeb && mcpTransportTab === 'http'" class="space-y-4">
-                <div class="rounded-md border bg-muted/20 p-4 space-y-2">
-                  <div class="flex items-center justify-between gap-3">
-                    <Label class="text-base">{{ t("settings.mcpHttpWebServiceTitle") }}</Label>
-                    <Badge :variant="webMcpHttpStatus?.enabled ? 'default' : 'outline'">{{ webMcpHttpStatus?.enabled ? t("settings.mcpHttpStatusLabelEnabled") : t("settings.mcpHttpStatusLabelDisabled") }}</Badge>
-                  </div>
-                  <p class="text-xs text-muted-foreground">{{ t("settings.mcpHttpWebServiceDescription") }}</p>
-                  <template v-if="webMcpHttpStatus">
-                    <code class="block rounded border bg-background px-2 py-1.5 text-xs">{{ webMcpEndpoint }}</code>
-                    <p class="text-[11px] text-muted-foreground">
-                      {{
-                        t("settings.mcpHttpWebTokenSourceAndHosts", {
-                          tokenSource: webMcpHttpStatus.tokenSource || t("settings.mcpHttpNotConfigured"),
-                          hosts: webMcpHttpStatus.allowedHosts.join(", ") || t("settings.mcpHttpNotConfigured"),
-                        })
-                      }}
-                    </p>
-                    <p v-if="webMcpHttpStatus.allowedOrigins.length" class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpWebAllowedOrigins", { origins: webMcpHttpStatus.allowedOrigins.join(", ") }) }}</p>
-                  </template>
-                  <Button type="button" variant="outline" size="sm" :disabled="mcpHttpLoading" @click="loadMcpHttpSettings">{{ t("settings.mcpHttpReloadStatus") }}</Button>
-                </div>
-              </div>
-
-              <div v-if="!isWeb && mcpTransportTab === 'http'" class="space-y-4">
-                <div class="rounded-md border bg-muted/20 p-4">
-                  <div class="flex items-start justify-between gap-4">
-                    <div class="space-y-1">
-                      <div class="flex items-center gap-2">
-                        <Label class="text-base">{{ t("settings.mcpHttpServiceTitle") }}</Label>
-                        <Badge :variant="mcpHttpStatus?.running ? 'default' : 'outline'">
-                          {{ mcpHttpStatus?.running ? t("settings.mcpHttpStatusLabelRunning") : mcpHttpSettings.enabled ? t("settings.mcpHttpStatusLabelPending") : t("settings.mcpHttpStatusLabelDisabled") }}
-                        </Badge>
-                      </div>
-                      <p class="text-xs leading-relaxed text-muted-foreground">{{ t("settings.mcpHttpServiceDescription") }}</p>
-                    </div>
-                    <Switch id="mcp-http-enabled" v-model="mcpHttpSettings.enabled" :disabled="mcpHttpLoading || mcpHttpSaving" />
-                  </div>
-                </div>
-
-                <template v-if="mcpHttpSettings.enabled">
-                  <section class="space-y-3 rounded-md border p-4">
-                    <div>
-                      <h4 class="text-sm font-medium">{{ t("settings.mcpHttpListenerTitle") }}</h4>
-                      <p class="mt-1 text-xs text-muted-foreground">{{ t("settings.mcpHttpListenerHintPrefix") }}<code>127.0.0.1</code>{{ t("settings.mcpHttpListenerHintSuffix") }}</p>
-                    </div>
-                    <div class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(9rem,0.42fr)]">
-                      <div class="space-y-1.5">
-                        <Label for="mcp-http-host">{{ t("settings.mcpHttpHostLabel") }}</Label>
-                        <Input id="mcp-http-host" v-model="mcpHttpSettings.host" :disabled="mcpHttpSaving" placeholder="127.0.0.1" />
-                      </div>
-                      <div class="space-y-1.5">
-                        <Label for="mcp-http-port">{{ t("settings.mcpHttpPortLabel") }}</Label>
-                        <Input id="mcp-http-port" v-model.number="mcpHttpSettings.port" :disabled="mcpHttpSaving" type="number" min="1" max="65535" />
-                      </div>
-                      <div class="space-y-1.5 sm:col-span-2">
-                        <Label for="mcp-http-path">{{ t("settings.mcpHttpPathLabel") }}</Label>
-                        <Input id="mcp-http-path" v-model="mcpHttpSettings.path" :disabled="mcpHttpSaving" placeholder="/mcp" />
+                <TabsContent value="access" class="m-0 space-y-6">
+                  <div class="border-b border-border/60 pb-2 sm:ml-1">
+                    <div class="mb-2 flex items-center gap-2">
+                      <div class="min-w-0">
+                        <p class="text-sm font-semibold text-foreground">{{ t("settings.mcpTransportLabel") }}</p>
                       </div>
                     </div>
-                  </section>
-
-                  <section class="space-y-3 rounded-md border p-4">
-                    <div class="flex items-start justify-between gap-4">
-                      <div>
-                        <h4 class="text-sm font-medium">{{ t("settings.mcpHttpRemoteTitle") }}</h4>
-                        <p class="mt-1 text-xs leading-relaxed text-muted-foreground">{{ t("settings.mcpHttpRemoteHintPrefix") }}<code>127.0.0.1</code>{{ t("settings.mcpHttpRemoteHintMiddle") }}<code>::1</code>{{ t("settings.mcpHttpRemoteHintSuffix") }}</p>
-                      </div>
-                      <Switch id="mcp-http-remote" v-model="mcpHttpSettings.allowRemote" :disabled="mcpHttpSaving" />
-                    </div>
-                    <div v-if="mcpHttpSettings.allowRemote" class="grid gap-3 sm:grid-cols-2">
-                      <div class="space-y-1.5">
-                        <Label for="mcp-http-hosts">{{ t("settings.mcpHttpAllowedHostsLabel") }}</Label>
-                        <textarea id="mcp-http-hosts" v-model="mcpHttpAllowedHostsText" :disabled="mcpHttpSaving" class="min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs" placeholder="mcp.example.com&#10;10.0.0.10" />
-                        <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpHostsHint") }}</p>
-                      </div>
-                      <div class="space-y-1.5">
-                        <Label for="mcp-http-origins">{{ t("settings.mcpHttpAllowedOriginsLabel") }}</Label>
-                        <textarea id="mcp-http-origins" v-model="mcpHttpAllowedOriginsText" :disabled="mcpHttpSaving" class="min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs" placeholder="https://mcp.example.com" />
-                        <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpOriginsHintPrefix") }}<code>https://</code>{{ t("settings.mcpHttpOriginsHintSuffix") }}</p>
-                      </div>
-                    </div>
-                    <p v-else class="rounded bg-muted px-3 py-2 text-xs text-muted-foreground">{{ t("settings.mcpHttpRemoteDisabledHint") }}</p>
-                  </section>
-
-                  <div v-if="mcpHttpDraftValidationError" class="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-                    {{ mcpHttpDraftValidationError }}
-                  </div>
-                  <div v-if="mcpHttpError" class="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
-                    {{ mcpHttpError }}
-                  </div>
-
-                  <div class="flex flex-col gap-3 rounded-md border bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
-                    <p class="text-xs text-muted-foreground">
-                      {{ mcpHttpHasUnsavedChanges ? t("settings.mcpHttpUnsavedChangesHint") : t("settings.mcpHttpSaveHint") }}
-                    </p>
-                    <div class="flex shrink-0 justify-end gap-2">
-                      <Button type="button" variant="outline" :disabled="mcpHttpLoading || mcpHttpSaving" @click="loadMcpHttpSettings">{{ t("settings.mcpHttpReload") }}</Button>
-                      <Button type="button" :disabled="mcpHttpLoading || mcpHttpSaving || Boolean(mcpHttpDraftValidationError)" @click="saveMcpHttpSettings">
-                        <Loader2 v-if="mcpHttpSaving" class="mr-2 h-4 w-4 animate-spin" />
-                        {{ t("settings.mcpHttpSaveAndStart") }}
-                      </Button>
-                    </div>
-                  </div>
-                </template>
-
-                <div v-else class="flex flex-col gap-3 rounded-md border border-dashed px-4 py-3 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
-                  <p>{{ t("settings.mcpHttpDisabledHint") }}</p>
-                  <div class="flex shrink-0 justify-end gap-2">
-                    <Button type="button" variant="outline" :disabled="mcpHttpLoading || mcpHttpSaving" @click="loadMcpHttpSettings">{{ t("settings.mcpHttpReload") }}</Button>
-                    <Button type="button" :disabled="mcpHttpLoading || mcpHttpSaving" @click="saveMcpHttpSettings">
-                      <Loader2 v-if="mcpHttpSaving" class="mr-2 h-4 w-4 animate-spin" />
-                      {{ t("settings.mcpHttpSaveAndStop") }}
-                    </Button>
-                  </div>
-                </div>
-
-                <div v-if="mcpHttpStatus?.lastError" class="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                  {{ mcpHttpStatus.lastError }}
-                </div>
-
-                <section v-if="mcpHttpStatus?.enabled" class="space-y-3 rounded-md border p-4">
-                  <div class="flex flex-wrap items-center justify-between gap-2">
-                    <div class="flex items-center gap-2 text-sm font-medium">
-                      <span class="h-2 w-2 rounded-full" :class="mcpHttpStatus.running ? 'bg-green-500' : 'bg-amber-500'" />
-                      {{ mcpHttpStatus.running ? t("settings.mcpHttpConnectionInfoTitle") : t("settings.mcpHttpServiceNotRunning") }}
-                    </div>
-                    <Badge variant="outline" class="font-normal">{{ mcpHttpStatus.running ? t("settings.mcpHttpRunningConfigBadge") : t("settings.mcpHttpLastStatusBadge") }}</Badge>
-                  </div>
-                  <p v-if="mcpHttpHasUnsavedChanges" class="rounded bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">{{ t("settings.mcpHttpRunningDraftDiffersHint") }}</p>
-                  <div v-if="mcpHttpStatus.endpoint" class="space-y-1">
-                    <Label>{{ t("settings.mcpHttpEndpointLabel") }}</Label>
-                    <div class="flex min-w-0 items-center gap-2">
-                      <code class="min-w-0 flex-1 overflow-x-auto rounded border bg-background px-2 py-1.5 text-xs">{{ mcpHttpStatus.endpoint }}</code>
-                      <Button type="button" variant="outline" size="icon" :title="t('common.copy')" @click="copyMcpText('http-endpoint', mcpHttpStatus.endpoint || '')">
-                        <CheckCircle2 v-if="mcpCopied === 'http-endpoint'" class="h-3.5 w-3.5 text-green-500" />
-                        <Copy v-else class="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                  </div>
-                  <div v-if="mcpHttpStatus.accessToken" class="space-y-1">
-                    <div class="flex items-center justify-between gap-3">
-                      <Label>Bearer Token</Label>
-                      <Button type="button" variant="outline" size="sm" :disabled="mcpHttpSaving" @click="rotateMcpHttpToken">{{ t("settings.mcpHttpRotateToken") }}</Button>
-                    </div>
-                    <div class="flex min-w-0 items-center gap-2">
-                      <code class="min-w-0 flex-1 overflow-x-auto rounded border bg-background px-2 py-1.5 text-xs">{{ mcpHttpStatus.accessToken }}</code>
-                      <Button type="button" variant="outline" size="icon" :title="t('common.copy')" @click="copyMcpText('http-token', mcpHttpStatus.accessToken || '')">
-                        <CheckCircle2 v-if="mcpCopied === 'http-token'" class="h-3.5 w-3.5 text-green-500" />
-                        <Copy v-else class="h-3.5 w-3.5" />
-                      </Button>
-                    </div>
-                    <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpTokenHintPrefix") }}<code>Authorization: Bearer</code>{{ t("settings.mcpHttpTokenHintSuffix") }}</p>
-                  </div>
-                  <details v-if="mcpHttpClientConfig" class="rounded border bg-muted/20 p-3 text-xs">
-                    <summary class="cursor-pointer font-medium">{{ t("settings.mcpHttpClientConfigTitle") }}</summary>
-                    <div class="mt-3 space-y-2">
-                      <div class="flex justify-end">
-                        <Button type="button" variant="outline" size="sm" :title="t('common.copy')" @click="copyMcpText('http-config', mcpHttpClientConfig)">
-                          <CheckCircle2 v-if="mcpCopied === 'http-config'" class="mr-1 h-3.5 w-3.5 text-green-500" />
-                          <Copy v-else class="mr-1 h-3.5 w-3.5" />
-                          {{ t("common.copy") }}
-                        </Button>
-                      </div>
-                      <pre class="max-h-48 overflow-auto rounded border bg-background p-2 text-[11px] whitespace-pre-wrap">{{ mcpHttpClientConfig }}</pre>
-                      <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpClientConfigHint") }}</p>
-                    </div>
-                  </details>
-                  <details v-if="mcpHttpStatus.recentLogs.length" class="text-xs">
-                    <summary class="cursor-pointer text-muted-foreground">{{ t("settings.mcpHttpLogsTitle") }}</summary>
-                    <pre class="mt-2 max-h-40 overflow-auto rounded border bg-background p-2 text-[11px] whitespace-pre-wrap">{{ mcpHttpStatus.recentLogs.join("\n") }}</pre>
-                  </details>
-                </section>
-              </div>
-
-              <template v-if="mcpTransportTab === 'stdio'">
-                <div v-if="!isWeb" class="grid gap-3 sm:grid-cols-2">
-                  <div class="rounded-md border p-3">
-                    <div class="text-xs font-medium uppercase text-muted-foreground">
-                      {{ t("settings.mcpCurrent") }}
-                    </div>
-                    <div class="mt-2 font-mono text-sm">
-                      {{ mcpStatus?.current_version ? `v${mcpStatus.current_version}` : t("settings.mcpVersionMissing") }}
-                    </div>
-                  </div>
-                  <div class="rounded-md border p-3">
-                    <div class="text-xs font-medium uppercase text-muted-foreground">
-                      {{ t("settings.mcpLatest") }}
-                    </div>
-                    <div class="mt-2 font-mono text-sm">
-                      {{ mcpStatus?.latest_version ? `v${mcpStatus.latest_version}` : t("settings.mcpVersionUnknown") }}
-                    </div>
-                  </div>
-                  <div class="rounded-md border p-3">
-                    <div class="text-xs font-medium uppercase text-muted-foreground">Node.js</div>
-                    <div class="mt-2 font-mono text-sm">
-                      {{ mcpStatus?.node_version || t("settings.mcpVersionUnknown") }}
-                    </div>
-                  </div>
-                  <div class="rounded-md border p-3">
-                    <div class="text-xs font-medium uppercase text-muted-foreground">npm</div>
-                    <div class="mt-2 font-mono text-sm">
-                      {{ mcpStatus?.npm_available ? t("settings.mcpAvailable") : t("settings.mcpUnavailable") }}
-                    </div>
-                  </div>
-                </div>
-
-                <div v-if="mcpStatus?.bin_path" class="space-y-2">
-                  <Label>{{ t("settings.mcpBinPath") }}</Label>
-                  <div class="rounded-md border bg-muted/20 px-3 py-2 font-mono text-xs text-muted-foreground">
-                    {{ mcpStatus.bin_path }}
-                  </div>
-                </div>
-
-                <div v-if="!isWeb" class="space-y-2">
-                  <Label>{{ mcpStatus?.installed ? t("settings.mcpUpdateCommand") : t("settings.mcpInstallCommand") }}</Label>
-                  <div class="flex min-w-0 items-center gap-2">
-                    <div class="min-w-0 flex-1 overflow-x-auto rounded-md border bg-background px-3 py-2 font-mono text-xs whitespace-nowrap">
-                      {{ mcpCommand }}
-                    </div>
-                    <Button type="button" variant="outline" size="icon" :title="t('common.copy')" @click="copyMcpText('install', mcpCommand)">
-                      <CheckCircle2 v-if="mcpCopied === 'install'" class="h-4 w-4 text-green-500" />
-                      <Copy v-else class="h-4 w-4" />
-                    </Button>
-                    <Button type="button" variant="default" :disabled="mcpInstalling || mcpUninstalling || !mcpStatus?.npm_available || (mcpStatus?.installed && !mcpStatus?.update_available)" @click="installMcp">
-                      <Loader2 v-if="mcpInstalling" class="mr-2 h-4 w-4 animate-spin" />
-                      <CheckCircle2 v-if="!mcpInstalling && mcpStatus?.installed && !mcpStatus?.update_available" class="mr-2 h-4 w-4" />
-                      {{ mcpInstalling ? t("settings.mcpInstalling") : !mcpStatus?.installed ? t("settings.mcpInstallButton") : mcpStatus?.update_available ? t("settings.mcpUpdateButton") : t("settings.mcpUpToDate") }}
-                    </Button>
-                  </div>
-                  <div
-                    v-if="mcpInstallMessage"
-                    :class="['text-xs px-3 py-2 rounded-md border', mcpInstallError ? 'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/30 dark:text-red-300 dark:border-red-800' : 'bg-green-50 text-green-700 border-green-200 dark:bg-green-950/30 dark:text-green-300 dark:border-green-800']"
-                  >
-                    {{ mcpInstallMessage }}
-                  </div>
-                </div>
-
-                <div v-if="!isWeb && mcpStatus?.installed" class="space-y-2">
-                  <Label>{{ t("settings.mcpUninstallCommand") }}</Label>
-                  <div class="flex min-w-0 items-center gap-2">
-                    <div class="min-w-0 flex-1 overflow-x-auto rounded-md border bg-background px-3 py-2 font-mono text-xs whitespace-nowrap">
-                      {{ mcpUninstallCommand }}
-                    </div>
-                    <Button type="button" variant="outline" size="icon" :title="t('common.copy')" @click="copyMcpText('uninstall', mcpUninstallCommand)">
-                      <CheckCircle2 v-if="mcpCopied === 'uninstall'" class="h-4 w-4 text-green-500" />
-                      <Copy v-else class="h-4 w-4" />
-                    </Button>
-                    <Button type="button" variant="outline" class="text-destructive hover:text-destructive" :disabled="mcpInstalling || mcpUninstalling || !mcpStatus.npm_available" @click="uninstallMcp">
-                      <Loader2 v-if="mcpUninstalling" class="mr-2 h-4 w-4 animate-spin" />
-                      <Trash2 v-else class="mr-2 h-4 w-4" />
-                      {{ mcpUninstalling ? t("settings.mcpUninstalling") : t("settings.mcpUninstallButton") }}
-                    </Button>
-                  </div>
-                </div>
-
-                <McpAuthorizationStepper>
-                  <template #connections>
-                    <div class="space-y-3">
-                      <p v-if="mcpPolicyLoadError" class="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-600 dark:text-red-400">
-                        {{
-                          t("settings.mcpPolicyLoadFailed", {
-                            error: mcpPolicyLoadError,
-                          })
-                        }}
-                      </p>
-                      <McpConnectionScopePicker :connections="mcpSelectableConnections" :allowed-connection-ids="mcpAllowedConnectionIds" :disabled="mcpPolicyControlsDisabled" :busy="mcpPolicyLoading || mcpPolicySaving" @update:allowed-connection-ids="onMcpAllowedConnectionIdsChange" />
-                    </div>
-                  </template>
-                  <template #databases>
-                    <McpDatabaseScopePicker
-                      :connections="mcpSelectableConnections"
-                      :allowed-connection-ids="mcpAllowedConnectionIds"
-                      :connection-policies="settingsStore.mcpGlobalPolicy.connectionPolicies"
-                      :global-execution-mode="mcpExecutionMode"
-                      :disabled="mcpPolicyControlsDisabled"
-                      :busy="mcpPolicyLoading || mcpPolicySaving"
-                      @update:connection-policies="onMcpConnectionPoliciesChange"
-                    />
-                  </template>
-                  <template #overrides>
-                    <div v-if="mcpConnectionPolicyConnections.length" class="space-y-2">
-                      <div class="flex flex-wrap items-start justify-between gap-2">
-                        <div>
-                          <p class="text-sm font-medium">{{ t("settings.mcpConnectionPolicyTitle") }}</p>
-                          <p class="text-xs text-muted-foreground">{{ t("settings.mcpConnectionPolicyDescription") }}</p>
-                        </div>
-                        <label class="flex h-8 items-center gap-1.5 rounded-md border bg-background px-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpPerPage") }}
-                          <select v-model.number="mcpConnectionPolicyPageSize" class="bg-transparent text-xs text-foreground outline-none" :disabled="mcpPolicyControlsDisabled">
-                            <option v-for="size in MCP_CONNECTION_POLICY_PAGE_SIZE_OPTIONS" :key="size" :value="size">{{ size }}</option>
-                          </select>
-                        </label>
-                      </div>
-                      <div class="space-y-2">
-                        <div v-for="connection in pagedMcpConnectionPolicyConnections" :key="connection.id" class="flex items-center justify-between gap-3 rounded-md border bg-background px-3 py-2">
-                          <div class="min-w-0">
-                            <p class="truncate text-sm font-medium">{{ connection.name }}</p>
-                            <p class="truncate font-mono text-[11px] text-muted-foreground">{{ connection.db_type }} · {{ connection.host }}</p>
+                    <Tabs v-model="mcpTransportTab" class="space-y-3">
+                      <TabsList variant="line" class="h-8 w-fit justify-start gap-1 border-b border-border/60 bg-transparent p-0">
+                        <TabsTrigger value="stdio" class="flex-none px-3">{{ t("settings.mcpTransportLocalStdio") }}</TabsTrigger>
+                        <TabsTrigger value="http" class="flex-none px-3">{{ t("settings.mcpTransportHttpService") }}</TabsTrigger>
+                      </TabsList>
+                      <TabsContent value="http" class="m-0 space-y-4">
+                        <div v-if="isWeb" class="space-y-4">
+                          <div class="rounded-md border bg-muted/20 p-4 space-y-2">
+                            <div class="flex items-center justify-between gap-3">
+                              <Label class="text-base">{{ t("settings.mcpHttpWebServiceTitle") }}</Label>
+                              <Badge :variant="webMcpHttpStatus?.enabled ? 'default' : 'outline'">{{ webMcpHttpStatus?.enabled ? t("settings.mcpHttpStatusLabelEnabled") : t("settings.mcpHttpStatusLabelDisabled") }}</Badge>
+                            </div>
+                            <p class="text-xs text-muted-foreground">{{ t("settings.mcpHttpWebServiceDescription") }}</p>
+                            <template v-if="webMcpHttpStatus">
+                              <code class="block rounded border bg-background px-2 py-1.5 text-xs">{{ webMcpEndpoint }}</code>
+                              <p class="text-[11px] text-muted-foreground">
+                                {{
+                                  t("settings.mcpHttpWebTokenSourceAndHosts", {
+                                    tokenSource: webMcpHttpStatus.tokenSource || t("settings.mcpHttpNotConfigured"),
+                                    hosts: webMcpHttpStatus.allowedHosts.join(", ") || t("settings.mcpHttpNotConfigured"),
+                                  })
+                                }}
+                              </p>
+                              <p v-if="webMcpHttpStatus.allowedOrigins.length" class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpWebAllowedOrigins", { origins: webMcpHttpStatus.allowedOrigins.join(", ") }) }}</p>
+                            </template>
+                            <Button type="button" variant="outline" size="sm" :disabled="mcpHttpLoading" @click="loadMcpHttpSettings">{{ t("settings.mcpHttpReloadStatus") }}</Button>
                           </div>
-                          <select
-                            :value="mcpConnectionExecutionMode(connection.id)"
-                            :disabled="mcpPolicyControlsDisabled"
-                            class="h-8 shrink-0 rounded-md border bg-background px-2 text-xs"
-                            @change="onMcpConnectionExecutionModeChange(connection.id, ($event.target as HTMLSelectElement).value as McpConnectionExecutionMode | 'inherit')"
-                          >
-                            <option value="inherit">{{ t("settings.mcpConnectionPolicyInherit") }}</option>
-                            <option value="read_only">{{ t("settings.mcpConnectionPolicyReadOnly") }}</option>
-                            <option value="safe_write">{{ t("settings.mcpConnectionPolicySafeWrite") }}</option>
-                            <option value="high_risk_write">{{ t("settings.mcpConnectionPolicyHighRiskWrite") }}</option>
-                          </select>
                         </div>
+
+                        <div v-if="!isWeb" class="space-y-4">
+                          <div class="settings-item rounded-md border bg-muted/20 p-4" :class="{ 'settings-item-disabled': mcpHttpLoading || mcpHttpSaving }">
+                            <div class="flex items-start justify-between gap-4">
+                              <div class="space-y-1">
+                                <div class="flex items-center gap-2">
+                                  <Label class="text-base">{{ t("settings.mcpHttpServiceTitle") }}</Label>
+                                  <Badge :variant="mcpHttpStatus?.running ? 'default' : 'outline'">
+                                    {{ mcpHttpStatus?.running ? t("settings.mcpHttpStatusLabelRunning") : mcpHttpSettings.enabled ? t("settings.mcpHttpStatusLabelPending") : t("settings.mcpHttpStatusLabelDisabled") }}
+                                  </Badge>
+                                </div>
+                                <p class="text-xs leading-relaxed text-muted-foreground">{{ t("settings.mcpHttpServiceDescription") }}</p>
+                              </div>
+                              <Switch id="mcp-http-enabled" v-model="mcpHttpSettings.enabled" :disabled="mcpHttpLoading || mcpHttpSaving" />
+                            </div>
+                          </div>
+
+                          <template v-if="mcpHttpSettings.enabled">
+                            <section class="space-y-3 rounded-md border p-4">
+                              <div>
+                                <h4 class="text-sm font-medium">{{ t("settings.mcpHttpListenerTitle") }}</h4>
+                                <p class="mt-1 text-xs text-muted-foreground">{{ t("settings.mcpHttpListenerHintPrefix") }}<code>127.0.0.1</code>{{ t("settings.mcpHttpListenerHintSuffix") }}</p>
+                              </div>
+                              <div class="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(9rem,0.42fr)]">
+                                <div class="space-y-1.5">
+                                  <Label for="mcp-http-host">{{ t("settings.mcpHttpHostLabel") }}</Label>
+                                  <Input id="mcp-http-host" v-model="mcpHttpSettings.host" :disabled="mcpHttpSaving" placeholder="127.0.0.1" />
+                                </div>
+                                <div class="space-y-1.5">
+                                  <Label for="mcp-http-port">{{ t("settings.mcpHttpPortLabel") }}</Label>
+                                  <Input id="mcp-http-port" v-model.number="mcpHttpSettings.port" :disabled="mcpHttpSaving" type="number" min="1" max="65535" />
+                                </div>
+                                <div class="space-y-1.5 sm:col-span-2">
+                                  <Label for="mcp-http-path">{{ t("settings.mcpHttpPathLabel") }}</Label>
+                                  <Input id="mcp-http-path" v-model="mcpHttpSettings.path" :disabled="mcpHttpSaving" placeholder="/mcp" />
+                                </div>
+                              </div>
+                            </section>
+
+                            <section class="space-y-3 rounded-md border p-4">
+                              <div class="flex items-start justify-between gap-4">
+                                <div>
+                                  <h4 class="text-sm font-medium">{{ t("settings.mcpHttpRemoteTitle") }}</h4>
+                                  <p class="mt-1 text-xs leading-relaxed text-muted-foreground">{{ t("settings.mcpHttpRemoteHintPrefix") }}<code>127.0.0.1</code>{{ t("settings.mcpHttpRemoteHintMiddle") }}<code>::1</code>{{ t("settings.mcpHttpRemoteHintSuffix") }}</p>
+                                </div>
+                                <Switch id="mcp-http-remote" v-model="mcpHttpSettings.allowRemote" :disabled="mcpHttpSaving" />
+                              </div>
+                              <div v-if="mcpHttpSettings.allowRemote" class="grid gap-3 sm:grid-cols-2">
+                                <div class="space-y-1.5">
+                                  <Label for="mcp-http-hosts">{{ t("settings.mcpHttpAllowedHostsLabel") }}</Label>
+                                  <textarea id="mcp-http-hosts" v-model="mcpHttpAllowedHostsText" :disabled="mcpHttpSaving" class="min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs" placeholder="mcp.example.com&#10;10.0.0.10" />
+                                  <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpHostsHint") }}</p>
+                                </div>
+                                <div class="space-y-1.5">
+                                  <Label for="mcp-http-origins">{{ t("settings.mcpHttpAllowedOriginsLabel") }}</Label>
+                                  <textarea id="mcp-http-origins" v-model="mcpHttpAllowedOriginsText" :disabled="mcpHttpSaving" class="min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-xs" placeholder="https://mcp.example.com" />
+                                  <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpOriginsHintPrefix") }}<code>https://</code>{{ t("settings.mcpHttpOriginsHintSuffix") }}</p>
+                                </div>
+                              </div>
+                              <p v-else class="rounded bg-muted px-3 py-2 text-xs text-muted-foreground">{{ t("settings.mcpHttpRemoteDisabledHint") }}</p>
+                            </section>
+
+                            <div v-if="mcpHttpDraftValidationError" class="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                              {{ mcpHttpDraftValidationError }}
+                            </div>
+                            <div v-if="mcpHttpError" class="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                              {{ mcpHttpError }}
+                            </div>
+
+                            <div class="flex flex-col gap-3 rounded-md border bg-muted/20 p-3 sm:flex-row sm:items-center sm:justify-between">
+                              <p class="text-xs text-muted-foreground">
+                                {{ mcpHttpHasUnsavedChanges ? t("settings.mcpHttpUnsavedChangesHint") : t("settings.mcpHttpSaveHint") }}
+                              </p>
+                              <div class="flex shrink-0 justify-end gap-2">
+                                <Button type="button" variant="outline" :disabled="mcpHttpLoading || mcpHttpSaving" @click="loadMcpHttpSettings">{{ t("settings.mcpHttpReload") }}</Button>
+                                <Button type="button" :disabled="mcpHttpLoading || mcpHttpSaving || Boolean(mcpHttpDraftValidationError)" @click="saveMcpHttpSettings">
+                                  <Loader2 v-if="mcpHttpSaving" class="mr-2 h-4 w-4 animate-spin" />
+                                  {{ t("settings.mcpHttpSaveAndStart") }}
+                                </Button>
+                              </div>
+                            </div>
+                          </template>
+
+                          <div v-else class="flex flex-col gap-3 rounded-md border border-dashed px-4 py-3 text-xs text-muted-foreground sm:flex-row sm:items-center sm:justify-between">
+                            <p>{{ t("settings.mcpHttpDisabledHint") }}</p>
+                            <div class="flex shrink-0 justify-end gap-2">
+                              <Button type="button" variant="outline" :disabled="mcpHttpLoading || mcpHttpSaving" @click="loadMcpHttpSettings">{{ t("settings.mcpHttpReload") }}</Button>
+                              <Button type="button" :disabled="mcpHttpLoading || mcpHttpSaving" @click="saveMcpHttpSettings">
+                                <Loader2 v-if="mcpHttpSaving" class="mr-2 h-4 w-4 animate-spin" />
+                                {{ t("settings.mcpHttpSaveAndStop") }}
+                              </Button>
+                            </div>
+                          </div>
+
+                          <div v-if="mcpHttpStatus?.lastError" class="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                            {{ mcpHttpStatus.lastError }}
+                          </div>
+
+                          <section v-if="mcpHttpStatus?.enabled" class="space-y-3 rounded-md border p-4">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                              <div class="flex items-center gap-2 text-sm font-medium">
+                                <span class="h-2 w-2 rounded-full" :class="mcpHttpStatus.running ? 'bg-green-500' : 'bg-amber-500'" />
+                                {{ mcpHttpStatus.running ? t("settings.mcpHttpConnectionInfoTitle") : t("settings.mcpHttpServiceNotRunning") }}
+                              </div>
+                              <Badge variant="outline" class="font-normal">{{ mcpHttpStatus.running ? t("settings.mcpHttpRunningConfigBadge") : t("settings.mcpHttpLastStatusBadge") }}</Badge>
+                            </div>
+                            <p v-if="mcpHttpHasUnsavedChanges" class="rounded bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-200">{{ t("settings.mcpHttpRunningDraftDiffersHint") }}</p>
+                            <div v-if="mcpHttpStatus.endpoint" class="space-y-1">
+                              <Label>{{ t("settings.mcpHttpEndpointLabel") }}</Label>
+                              <div class="flex min-w-0 items-center gap-2">
+                                <code class="min-w-0 flex-1 overflow-x-auto rounded border bg-background px-2 py-1.5 text-xs">{{ mcpHttpStatus.endpoint }}</code>
+                                <Button type="button" variant="outline" size="icon" :title="t('common.copy')" @click="copyMcpText('http-endpoint', mcpHttpStatus.endpoint || '')">
+                                  <CheckCircle2 v-if="mcpCopied === 'http-endpoint'" class="h-3.5 w-3.5 text-green-500" />
+                                  <Copy v-else class="h-3.5 w-3.5" />
+                                </Button>
+                              </div>
+                            </div>
+                            <div v-if="mcpHttpStatus.accessToken" class="space-y-1">
+                              <div class="flex items-center justify-between gap-3">
+                                <Label>Bearer Token</Label>
+                                <Button type="button" variant="outline" size="sm" :disabled="mcpHttpSaving" @click="rotateMcpHttpToken">{{ t("settings.mcpHttpRotateToken") }}</Button>
+                              </div>
+                              <div class="flex min-w-0 items-center gap-2">
+                                <code class="min-w-0 flex-1 overflow-x-auto rounded border bg-background px-2 py-1.5 text-xs">{{ mcpHttpStatus.accessToken }}</code>
+                                <Button type="button" variant="outline" size="icon" :title="t('common.copy')" @click="copyMcpText('http-token', mcpHttpStatus.accessToken || '')">
+                                  <CheckCircle2 v-if="mcpCopied === 'http-token'" class="h-3.5 w-3.5 text-green-500" />
+                                  <Copy v-else class="h-3.5 w-3.5" />
+                                </Button>
+                              </div>
+                              <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpTokenHintPrefix") }}<code>Authorization: Bearer</code>{{ t("settings.mcpHttpTokenHintSuffix") }}</p>
+                            </div>
+                            <details v-if="mcpHttpClientConfig" class="rounded border bg-muted/20 p-3 text-xs">
+                              <summary class="cursor-pointer font-medium">{{ t("settings.mcpHttpClientConfigTitle") }}</summary>
+                              <div class="mt-3 space-y-2">
+                                <div class="flex justify-end">
+                                  <Button type="button" variant="outline" size="sm" :title="t('common.copy')" @click="copyMcpText('http-config', mcpHttpClientConfig)">
+                                    <CheckCircle2 v-if="mcpCopied === 'http-config'" class="mr-1 h-3.5 w-3.5 text-green-500" />
+                                    <Copy v-else class="mr-1 h-3.5 w-3.5" />
+                                    {{ t("common.copy") }}
+                                  </Button>
+                                </div>
+                                <pre class="max-h-48 overflow-auto rounded border bg-background p-2 text-[11px] whitespace-pre-wrap">{{ mcpHttpClientConfig }}</pre>
+                                <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpHttpClientConfigHint") }}</p>
+                              </div>
+                            </details>
+                            <details v-if="mcpHttpStatus.recentLogs.length" class="text-xs">
+                              <summary class="cursor-pointer text-muted-foreground">{{ t("settings.mcpHttpLogsTitle") }}</summary>
+                              <pre class="mt-2 max-h-40 overflow-auto rounded border bg-background p-2 text-[11px] whitespace-pre-wrap">{{ mcpHttpStatus.recentLogs.join("\n") }}</pre>
+                            </details>
+                          </section>
+                        </div>
+                      </TabsContent>
+
+                      <TabsContent value="stdio" class="m-0 space-y-4">
+                        <div v-if="!isWeb" class="grid gap-3 sm:grid-cols-2">
+                          <div class="rounded-md border p-3">
+                            <div class="text-xs font-medium uppercase text-muted-foreground">
+                              {{ t("settings.mcpCurrent") }}
+                            </div>
+                            <div class="mt-2 font-mono text-sm">
+                              {{ mcpStatus?.current_version ? `v${mcpStatus.current_version}` : t("settings.mcpVersionMissing") }}
+                            </div>
+                          </div>
+                          <div class="rounded-md border p-3">
+                            <div class="text-xs font-medium uppercase text-muted-foreground">
+                              {{ t("settings.mcpLatest") }}
+                            </div>
+                            <div class="mt-2 font-mono text-sm">
+                              {{ mcpStatus?.latest_version ? `v${mcpStatus.latest_version}` : t("settings.mcpVersionUnknown") }}
+                            </div>
+                          </div>
+                          <div class="rounded-md border p-3">
+                            <div class="text-xs font-medium uppercase text-muted-foreground">Node.js</div>
+                            <div class="mt-2 font-mono text-sm">
+                              {{ mcpStatus?.node_version || t("settings.mcpVersionUnknown") }}
+                            </div>
+                          </div>
+                          <div class="rounded-md border p-3">
+                            <div class="text-xs font-medium uppercase text-muted-foreground">npm</div>
+                            <div class="mt-2 font-mono text-sm">
+                              {{ mcpStatus?.npm_available ? t("settings.mcpAvailable") : t("settings.mcpUnavailable") }}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div v-if="mcpStatus?.bin_path" class="space-y-2">
+                          <Label>{{ t("settings.mcpBinPath") }}</Label>
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 font-mono text-xs text-muted-foreground">
+                            {{ mcpStatus.bin_path }}
+                          </div>
+                        </div>
+
+                        <div v-if="!isWeb" class="space-y-2">
+                          <Label>{{ mcpStatus?.installed ? t("settings.mcpUpdateCommand") : t("settings.mcpInstallCommand") }}</Label>
+                          <div class="flex min-w-0 items-center gap-2">
+                            <div class="min-w-0 flex-1 overflow-x-auto rounded-md border bg-background px-3 py-2 font-mono text-xs whitespace-nowrap">
+                              {{ mcpCommand }}
+                            </div>
+                            <Button type="button" variant="outline" size="icon" :title="t('common.copy')" @click="copyMcpText('install', mcpCommand)">
+                              <CheckCircle2 v-if="mcpCopied === 'install'" class="h-4 w-4 text-green-500" />
+                              <Copy v-else class="h-4 w-4" />
+                            </Button>
+                            <Button type="button" variant="default" :disabled="mcpInstalling || mcpUninstalling || !mcpStatus?.npm_available || (mcpStatus?.installed && !mcpStatus?.update_available)" @click="installMcp">
+                              <Loader2 v-if="mcpInstalling" class="mr-2 h-4 w-4 animate-spin" />
+                              <CheckCircle2 v-if="!mcpInstalling && mcpStatus?.installed && !mcpStatus?.update_available" class="mr-2 h-4 w-4" />
+                              {{ mcpInstalling ? t("settings.mcpInstalling") : !mcpStatus?.installed ? t("settings.mcpInstallButton") : mcpStatus?.update_available ? t("settings.mcpUpdateButton") : t("settings.mcpUpToDate") }}
+                            </Button>
+                          </div>
+                          <div
+                            v-if="mcpInstallMessage"
+                            :class="[
+                              'text-xs px-3 py-2 rounded-md border',
+                              mcpInstallError ? 'bg-red-50 text-red-700 border-red-200 dark:bg-red-950/30 dark:text-red-300 dark:border-red-800' : 'bg-green-50 text-green-700 border-green-200 dark:bg-green-950/30 dark:text-green-300 dark:border-green-800',
+                            ]"
+                          >
+                            {{ mcpInstallMessage }}
+                          </div>
+                        </div>
+
+                        <div v-if="!isWeb && mcpStatus?.installed" class="space-y-2">
+                          <Label>{{ t("settings.mcpUninstallCommand") }}</Label>
+                          <div class="flex min-w-0 items-center gap-2">
+                            <div class="min-w-0 flex-1 overflow-x-auto rounded-md border bg-background px-3 py-2 font-mono text-xs whitespace-nowrap">
+                              {{ mcpUninstallCommand }}
+                            </div>
+                            <Button type="button" variant="outline" size="icon" :title="t('common.copy')" @click="copyMcpText('uninstall', mcpUninstallCommand)">
+                              <CheckCircle2 v-if="mcpCopied === 'uninstall'" class="h-4 w-4 text-green-500" />
+                              <Copy v-else class="h-4 w-4" />
+                            </Button>
+                            <Button type="button" variant="outline" class="text-destructive hover:text-destructive" :disabled="mcpInstalling || mcpUninstalling || !mcpStatus.npm_available" @click="uninstallMcp">
+                              <Loader2 v-if="mcpUninstalling" class="mr-2 h-4 w-4 animate-spin" />
+                              <Trash2 v-else class="mr-2 h-4 w-4" />
+                              {{ mcpUninstalling ? t("settings.mcpUninstalling") : t("settings.mcpUninstallButton") }}
+                            </Button>
+                          </div>
+                        </div>
+                      </TabsContent>
+                    </Tabs>
+                  </div>
+                </TabsContent>
+
+                <TabsContent value="permissions" class="m-0 space-y-4">
+                  <McpAuthorizationStepper>
+                    <template #connections>
+                      <div class="space-y-3">
+                        <p v-if="mcpPolicyLoadError" class="rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+                          {{
+                            t("settings.mcpPolicyLoadFailed", {
+                              error: mcpPolicyLoadError,
+                            })
+                          }}
+                        </p>
+                        <McpResourceScopePicker
+                          :layout="connectionStore.sidebarLayout"
+                          :connections="mcpSelectableConnections"
+                          :allowed-group-ids="mcpAllowedGroupIds"
+                          :allowed-connection-ids="mcpAllowedConnectionIds"
+                          :group-policies="settingsStore.mcpGlobalPolicy.groupPolicies"
+                          :connection-policies="settingsStore.mcpGlobalPolicy.connectionPolicies"
+                          :disabled="mcpPolicyControlsDisabled"
+                          :busy="mcpPolicyLoading || mcpPolicySaving"
+                          @update:scope="onMcpResourceScopeChange"
+                          @set:group-policy="onMcpGroupExecutionModeChange"
+                          @set:connection-policy="onMcpConnectionExecutionModeChange"
+                        />
                       </div>
-                      <div v-if="mcpConnectionPolicyPageCount > 1" class="flex items-center justify-center gap-2 border-t pt-2 text-xs text-muted-foreground">
-                        <Button type="button" size="icon-sm" variant="ghost" :disabled="mcpConnectionPolicyPage === 1" :title="t('settings.mcpPreviousPage')" :aria-label="t('settings.mcpPreviousPage')" @click="setMcpConnectionPolicyPage(mcpConnectionPolicyPage - 1)"><ChevronLeft /></Button>
-                        <span class="min-w-12 text-center tabular-nums">{{ mcpConnectionPolicyPage }} / {{ mcpConnectionPolicyPageCount }}</span>
-                        <Button type="button" size="icon-sm" variant="ghost" :disabled="mcpConnectionPolicyPage === mcpConnectionPolicyPageCount" :title="t('settings.mcpNextPage')" :aria-label="t('settings.mcpNextPage')" @click="setMcpConnectionPolicyPage(mcpConnectionPolicyPage + 1)"
-                          ><ChevronRight
-                        /></Button>
-                      </div>
-                    </div>
-                    <div v-else class="rounded-md border border-dashed px-3 py-8 text-center text-xs text-muted-foreground">{{ t("settings.mcpConnectionPolicyEmptyHint") }}</div>
-                  </template>
-                  <template #capabilities>
-                    <div class="space-y-4">
-                      <section class="space-y-2 rounded-md border bg-background p-3">
-                        <div>
-                          <p class="text-sm font-medium">{{ t("settings.mcpPermissionPreviewTitle") }}</p>
-                          <p class="text-xs text-muted-foreground">{{ t("settings.mcpPermissionPreviewDescription") }}</p>
-                        </div>
-                        <template v-if="mcpPermissionPreviewRows.length">
-                          <div class="relative">
-                            <Search class="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-                            <Input v-model="mcpPermissionPreviewSearchQuery" autocomplete="off" :placeholder="t('settings.mcpPermissionPreviewSearchPlaceholder')" class="h-8 pl-9 text-xs" />
+                    </template>
+                    <template #databases>
+                      <McpDatabaseScopePicker
+                        :connections="mcpSelectableConnections"
+                        :allowed-connection-ids="mcpEffectiveAllowedConnectionIds"
+                        :connection-policies="settingsStore.mcpGlobalPolicy.connectionPolicies"
+                        :disabled="mcpPolicyControlsDisabled"
+                        :busy="mcpPolicyLoading || mcpPolicySaving"
+                        @update:connection-policies="onMcpConnectionPoliciesChange"
+                        @set:database-policy="onMcpDatabaseExecutionModeChange"
+                      />
+                    </template>
+                    <template #overrides>
+                      <div class="space-y-4">
+                        <section class="space-y-3">
+                          <div class="space-y-1">
+                            <Label id="mcp-execution-mode-label">{{ t("settings.mcpExecutionMode") }}</Label>
+                            <p class="text-xs text-muted-foreground">{{ t("settings.mcpExecutionModeDescription") }}</p>
                           </div>
-                          <div class="max-h-72 overflow-auto overscroll-contain rounded border">
-                            <table class="w-full min-w-[42rem] border-separate border-spacing-0 text-xs">
-                              <thead class="text-muted-foreground">
-                                <tr>
-                                  <th scope="col" class="sticky top-0 z-10 bg-muted px-3 py-2 text-left font-medium shadow-[0_1px_0_hsl(var(--border))]">{{ t("settings.mcpPermissionPreviewConnection") }}</th>
-                                  <th scope="col" class="sticky top-0 z-10 bg-muted px-3 py-2 text-left font-medium shadow-[0_1px_0_hsl(var(--border))]">{{ t("settings.mcpPermissionPreviewDatabase") }}</th>
-                                  <th scope="col" class="sticky top-0 z-10 bg-muted px-3 py-2 text-left font-medium shadow-[0_1px_0_hsl(var(--border))]">{{ t("settings.mcpPermissionPreviewConnectionDefault") }}</th>
-                                  <th scope="col" class="sticky top-0 z-10 bg-muted px-3 py-2 text-left font-medium shadow-[0_1px_0_hsl(var(--border))]">{{ t("settings.mcpPermissionPreviewDatabaseOverride") }}</th>
-                                  <th scope="col" class="sticky top-0 z-10 bg-muted px-3 py-2 text-left font-medium shadow-[0_1px_0_hsl(var(--border))]">{{ t("settings.mcpPermissionPreviewEffective") }}</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                <tr v-for="row in filteredMcpPermissionPreviewRows" :key="`${row.connection}:${row.database}`" class="border-t">
-                                  <td class="px-3 py-2 font-medium">{{ row.connection }}</td>
-                                  <td class="px-3 py-2 font-mono">{{ row.database }}</td>
-                                  <td class="px-3 py-2">{{ row.connectionMode === "inherit" ? t("settings.mcpConnectionPolicyInherit") : mcpExecutionModeLabel(row.connectionMode) }}</td>
-                                  <td class="px-3 py-2">{{ row.databaseMode === "inherit" ? t("settings.mcpDatabasePolicyInherit") : mcpExecutionModeLabel(row.databaseMode) }}</td>
-                                  <td class="px-3 py-2 font-medium">{{ mcpExecutionModeLabel(row.effectiveMode) }}</td>
-                                </tr>
-                                <tr v-if="filteredMcpPermissionPreviewRows.length === 0">
-                                  <td colspan="5" class="px-3 py-8 text-center text-muted-foreground">{{ t("settings.mcpPermissionPreviewSearchNoResults") }}</td>
-                                </tr>
-                              </tbody>
-                            </table>
+                          <div class="grid grid-cols-1 gap-2 sm:grid-cols-3" role="radiogroup" aria-labelledby="mcp-execution-mode-label">
+                            <Button
+                              v-for="mode in mcpExecutionModeOptions"
+                              :key="mode"
+                              :disabled="mcpPolicyControlsDisabled"
+                              type="button"
+                              role="radio"
+                              :data-mcp-execution-mode="mode"
+                              :aria-checked="mcpExecutionMode === mode"
+                              :tabindex="mcpExecutionMode === mode ? 0 : -1"
+                              variant="outline"
+                              class="settings-choice-card h-10 justify-center"
+                              :class="mcpExecutionMode === mode ? 'dbx-choice-selected' : ''"
+                              @click="onMcpExecutionModeChange(mode)"
+                              @keydown="onMcpExecutionModeKeydown($event, mode)"
+                            >
+                              {{ mcpExecutionModeLabel(mode) }}
+                            </Button>
                           </div>
-                        </template>
-                        <p v-else class="text-xs text-muted-foreground">{{ t("settings.mcpPermissionPreviewEmpty") }}</p>
-                      </section>
-                      <section class="space-y-2">
-                        <div>
-                          <p class="text-sm font-medium">{{ t("settings.mcpToolPermissionsTitle") }}</p>
-                          <p class="text-xs text-muted-foreground">{{ t("settings.mcpToolPermissionsDescription") }}</p>
-                        </div>
-                        <div class="grid gap-2 sm:grid-cols-2">
-                          <label v-for="tool in mcpToolOptions" :key="tool.name" class="flex items-center gap-2 rounded border bg-background px-2.5 py-2 text-xs">
-                            <input type="checkbox" :checked="mcpToolAllowed(tool.name)" :disabled="mcpPolicyControlsDisabled" @change="onMcpToolAllowedChange(tool.name, ($event.target as HTMLInputElement).checked)" />
-                            <span>{{ t(tool.labelKey) }}</span>
-                          </label>
-                        </div>
-                      </section>
-                      <section class="space-y-3 border-t pt-4">
-                        <div class="space-y-1">
-                          <Label id="mcp-execution-mode-label">{{ t("settings.mcpExecutionMode") }}</Label>
-                          <p class="text-xs text-muted-foreground">
-                            {{ t("settings.mcpExecutionModeDescription") }}
-                          </p>
-                        </div>
-                        <div class="grid grid-cols-1 p-1 sm:grid-cols-3 gap-2.5" role="radiogroup" aria-labelledby="mcp-execution-mode-label">
-                          <Button
-                            :disabled="mcpPolicyControlsDisabled"
-                            type="button"
-                            role="radio"
-                            data-mcp-execution-mode="read_only"
-                            :aria-checked="mcpExecutionMode === 'read_only'"
-                            :tabindex="mcpExecutionMode === 'read_only' ? 0 : -1"
-                            variant="outline"
-                            class="settings-choice-card h-auto justify-center border p-3"
-                            :class="mcpExecutionMode === 'read_only' ? 'dbx-choice-selected' : ''"
-                            @click="onMcpExecutionModeChange('read_only')"
-                            @keydown="onMcpExecutionModeKeydown($event, 'read_only')"
-                          >
-                            <span>{{ t("settings.mcpExecutionModeReadOnly") }}</span>
-                          </Button>
-                          <Button
-                            :disabled="mcpPolicyControlsDisabled"
-                            type="button"
-                            role="radio"
-                            data-mcp-execution-mode="safe_write"
-                            :aria-checked="mcpExecutionMode === 'safe_write'"
-                            :tabindex="mcpExecutionMode === 'safe_write' ? 0 : -1"
-                            variant="outline"
-                            class="settings-choice-card h-auto justify-center border p-3"
-                            :class="mcpExecutionMode === 'safe_write' ? 'dbx-choice-selected' : ''"
-                            @click="onMcpExecutionModeChange('safe_write')"
-                            @keydown="onMcpExecutionModeKeydown($event, 'safe_write')"
-                          >
-                            <span>{{ t("settings.mcpExecutionModeSafeWrite") }}</span>
-                            <span class="text-[10px] font-normal text-green-600 dark:text-green-400">{{ t("settings.mcpExecutionModeRecommended") }}</span>
-                          </Button>
-                          <Button
-                            :disabled="mcpPolicyControlsDisabled"
-                            type="button"
-                            role="radio"
-                            data-mcp-execution-mode="high_risk_write"
-                            :aria-checked="mcpExecutionMode === 'high_risk_write'"
-                            :tabindex="mcpExecutionMode === 'high_risk_write' ? 0 : -1"
-                            variant="outline"
-                            class="settings-choice-card h-auto justify-center border p-3"
-                            :class="mcpExecutionMode === 'high_risk_write' ? 'dbx-choice-selected' : ''"
-                            @click="onMcpExecutionModeChange('high_risk_write')"
-                            @keydown="onMcpExecutionModeKeydown($event, 'high_risk_write')"
-                          >
-                            <span>{{ t("settings.mcpExecutionModeHighRiskWrite") }}</span>
-                          </Button>
-                        </div>
-                        <!-- Keep every translation in one grid cell so mode changes cannot reflow the capability matrix. -->
-                        <div data-mcp-execution-mode-description class="grid text-xs">
-                          <p class="col-start-1 row-start-1 text-muted-foreground" :class="mcpExecutionMode === 'read_only' ? 'visible' : 'invisible'">
-                            {{ t("settings.mcpExecutionModeReadOnlyDescription") }}
-                          </p>
-                          <p class="col-start-1 row-start-1 text-muted-foreground" :class="mcpExecutionMode === 'safe_write' ? 'visible' : 'invisible'">
-                            {{ t("settings.mcpExecutionModeSafeWriteDescription") }}
-                          </p>
-                          <p class="col-start-1 row-start-1 flex items-start gap-1.5 text-amber-600 dark:text-amber-400" :class="mcpExecutionMode === 'high_risk_write' ? 'visible' : 'invisible'">
-                            <AlertTriangle class="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                            <span>{{ t("settings.mcpExecutionModeHighRiskWriteDescription") }}</span>
-                          </p>
-                        </div>
-                        <div class="space-y-1.5">
-                          <div class="space-y-0.5">
-                            <Label id="mcp-query-timeout-label">{{ t("settings.mcpQueryTimeout") }}</Label>
-                            <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpQueryTimeoutDescription") }}</p>
-                          </div>
-                          <Input id="mcp-query-timeout" v-model="mcpQueryTimeoutInput" type="number" min="0" step="1" inputmode="numeric" placeholder="0" :disabled="mcpPolicyControlsDisabled" @change="onMcpQueryTimeoutInput" />
-                        </div>
-                        <details class="rounded-md border bg-background">
-                          <summary class="cursor-pointer px-3 py-2.5 text-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">
-                            <p class="text-xs font-medium">
-                              {{ t("settings.mcpCapabilityTitle") }}
-                            </p>
-                            <p class="text-[11px] text-muted-foreground">
-                              {{ t("settings.mcpCapabilityDescription") }}
-                            </p>
-                          </summary>
-                          <div class="space-y-1.5 border-t p-3">
-                            <div class="overflow-x-auto rounded-md border bg-background">
-                              <table class="w-full min-w-[36rem] table-fixed text-xs">
+                          <p class="text-[11px] text-muted-foreground">{{ t("settings.mcpPermissionGlobalDefaultHint") }}</p>
+                          <div class="space-y-2 border-t border-border/60 pt-3">
+                            <div>
+                              <p class="text-xs font-medium">{{ t("settings.mcpCapabilityTitle") }}</p>
+                              <p class="mt-1 text-[11px] text-muted-foreground">{{ t("settings.mcpCapabilityDescription") }}</p>
+                            </div>
+                            <div class="overflow-x-auto rounded border bg-background">
+                              <table class="w-full min-w-[34rem] table-fixed text-xs">
                                 <thead class="bg-muted/50 text-muted-foreground">
                                   <tr>
-                                    <th scope="col" class="w-[46%] px-3 py-2 text-left font-medium">
-                                      {{ t("settings.mcpCapabilityOperation") }}
-                                    </th>
-                                    <th v-for="column in MCP_EXECUTION_MODE_COLUMNS" :key="column.mode" scope="col" class="px-2 py-2 text-center font-medium">
-                                      {{ t(column.labelKey) }}
-                                    </th>
+                                    <th scope="col" class="w-[46%] px-3 py-2 text-left font-medium">{{ t("settings.mcpCapabilityOperation") }}</th>
+                                    <th v-for="column in MCP_EXECUTION_MODE_COLUMNS" :key="column.mode" scope="col" class="px-2 py-2 text-center font-medium">{{ t(column.labelKey) }}</th>
                                   </tr>
                                 </thead>
                                 <tbody class="divide-y">
                                   <tr v-for="row in MCP_CAPABILITY_ROWS" :key="row.labelKey">
-                                    <th scope="row" class="px-3 py-2 text-left font-normal leading-relaxed">
-                                      {{ t(row.labelKey) }}
-                                    </th>
+                                    <th scope="row" class="px-3 py-2 text-left font-normal leading-relaxed">{{ t(row.labelKey) }}</th>
                                     <td v-for="column in MCP_EXECUTION_MODE_COLUMNS" :key="column.mode" class="px-2 py-2 text-center">
                                       <span class="inline-flex items-center justify-center" :class="row[column.mode] ? 'text-green-600 dark:text-green-400' : 'text-muted-foreground/60'">
                                         <Check v-if="row[column.mode]" class="h-4 w-4" aria-hidden="true" />
@@ -8284,220 +8941,309 @@ onUnmounted(() => {
                                 </tbody>
                               </table>
                             </div>
-                            <p class="text-[11px] leading-relaxed text-muted-foreground">
-                              {{ t("settings.mcpCapabilityAlwaysEnforced") }}
-                            </p>
+                            <p class="text-[11px] leading-relaxed text-muted-foreground">{{ t("settings.mcpCapabilityAlwaysEnforced") }}</p>
                           </div>
-                        </details>
-                      </section>
+                        </section>
+                      </div>
+                    </template>
+                    <template #capabilities>
+                      <div class="space-y-4">
+                        <section class="space-y-2 rounded-md border bg-background p-3">
+                          <div>
+                            <p class="text-sm font-medium">{{ t("settings.mcpPermissionPreviewTitle") }}</p>
+                            <p class="text-xs text-muted-foreground">{{ t("settings.mcpPermissionPreviewDescription") }}</p>
+                          </div>
+                          <template v-if="mcpPermissionPreviewRows.length">
+                            <div class="relative">
+                              <Search class="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+                              <Input v-model="mcpPermissionPreviewSearchQuery" autocomplete="off" :placeholder="t('settings.mcpPermissionPreviewSearchPlaceholder')" class="h-8 pl-9 text-xs" />
+                            </div>
+                            <div class="max-h-72 overflow-auto overscroll-contain rounded border">
+                              <table class="w-full min-w-[30rem] border-separate border-spacing-0 text-xs">
+                                <thead class="text-muted-foreground">
+                                  <tr>
+                                    <th scope="col" class="sticky top-0 z-10 bg-muted px-3 py-2 text-left font-medium shadow-[0_1px_0_hsl(var(--border))]">{{ t("settings.mcpPermissionPreviewResource") }}</th>
+                                    <th scope="col" class="sticky top-0 z-10 bg-muted px-3 py-2 text-left font-medium shadow-[0_1px_0_hsl(var(--border))]">{{ t("settings.mcpPermissionPreviewEffective") }}</th>
+                                    <th scope="col" class="sticky top-0 z-10 bg-muted px-3 py-2 text-left font-medium shadow-[0_1px_0_hsl(var(--border))]">{{ t("settings.mcpPermissionPreviewSource") }}</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  <tr v-for="row in filteredMcpPermissionPreviewRows" :key="`${row.connectionId}:${row.database}`" class="border-t">
+                                    <td class="px-3 py-2">
+                                      <span class="font-medium">{{ row.connection }}</span
+                                      ><span class="text-muted-foreground"> / </span><span class="font-mono">{{ row.database }}</span>
+                                    </td>
+                                    <td class="px-3 py-2 font-medium">{{ mcpExecutionModeLabel(row.effectiveMode) }}</td>
+                                    <td class="px-3 py-2 text-muted-foreground">{{ mcpPermissionSource(row) }}</td>
+                                  </tr>
+                                  <tr v-if="filteredMcpPermissionPreviewRows.length === 0">
+                                    <td colspan="3" class="px-3 py-8 text-center text-muted-foreground">{{ t("settings.mcpPermissionPreviewSearchNoResults") }}</td>
+                                  </tr>
+                                </tbody>
+                              </table>
+                            </div>
+                          </template>
+                          <p v-else class="text-xs text-muted-foreground">{{ t("settings.mcpPermissionPreviewEmpty") }}</p>
+                        </section>
+                        <section class="space-y-2">
+                          <div>
+                            <p class="text-sm font-medium">{{ t("settings.mcpToolPermissionsTitle") }}</p>
+                            <p class="text-xs text-muted-foreground">{{ t("settings.mcpToolPermissionsDescription") }}</p>
+                          </div>
+                          <div class="grid gap-2 sm:grid-cols-2">
+                            <label v-for="tool in mcpToolOptions" :key="tool.name" class="flex items-center gap-2 rounded border bg-background px-2.5 py-2 text-xs">
+                              <input type="checkbox" :checked="mcpToolAllowed(tool.name)" :disabled="mcpPolicyControlsDisabled" @change="onMcpToolAllowedChange(tool.name, ($event.target as HTMLInputElement).checked)" />
+                              <span>{{ t(tool.labelKey) }}</span>
+                            </label>
+                          </div>
+                        </section>
+                      </div>
+                    </template>
+                  </McpAuthorizationStepper>
+                </TabsContent>
+                <div v-if="mcpManagementTab === 'access'" class="space-y-5 border-t border-border/60 pt-5 sm:ml-1">
+                  <div class="space-y-3">
+                    <div>
+                      <p class="text-sm font-semibold text-foreground">{{ t("settings.mcpRuntimeSettings") }}</p>
+                      <p class="mt-1 text-xs text-muted-foreground">{{ t("settings.mcpQueryTimeoutDescription") }}</p>
                     </div>
-                  </template>
-                </McpAuthorizationStepper>
-
-                <div class="space-y-2">
-                  <Label>{{ t("settings.mcpConfig") }}</Label>
-                  <Tabs v-model="mcpConfigTab" class="space-y-3">
-                    <TabsList class="settings-mcp-config-tabs h-auto min-h-8 w-full min-w-0 max-w-full justify-start gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain group-data-horizontal/tabs:h-auto">
-                      <TabsTrigger value="claude" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Claude Code</TabsTrigger>
-                      <TabsTrigger value="cursor" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Cursor</TabsTrigger>
-                      <TabsTrigger value="codebuddy" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">CodeBuddy Code</TabsTrigger>
-                      <TabsTrigger value="zcode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">ZCode</TabsTrigger>
-                      <TabsTrigger value="trae" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">TRAE</TabsTrigger>
-                      <TabsTrigger value="vscode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">VS Code</TabsTrigger>
-                      <TabsTrigger value="windsurf" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Windsurf</TabsTrigger>
-                      <TabsTrigger value="codex" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Codex</TabsTrigger>
-                      <TabsTrigger value="deepseek-harness" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">DeepSeek Harness</TabsTrigger>
-                      <TabsTrigger value="opencode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">OpenCode</TabsTrigger>
-                      <TabsTrigger value="pi" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Pi</TabsTrigger>
-                      <TabsTrigger value="cherry-studio" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Cherry Studio</TabsTrigger>
-                    </TabsList>
-
-                    <TabsContent value="claude" class="m-0">
-                      <div class="relative rounded-md border bg-background p-3">
-                        <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
-                        <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('claude-config', mcpJsonRecommendedConfig)">
-                          <CheckCircle2 v-if="mcpCopied === 'claude-config'" class="h-3.5 w-3.5 text-green-500" />
-                          <Copy v-else class="h-3.5 w-3.5" />
-                        </Button>
+                    <div class="grid items-center gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(12rem,18rem)]">
+                      <Label id="mcp-query-timeout-label">{{ t("settings.mcpQueryTimeout") }}</Label>
+                      <div class="space-y-1">
+                        <Input id="mcp-query-timeout" v-model="mcpQueryTimeoutInput" type="number" min="0" step="1" inputmode="numeric" placeholder="0" :disabled="mcpPolicyControlsDisabled" @input.capture="onMcpQueryTimeoutInput" />
+                        <p v-if="mcpQueryTimeoutSaveStatus !== 'idle'" class="flex h-4 items-center justify-end gap-1 text-[11px] text-muted-foreground" role="status" aria-live="polite">
+                          <Loader2 v-if="mcpQueryTimeoutSaveStatus === 'saving'" class="size-3 animate-spin" />
+                          <Check v-else-if="mcpQueryTimeoutSaveStatus === 'saved'" class="size-3 text-emerald-600 dark:text-emerald-400" />
+                          <AlertTriangle v-else class="size-3 text-destructive" />
+                          {{ t(`settings.mcpQueryTimeoutSaveStatus_${mcpQueryTimeoutSaveStatus}`) }}
+                        </p>
                       </div>
-                    </TabsContent>
+                    </div>
+                  </div>
+                  <div v-if="mcpTransportTab === 'stdio'" class="space-y-3">
+                    <div>
+                      <Label>{{ t("settings.mcpConfig") }}</Label>
+                      <p class="mt-1 text-xs text-muted-foreground">{{ t("settings.mcpConfigOptionsHint") }}</p>
+                    </div>
+                    <Tabs v-model="mcpConfigTab" class="space-y-3">
+                      <TabsList class="settings-mcp-config-tabs h-auto min-h-8 w-full min-w-0 max-w-full justify-start gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain group-data-horizontal/tabs:h-auto">
+                        <TabsTrigger value="claude" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Claude Code</TabsTrigger>
+                        <TabsTrigger value="cursor" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Cursor</TabsTrigger>
+                        <TabsTrigger value="codebuddy" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">CodeBuddy Code</TabsTrigger>
+                        <TabsTrigger value="zcode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">ZCode</TabsTrigger>
+                        <TabsTrigger value="trae" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">TRAE</TabsTrigger>
+                        <TabsTrigger value="vscode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">VS Code</TabsTrigger>
+                        <TabsTrigger value="windsurf" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Windsurf</TabsTrigger>
+                        <TabsTrigger value="codex" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Codex</TabsTrigger>
+                        <TabsTrigger value="deepseek-harness" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">DeepSeek Harness</TabsTrigger>
+                        <TabsTrigger value="opencode" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">OpenCode</TabsTrigger>
+                        <TabsTrigger value="pi" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Pi</TabsTrigger>
+                        <TabsTrigger value="cherry-studio" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Cherry Studio</TabsTrigger>
+                        <TabsTrigger value="qoder" class="settings-mcp-config-tab h-7 flex-none shrink-0 px-2.5">Qoder</TabsTrigger>
+                      </TabsList>
 
-                    <TabsContent value="cursor" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpCursorConfigPath") }}
-                        </div>
+                      <TabsContent value="claude" class="m-0">
                         <div class="relative rounded-md border bg-background p-3">
                           <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('cursor-config', mcpJsonRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'cursor-config'" class="h-3.5 w-3.5 text-green-500" />
+                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('claude-config', mcpJsonRecommendedConfig)">
+                            <CheckCircle2 v-if="mcpCopied === 'claude-config'" class="h-3.5 w-3.5 text-green-500" />
                             <Copy v-else class="h-3.5 w-3.5" />
                           </Button>
                         </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="codebuddy" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpCodeBuddyConfigPath") }}
+                      <TabsContent value="cursor" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpCursorConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('cursor-config', mcpJsonRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'cursor-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('codebuddy-config', mcpJsonRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'codebuddy-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="zcode" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpZCodeConfigPath") }}
+                      <TabsContent value="codebuddy" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpCodeBuddyConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('codebuddy-config', mcpJsonRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'codebuddy-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('zcode-config', mcpJsonRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'zcode-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="trae" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpTraeConfigPath") }}
+                      <TabsContent value="zcode" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpZCodeConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('zcode-config', mcpJsonRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'zcode-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpTraeRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('trae-config', mcpTraeRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'trae-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="vscode" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpVsCodeConfigPath") }}
+                      <TabsContent value="trae" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpTraeConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpTraeRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('trae-config', mcpTraeRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'trae-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpVsCodeRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('vscode-config', mcpVsCodeRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'vscode-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="windsurf" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpWindsurfConfigPath") }}
+                      <TabsContent value="vscode" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpVsCodeConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpVsCodeRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('vscode-config', mcpVsCodeRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'vscode-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('windsurf-config', mcpJsonRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'windsurf-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="codex" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpCodexConfigPath") }}
+                      <TabsContent value="windsurf" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpWindsurfConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpJsonRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('windsurf-config', mcpJsonRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'windsurf-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpCodexRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('codex-config', mcpCodexRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'codex-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="deepseek-harness" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpDeepSeekHarnessConfigPath") }}
+                      <TabsContent value="codex" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpCodexConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpCodexRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('codex-config', mcpCodexRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'codex-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpDeepSeekHarnessRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('deepseek-harness-config', mcpDeepSeekHarnessRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'deepseek-harness-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="opencode" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpOpenCodeConfigPath") }}
+                      <TabsContent value="deepseek-harness" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpDeepSeekHarnessConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpDeepSeekHarnessRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('deepseek-harness-config', mcpDeepSeekHarnessRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'deepseek-harness-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpOpenCodeRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('opencode-config', mcpOpenCodeRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'opencode-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="pi" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpPiConfigPath") }}
+                      <TabsContent value="opencode" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpOpenCodeConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpOpenCodeRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('opencode-config', mcpOpenCodeRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'opencode-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpPiRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('pi-config', mcpPiRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'pi-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
-                        </div>
-                      </div>
-                    </TabsContent>
+                      </TabsContent>
 
-                    <TabsContent value="cherry-studio" class="m-0">
-                      <div class="space-y-2">
-                        <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-                          {{ t("settings.mcpCherryStudioConfigPath") }}
+                      <TabsContent value="pi" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpPiConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpPiRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('pi-config', mcpPiRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'pi-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                        <div class="relative rounded-md border bg-background p-3">
-                          <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpCherryStudioRecommendedConfig }}</code></pre>
-                          <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('cherry-studio-config', mcpCherryStudioRecommendedConfig)">
-                            <CheckCircle2 v-if="mcpCopied === 'cherry-studio-config'" class="h-3.5 w-3.5 text-green-500" />
-                            <Copy v-else class="h-3.5 w-3.5" />
-                          </Button>
+                      </TabsContent>
+
+                      <TabsContent value="cherry-studio" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpCherryStudioConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpCherryStudioRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('cherry-studio-config', mcpCherryStudioRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'cherry-studio-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
                         </div>
-                      </div>
-                    </TabsContent>
-                  </Tabs>
+                      </TabsContent>
+
+                      <TabsContent value="qoder" class="m-0">
+                        <div class="space-y-2">
+                          <div class="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+                            {{ t("settings.mcpQoderConfigPath") }}
+                          </div>
+                          <div class="relative rounded-md border bg-background p-3">
+                            <pre class="overflow-x-auto whitespace-pre text-xs leading-relaxed"><code>{{ mcpQoderRecommendedConfig }}</code></pre>
+                            <Button type="button" variant="outline" size="icon" class="absolute right-2 top-2 h-7 w-7" :title="t('common.copy')" @click="copyMcpText('qoder-config', mcpQoderRecommendedConfig)">
+                              <CheckCircle2 v-if="mcpCopied === 'qoder-config'" class="h-3.5 w-3.5 text-green-500" />
+                              <Copy v-else class="h-3.5 w-3.5" />
+                            </Button>
+                          </div>
+                        </div>
+                      </TabsContent>
+                    </Tabs>
+                  </div>
+
+                  <div v-if="mcpTransportTab === 'stdio' && (mcpStatus?.error || mcpStatusError)" class="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                    {{ mcpStatusError || mcpStatus?.error }}
+                  </div>
+
+                  <div v-if="mcpTransportTab === 'stdio'" class="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Terminal class="h-3.5 w-3.5" />
+                    <span>{{ t("settings.mcpDetectionTiming") }} {{ t("settings.mcpNpmBoundary") }}</span>
+                  </div>
                 </div>
-
-                <div v-if="mcpStatus?.error || mcpStatusError" class="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                  {{ mcpStatusError || mcpStatus?.error }}
-                </div>
-
-                <div class="flex items-center gap-2 text-xs text-muted-foreground">
-                  <Terminal class="h-3.5 w-3.5" />
-                  <span>{{ t("settings.mcpDetectionTiming") }} {{ t("settings.mcpNpmBoundary") }}</span>
-                </div>
-              </template>
+              </Tabs>
             </section>
 
             <section v-else-if="activeSettingsTab === 'security' && isWeb" data-settings-search-id="security" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('security')]">
@@ -8559,9 +9305,17 @@ onUnmounted(() => {
                 </p>
               </div>
 
+              <SettingsTransferPanel
+                :has-unapplied-changes="hasChanges"
+                :build-saved-export-payload="buildSettingsExportPayload"
+                :build-applied-export-payload="buildAppliedExportPayload"
+                :apply-imported-settings="applyImportedEditorSettings"
+                :get-draft-conflict-categories="getDraftConflictCategories"
+              />
+
               <ChangelogPanel :checking-updates="props.checkingUpdates" @check-updates="emit('check-updates')" />
 
-              <div class="rounded-lg border p-4">
+              <div class="settings-item rounded-lg border p-4">
                 <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <div class="min-w-0 space-y-1">
                     <Label>{{ t("settings.updateDownloadSource") }}</Label>
@@ -8970,6 +9724,24 @@ onUnmounted(() => {
 
 .settings-option-stack > * + * {
   margin-top: 0.625rem;
+}
+
+.settings-item:not(.settings-item-disabled):not(.opacity-50) {
+  transition:
+    background-color 150ms ease-out,
+    border-color 150ms ease-out;
+}
+
+.settings-item:not(.settings-item-disabled):not(.opacity-50):hover {
+  border-color: var(--muted-foreground);
+  background-color: var(--muted);
+}
+
+@supports (background: color-mix(in oklab, black, white)) {
+  .settings-item:not(.settings-item-disabled):not(.opacity-50):hover {
+    border-color: color-mix(in oklab, var(--border) 80%, var(--muted-foreground));
+    background-color: color-mix(in oklab, var(--muted) 40%, var(--background));
+  }
 }
 
 .settings-editor-live-preview {

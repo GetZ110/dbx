@@ -353,6 +353,38 @@ describe("splitSqlStatementRanges", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges(sql))).toEqual(["SELECT 1", "SELECT 2", "SELECT 3"]);
   });
 
+  // Issue #7832 shape: MySQL GROUP BY over a LEFT JOIN with an aggregated
+  // derived table, COUNT(DISTINCT IF(...)) in the projection, and inline
+  // `-- 中文` line comments. The splitter must keep it a single statement and
+  // cursor-statement extraction must always include the trailing GROUP BY, so
+  // the executed SQL keeps the query's row cardinality.
+  it("keeps a commented MySQL GROUP BY query as one statement including the GROUP BY (issue #7832)", () => {
+    const sql = [
+      "SELECT",
+      "  base.brand_name",
+      " ,base.stall_id",
+      " ,base.floor",
+      " ,COUNT(1) total_invite -- 邀约数量",
+      " ,SUM(IFNULL(base.ver_status, 0)) sign_num -- 签到数量",
+      " ,SUM(IFNULL(dr.draw_count, 0)) draw_num -- 抽奖次数",
+      " ,SUM(IFNULL(dr.draw_user_num, 0)) draw_user_num -- 抽奖人数",
+      " ,COUNT(distinct IF(base.ver_status = 1, base.mobile, null)) sign_and_draw_user_num",
+      "FROM v_form_data_1786326962 base",
+      "LEFT JOIN (",
+      "  SELECT id, SUM(IFNULL(hx_status, 0)) draw_count, COUNT(distinct IF(hx_status = 1, mobile, null)) draw_user_num",
+      "  FROM v_form_data_1786326962_coupon",
+      "  GROUP BY id",
+      ") dr ON base.id = dr.id",
+      "GROUP BY base.brand_name, base.stall_id, base.floor",
+    ].join("\n");
+    const ranges = splitSqlStatementRanges(sql, "mysql");
+    expect(rangeSqlTexts(ranges)).toEqual([sql.trim()]);
+    for (const position of [0, indexOf(sql, "total_invite"), indexOf(sql, "sign_and_draw_user_num"), sql.indexOf("GROUP BY") + 5, sql.length - 1]) {
+      const range = statementRangeAtCursor(sql, position, "mysql");
+      expect(range?.sql).toContain("GROUP BY base.brand_name, base.stall_id, base.floor");
+    }
+  });
+
   it("keeps a trailing statement without a semicolon", () => {
     const sql = "SELECT 1;\nSELECT 2";
     const ranges = splitSqlStatementRanges(sql);
@@ -367,6 +399,20 @@ describe("splitSqlStatementRanges", () => {
   it("handles doubled single quotes as escaped quotes", () => {
     const sql = "SELECT 'it''s; ok';\nSELECT 2";
     expect(rangeSqlTexts(splitSqlStatementRanges(sql))).toEqual(["SELECT 'it''s; ok'", "SELECT 2"]);
+  });
+
+  it("treats backslash as a literal inside single quotes for standard SQL (issue #8189)", () => {
+    // ESCAPE '\' is a complete one-char string in standard SQL; the closing quote must not be
+    // swallowed, so the following statement keeps its own range (and thus its run button).
+    const sql = "SELECT * FROM MAXRELATIONSHIP m WHERE m.PARENT LIKE 'A\\_%' ESCAPE '\\';\nSELECT * FROM USER;";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "postgres"))).toEqual(["SELECT * FROM MAXRELATIONSHIP m WHERE m.PARENT LIKE 'A\\_%' ESCAPE '\\'", "SELECT * FROM USER"]);
+    // No databaseType (generic) must behave the same as a standard-SQL dialect.
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql)).length).toBe(2);
+  });
+
+  it("keeps backslash-escaped quotes as one string for MySQL (no regression)", () => {
+    const sql = "SELECT 'a\\'b; still string';\nSELECT 2";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["SELECT 'a\\'b; still string'", "SELECT 2"]);
   });
 
   it("ignores semicolons inside double-quoted identifiers", () => {
@@ -1329,6 +1375,20 @@ FROM orders;`;
 });
 
 describe("executableStatementRanges", () => {
+  it.each(["doris", "starrocks"] as const)("keeps %s half-open range partitions from swallowing the next statement", (databaseType) => {
+    const first = `CREATE TABLE fixed_partitions_1 (
+  sale_date date NULL,
+  product_id int NULL
+) ENGINE=OLAP
+DUPLICATE KEY(sale_date, product_id)
+PARTITION BY RANGE(sale_date) (
+  PARTITION p_2024_01 VALUES [('2024-02-01'), ('2024-03-01'))
+)
+DISTRIBUTED BY HASH(product_id) BUCKETS 1`;
+    const second = first.replace("fixed_partitions_1", "fixed_partitions_2");
+
+    expect(rangeSqlTexts(executableStatementRanges(`${first};\n\n${second};`, databaseType))).toEqual([first, second]);
+  });
   it("returns statement ranges starting only at statement starts", () => {
     const sql = "SELECT *\nFROM users\nWHERE active = 1;\nSELECT 2;";
     const ranges = executableStatementRanges(sql);

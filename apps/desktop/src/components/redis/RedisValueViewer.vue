@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useUpdateBlocker } from "@/lib/app/updatePreparation";
 import { computed, ref, shallowRef, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, watch } from "vue";
 import type { CalendarDateTime } from "@internationalized/date";
 import { useI18n } from "vue-i18n";
@@ -41,6 +42,7 @@ import {
   redisJsonValueText,
   normalizeRedisJsonDraft,
   redisClipboardSafeText,
+  redisHashRowCopyText,
   redisMemberCopyText,
   redisValueCopyText,
   redisValueCollectionItems,
@@ -54,12 +56,14 @@ import {
   jsonToYamlText,
   REDIS_VALUE_CODEC_ORDER,
   type RedisCollectionItem,
+  type RedisHashRowCopyTarget,
   type RedisValueCodec,
   type RedisValueFormat,
 } from "@/lib/redis/redisValuePresentation";
 import { decompressRedisValue, decodeBase64RedisValue, decodePickle, decodeProtobuf, isGzipMagic, type RedisDecompressAlgorithm } from "@/lib/redis/codec";
 import { canFullHighlightRedisText, findRedisTextMatches, nextRedisSearchMatchIndex, REDIS_VALUE_SEARCH_MATCH_LIMIT, renderRedisTextSearchHtml, redisValueSearchStatus } from "@/lib/redis/redisValueSearch";
 import TextContentSearchBar from "@/components/common/TextContentSearchBar.vue";
+import RedisHorizontalScrollbar from "@/components/redis/RedisHorizontalScrollbar.vue";
 import { decodeJsonUnicodeEscapes, formatJsonSource, mapDisplayToRaw } from "@/lib/common/safeJsonFormat";
 import { unixSecondsToCalendarDateTime } from "@/components/ui/date-time-picker/dateTimePicker";
 import { applyRedisExpiryPolicy, type RedisExpiryMode, redisExpiryModeForTtl, validateRedisExpiry } from "@/lib/redis/redisExpiry";
@@ -97,7 +101,6 @@ const REDIS_AUTO_REFRESH_INTERVAL_STORAGE_KEY = "dbx-redis-auto-refresh-interval
 const REDIS_AUTO_REFRESH_INTERVAL_OPTIONS = [1, 3, 5, 10] as const;
 const REDIS_COLLECTION_ROW_HEIGHT = 32;
 const REDIS_STREAM_MIN_ROW_HEIGHT = 96;
-
 const data = ref<RedisValue | null>(null);
 const loading = ref(false);
 const loadingMore = ref(false);
@@ -334,10 +337,13 @@ async function refreshAutoValue() {
   const requestId = ++autoRefreshRequestId;
   refreshingValue.value = true;
   try {
+    // The parent owns the key record this panel's header reads its size badge
+    // from, so a poll that skipped notifying it left the badge frozen at the
+    // value the key had when it was opened. Notifying is cheap: the parent
+    // refreshes that one record's metadata in place.
     const applied = await load({
       background: true,
       preserveDraft: true,
-      notifyParent: false,
       shouldApply: () => requestId === autoRefreshRequestId && !hasUnsavedRedisDraft.value && !shouldPauseAutoValueRefresh() && autoRefreshEnabled.value && canRunAutoRefresh(),
     });
     if (requestId !== autoRefreshRequestId || !applied || !data.value) return;
@@ -1860,6 +1866,10 @@ function copyMember(value: unknown) {
   void copyText(redisMemberCopyText(value));
 }
 
+function copyHashRow(item: RedisHashItem, target: RedisHashRowCopyTarget) {
+  void copyText(redisHashRowCopyText(item.field, item.value, target));
+}
+
 function selectMember(title: string, value: unknown, context: RedisMemberContext, identity?: string) {
   const detail = formatRedisMemberDetail(value, { allowJsonText: true });
   selectedMemberTitle.value = title;
@@ -2701,6 +2711,7 @@ onBeforeUnmount(() => {
 });
 
 defineExpose({ focusSearch });
+useUpdateBlocker(() => (hasUnsavedRedisDraft.value || editingTtl.value || savingTtl.value || savingString.value || savingJson.value || savingMember.value || savingZsetMember.value || savingHashFieldTtl.value || showRenameKeyDialog.value ? t("updates.preparationDrafts") : undefined));
 </script>
 
 <template>
@@ -2804,7 +2815,7 @@ defineExpose({ focusSearch });
       <div v-if="isStringLikeKind && stringValueDetail" class="flex-1 flex flex-col overflow-hidden">
         <div class="flex h-9 items-center gap-2 border-b px-4 text-xs shrink-0">
           <span class="shrink-0 text-muted-foreground">{{ t("redis.codecRowLabel") }}</span>
-          <div class="flex max-w-full overflow-x-auto rounded-md border bg-muted/20 p-0.5">
+          <RedisHorizontalScrollbar>
             <Button
               v-for="codec in REDIS_VALUE_CODEC_ORDER"
               :key="codec"
@@ -2818,7 +2829,7 @@ defineExpose({ focusSearch });
             >
               {{ redisCodecLabel(codec) }}
             </Button>
-          </div>
+          </RedisHorizontalScrollbar>
           <FileArchive v-if="!isStringValueTruncated && stringGzipBadge && stringValueCodec === 'none'" class="h-3.5 w-3.5 shrink-0 text-muted-foreground" :title="t('redis.gzipBadgeTitle')" :aria-label="t('redis.gzipBadgeTitle')" />
           <span class="flex-1" />
           <label v-if="isTextRedisFormat(stringValueView) || activeStructuredStringDetail || isDecompressCodec(stringValueCodec)" class="flex items-center gap-1.5 text-muted-foreground">
@@ -2829,7 +2840,7 @@ defineExpose({ focusSearch });
         </div>
         <div class="flex h-9 items-center gap-2 border-b px-4 text-xs shrink-0">
           <span class="shrink-0 text-muted-foreground">{{ t("redis.viewRowLabel") }}</span>
-          <div class="flex max-w-full overflow-x-auto rounded-md border bg-muted/20 p-0.5">
+          <RedisHorizontalScrollbar>
             <Button
               v-for="format in REDIS_VALUE_FORMAT_DISPLAY_ORDER"
               :key="format"
@@ -2842,7 +2853,7 @@ defineExpose({ focusSearch });
             >
               {{ redisFormatLabel(format, stringValueDetail.rawLabel) }}
             </Button>
-          </div>
+          </RedisHorizontalScrollbar>
           <span class="flex-1" />
           <div v-if="stringValueView === 'json' && stringValueDetail.json && stringValueCodec === 'none'" class="flex shrink-0 overflow-hidden rounded-md border bg-muted/20 p-0.5">
             <Button variant="ghost" size="sm" class="h-6 shrink-0 rounded-[5px] px-2 text-xs" :class="{ 'bg-background shadow-sm': !redisJsonDecoded }" @click="setRedisJsonUnicodeMode('raw')">{{ t("redis.jsonViewRaw") }}</Button>
@@ -3121,7 +3132,19 @@ defineExpose({ focusSearch });
                   @click.stop="viewMember(formatValue(row.value.field), row.value.value, { kind: 'hash', field: redisBlobText(row.value.field), canEdit: redisBlobText(row.value.field) != null && canEditRedisMemberDetail('hash', row.value.value) })"
                   ><Eye class="w-3 h-3"
                 /></Button>
-                <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100" :title="t('redis.copyMember')" @click.stop="copyMember(row.value.value)"><Copy class="w-3 h-3" /></Button>
+                <div class="flex h-5 shrink-0 overflow-hidden rounded opacity-0 group-hover:opacity-100 has-[[data-state=open]]:opacity-100" @click.stop>
+                  <Button data-redis-copy-value variant="ghost" size="icon" class="h-5 w-[18px] rounded-none px-0" :title="t('grid.copyValue')" :aria-label="t('grid.copyValue')" @click="copyHashRow(row.value, 'value')"><Copy class="w-3 h-3" /></Button>
+                  <DropdownMenu :key="row.id">
+                    <DropdownMenuTrigger as-child>
+                      <Button data-redis-copy-menu variant="ghost" size="icon" class="h-5 w-4 rounded-none border-l px-0" :title="t('redis.copyOptions')" :aria-label="t('redis.copyOptions')"><ChevronDown class="h-2.5 w-2.5" /></Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end" class="w-44">
+                      <DropdownMenuItem data-redis-copy-item-field @select="copyHashRow(row.value, 'field')">{{ t("redis.copyField") }}</DropdownMenuItem>
+                      <DropdownMenuItem data-redis-copy-item-value @select="copyHashRow(row.value, 'value')">{{ t("grid.copyValue") }}</DropdownMenuItem>
+                      <DropdownMenuItem data-redis-copy-item-field-value @select="copyHashRow(row.value, 'fieldValue')">{{ t("redis.copyFieldValue") }}</DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
                 <Button variant="ghost" size="icon" class="h-5 w-5 opacity-0 group-hover:opacity-100 text-destructive" :disabled="!canDeleteHashItem(row.value)" @click.stop="requestHashDel(redisBlobText(row.value.field))"><Trash2 class="w-3 h-3" /></Button>
               </div>
             </div>
@@ -3584,11 +3607,11 @@ defineExpose({ focusSearch });
         <template v-else>
           <div class="flex h-9 items-center gap-2 border-b px-5 text-xs">
             <span class="shrink-0 text-muted-foreground">{{ t("redis.codecRowLabel") }}</span>
-            <div class="flex max-w-full overflow-x-auto rounded-md border bg-muted/20 p-0.5">
+            <RedisHorizontalScrollbar>
               <Button v-for="codec in REDIS_VALUE_CODEC_ORDER" :key="codec" variant="ghost" size="sm" class="h-6 shrink-0 rounded-[5px] px-2 text-xs" :class="{ 'bg-background shadow-sm': memberValueCodec === codec }" @click="setMemberValueCodec(codec)">
                 {{ redisCodecLabel(codec) }}
               </Button>
-            </div>
+            </RedisHorizontalScrollbar>
             <span class="flex-1" />
             <label v-if="isTextRedisFormat(memberValueView) || activeStructuredMemberDetail || isDecompressCodec(memberValueCodec)" class="flex items-center gap-1.5 text-muted-foreground">
               <WrapText class="h-3.5 w-3.5" />
@@ -3598,7 +3621,7 @@ defineExpose({ focusSearch });
           </div>
           <div class="flex h-9 items-center gap-2 border-b px-5 text-xs">
             <span class="shrink-0 text-muted-foreground">{{ t("redis.viewRowLabel") }}</span>
-            <div class="flex max-w-full overflow-x-auto rounded-md border bg-muted/20 p-0.5">
+            <RedisHorizontalScrollbar>
               <Button
                 v-for="format in REDIS_VALUE_FORMAT_DISPLAY_ORDER"
                 :key="format"
@@ -3611,7 +3634,7 @@ defineExpose({ focusSearch });
               >
                 {{ redisFormatLabel(format, selectedMemberDetail.rawLabel) }}
               </Button>
-            </div>
+            </RedisHorizontalScrollbar>
             <span class="flex-1" />
             <div v-if="memberValueView === 'json' && selectedMemberDetail.json && memberValueCodec === 'none'" class="flex shrink-0 overflow-hidden rounded-md border bg-muted/20 p-0.5">
               <Button variant="ghost" size="sm" class="h-6 shrink-0 rounded-[5px] px-2 text-xs" :class="{ 'bg-background shadow-sm': !redisJsonDecoded }" @click="setRedisJsonUnicodeMode('raw')">{{ t("redis.jsonViewRaw") }}</Button>

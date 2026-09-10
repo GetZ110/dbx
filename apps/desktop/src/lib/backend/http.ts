@@ -77,6 +77,7 @@ import type {
   DriverInstallProgress,
   JavaRuntimeConfig,
   UpdateInfo,
+  DownloadedUpdate,
   UpdateDownloadSource,
   RedisCollectionPage,
   RedisDatabaseInfo,
@@ -765,7 +766,7 @@ export async function revealPathInFileManager(_path: string): Promise<void> {
   throw new Error("Reveal in file manager is only available in the desktop app.");
 }
 
-export async function deleteDatabaseBackupFiles(_paths: string[]): Promise<number> {
+export async function deleteDatabaseBackupFiles(_paths: string[], _allowedRoots: string[] = []): Promise<number> {
   throw new Error("Database backup file management is only available in the desktop app.");
 }
 
@@ -1848,6 +1849,19 @@ export async function loadMaxAgentTurns(): Promise<number> {
   return get("/api/app-settings/max-agent-turns");
 }
 
+export async function loadSqlFileUploadMaxBytes(): Promise<number> {
+  return get("/api/app-settings/sql-file-upload-max-bytes");
+}
+
+export async function saveSqlFileUploadMaxMb(sqlFileUploadMaxMb: number): Promise<void> {
+  const res = await fetch(apiUrl("/api/app-settings/sql-file-upload-max-bytes"), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sqlFileUploadMaxMb }),
+  });
+  if (!res.ok) throw await backendResponseError(res);
+}
+
 export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
   const res = await fetch(apiUrl("/api/app-settings/max-agent-turns"), {
     method: "PUT",
@@ -1870,10 +1884,8 @@ export async function saveMaxRetries(maxRetries: number): Promise<void> {
   if (!res.ok) throw await backendResponseError(res);
 }
 
-export interface OpenTabsStatePayload {
-  tabs: unknown[];
-  activeTabId: string | null;
-}
+export type { OpenTabsStatePayload, PersistedEditorGroup } from "@/lib/app/openTabsPersistence";
+import type { OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 
 export async function loadEditorSettings(): Promise<unknown | null> {
   return loadBrowserAppState("editor_settings");
@@ -1881,6 +1893,28 @@ export async function loadEditorSettings(): Promise<unknown | null> {
 
 export async function saveEditorSettings(settings: unknown): Promise<void> {
   await saveBrowserAppState("editor_settings", settings);
+}
+
+// Background images are desktop-only: the web backend has no local data dir.
+export interface BackgroundImageInfo {
+  storedPath: string;
+  fileName: string;
+}
+
+export async function saveBackgroundImage(_sourcePath: string): Promise<BackgroundImageInfo> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function clearBackgroundImage(_storedPath: string): Promise<void> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function readBackgroundImage(_storedPath: string): Promise<string> {
+  throw new Error("Background images are only supported in the desktop app");
+}
+
+export async function checkBackgroundImage(_storedPath: string): Promise<boolean> {
+  throw new Error("Background images are only supported in the desktop app");
 }
 
 export async function loadOpenTabsState(): Promise<OpenTabsStatePayload | null> {
@@ -1891,6 +1925,10 @@ export async function loadOpenTabsState(): Promise<OpenTabsStatePayload | null> 
     ? {
         tabs: payload.tabs,
         activeTabId: typeof payload.activeTabId === "string" ? payload.activeTabId : null,
+        ...(payload.groups !== undefined ? { groups: payload.groups } : {}),
+        ...(typeof payload.focusedGroupId === "string" ? { focusedGroupId: payload.focusedGroupId } : {}),
+        ...(payload.orientation === "vertical" || payload.orientation === "horizontal" ? { orientation: payload.orientation } : {}),
+        ...(Array.isArray(payload.sizes) ? { sizes: payload.sizes } : {}),
       }
     : null;
 }
@@ -2246,11 +2284,11 @@ export async function pendingOpenAiConfigLinks(): Promise<string[]> {
   return [];
 }
 
-export async function readExternalSqlFile(_path: string): Promise<string> {
+export async function readExternalSqlFile(_path: string, _maxSizeBytes?: number): Promise<string> {
   throw new Error("Opening external SQL file paths is only available in the desktop app");
 }
 
-export async function readExternalSqlFileSnapshot(_path: string): Promise<import("@/lib/backend/tauri").ExternalSqlFileSnapshot> {
+export async function readExternalSqlFileSnapshot(_path: string, _maxSizeBytes?: number): Promise<import("@/lib/backend/tauri").ExternalSqlFileSnapshot> {
   throw new Error("Opening external SQL file paths is only available in the desktop app");
 }
 
@@ -2478,6 +2516,10 @@ export async function clearDatabaseExportCancellation(_exportId: string): Promis
   // The web exporter owns and clears its cancellation marker on completion.
 }
 
+export async function databaseExportDestinationNeedsConfirmation(_directory: string): Promise<boolean> {
+  throw new Error("Scheduled database backups are only available in the desktop app.");
+}
+
 export async function recordDatabaseExportDestination(_directory: string): Promise<void> {
   throw new Error("Scheduled database backups are only available in the desktop app.");
 }
@@ -2635,6 +2677,11 @@ export async function exportQueryResultXlsx(
   rows: readonly (readonly XlsxCellValue[])[],
   numericColumnRightAlign?: boolean,
   autoFilter?: boolean,
+  // Accepted for signature parity with the Tauri backend but unused: the web
+  // builder writes every cell as `inlineStr`, so a temporal value keeps the
+  // text the grid already formatted (milliseconds included) and never goes
+  // through a `numFmt` display pattern.
+  _dateTimeFormat?: string,
 ): Promise<void> {
   const { buildXlsxWorkbook } = await import("@/lib/export/xlsxExport");
   const workbook = buildXlsxWorkbook({
@@ -2670,6 +2717,7 @@ export async function exportQueryResultsXlsx(
     autoFilter?: boolean;
   }[],
   autoFilter?: boolean,
+  _dateTimeFormat?: string,
 ): Promise<void> {
   const { buildXlsxWorkbookMulti } = await import("@/lib/export/xlsxExport");
   const workbook = buildXlsxWorkbookMulti(autoFilter === undefined ? worksheets : worksheets.map((worksheet) => ({ ...worksheet, autoFilter })));
@@ -2941,8 +2989,8 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   });
 }
 
-export async function redisPubSubConnect(connectionId: string): Promise<WebSocket> {
-  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`));
+export async function redisPubSubConnect(connectionId: string, monitor = false): Promise<WebSocket> {
+  return new WebSocket(apiWebSocketUrl(`/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}&monitor=${monitor}`));
 }
 
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
@@ -4435,13 +4483,19 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return null;
 }
 
-export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion?: string): Promise<void> {
+export async function downloadUpdate(_source: UpdateDownloadSource, _latestVersion: string, _attemptId: string, _releaseNotes?: string): Promise<DownloadedUpdate> {
   throw new Error("In-app update downloads are only available in the desktop app.");
 }
 
 export async function cancelUpdateDownload(): Promise<void> {}
 
-export async function installDownloadedUpdate(): Promise<void> {
+export async function getDownloadedUpdate(): Promise<DownloadedUpdate | null> {
+  return null;
+}
+
+export async function discardDownloadedUpdate(_cacheId: string): Promise<void> {}
+
+export async function installDownloadedUpdate(_cacheId: string, _expectedVersion: string): Promise<void> {
   throw new Error("In-app update installation is only available in the desktop app.");
 }
 

@@ -85,6 +85,7 @@ import { loadSidebarObjectGroup } from "@/lib/sidebar/sidebarObjectGroupRouting"
 import { isXuguTypeMemberContainer } from "@/lib/sidebar/xuguTypeMembers";
 import { isXuguSyntheticTreeNode } from "@/lib/sidebar/xuguPublicSynonyms";
 import { buildXuguSchedulerJobSql, type XuguSchedulerJobAction } from "@/lib/database/xuguSchedulerJobSql";
+import { canViewDatabaseObjectDependencies, databaseDependencyProviderFor } from "@/lib/database/databaseObjectDependencies";
 import { elasticsearchClearIndexPreview, isElasticsearchClearConfirmed, isElasticsearchIndexPattern } from "@/lib/sidebar/elasticsearchIndexActions";
 import { mysqlObjectTemplateForGroup } from "@/lib/sidebar/mysqlObjectTemplates";
 import { buildTableDeleteTemplate, buildTableInsertTemplate, buildTableSelectTemplate, buildTableUpdateTemplate } from "@/lib/table/tableSqlTemplates";
@@ -140,11 +141,14 @@ import {
   buildCopyTableDataSql,
   buildEmptyTableSql,
   buildTruncateTableSql,
+  buildMysqlAutoIncrementSql,
   supportsDropTableCascade,
   supportsTruncateTableCascade,
+  supportsNativeMysqlAutoIncrement,
   supportsSchemaComment,
   type DropTableChildObjectSqlOptions,
   type DropObjectSqlOptions,
+  type MysqlAutoIncrementSqlOptions,
   type TableChildObjectType,
 } from "@/lib/database/dbAdminSql";
 import { buildRenameObjectSql, buildRenameDatabaseSql, buildRenameDatabasePreflightSql, databaseRenameMaintenanceDatabase, supportsDatabaseRename, supportsObjectRename, type RenameableObjectType } from "@/lib/table/objectRenameSql";
@@ -152,6 +156,7 @@ import { buildEditableObjectSource, buildRoutineRenameObjectSourceStatements, su
 import { loadEditableObjectSourceForEditor } from "@/lib/table/objectSourceLoad";
 import { buildViewDdl } from "@/lib/table/viewDdl";
 import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
+import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
 import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
@@ -174,7 +179,9 @@ import { authorizationPlanSql, authorizationPlanStatus, buildCreateDatabaseAutho
 import { connectionSupportsProcessList } from "@/lib/database/processListDrivers";
 import { connectionSupportsServerDashboard } from "@/lib/database/mysqlServerStatus";
 import { connectionSupportsServerDashboard as connectionSupportsPgServerDashboard } from "@/lib/database/postgresServerStatus";
+import { connectionSupportsXuguServerDashboard } from "@/lib/database/xuguServerStatus";
 import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
+import { sidebarTreeArrowAction } from "@/lib/sidebar/sidebarTreeArrowNavigation";
 import { batchTableEmptyFeedback, runBatchTableEmpty } from "@/lib/sidebar/batchTableEmpty";
 import { runBatchTableTruncate } from "@/lib/table/batchTableTruncate";
 import { runBatchTableDrop } from "@/lib/table/batchTableDrop";
@@ -223,6 +230,9 @@ import {
   showTruncateTableConfirm,
   showVacuumTableConfirm,
   showMysqlAutoIncrementConfirm,
+  showBatchMysqlAutoIncrementConfirm,
+  batchMysqlAutoIncrementTargets,
+  batchMysqlAutoIncrementPreviewSql,
   showRenameObjectDialog,
   renameObjectName,
   renameObjectError,
@@ -696,14 +706,23 @@ function isGroupLabel(node: TreeNode): boolean {
 async function openDirectNavigationNode(node: TreeNode, requestId: number) {
   if (!node.connectionId) return;
   const isNacosNavigation = node.type === "nacos-namespace" || node.type === "nacos-access-control";
-  await connectionStore.ensureConnected(node.connectionId, isNacosNavigation ? { verifyHealth: false } : undefined);
+  const isEtcdNavigation = node.type === "etcd-root" || node.type === "etcd-dashboard" || node.type === "etcd-access-control";
+  await connectionStore.ensureConnected(node.connectionId, isNacosNavigation || isEtcdNavigation ? { verifyHealth: false } : undefined);
   if (!isCurrentNavigationRequest(requestId)) return;
-  const connectionName = connectionStore.getConfig(node.connectionId)?.name || (isNacosNavigation ? "Nacos" : "Consul");
+  if ((node.type === "etcd-dashboard" || node.type === "etcd-access-control") && !connectionStore.getEtcdAccessCapabilities(node.connectionId).admin) return;
+  const connectionName = connectionStore.getConfig(node.connectionId)?.name || (isNacosNavigation ? "Nacos" : isEtcdNavigation ? "etcd" : "Consul");
   if (node.type === "consul-root") {
     queryStore.createTab(node.connectionId, "", `${connectionName}:keys`, "consul");
     refreshActiveKvBrowserAfterOpen("consul", node.connectionId);
   } else if (node.type === "consul-overview") {
     queryStore.createTab(node.connectionId, "", `${connectionName}:${t("consul.ui.overview")}`, "consul-overview");
+  } else if (node.type === "etcd-root") {
+    queryStore.createTab(node.connectionId, "", `${connectionName}:keys`, "etcd");
+    refreshActiveKvBrowserAfterOpen("etcd", node.connectionId);
+  } else if (node.type === "etcd-dashboard") {
+    queryStore.createTab(node.connectionId, "", `${connectionName}:dashboard`, "etcd-dashboard");
+  } else if (node.type === "etcd-access-control") {
+    queryStore.createTab(node.connectionId, "", `${connectionName}:access-control`, "etcd-access-control");
   } else if (node.type === "nacos-namespace") {
     queryStore.openNacosAdmin(node.connectionId, { namespace: node.nacosNamespace || "", namespaceName: node.nacosNamespaceName || node.label });
   } else if (node.type === "nacos-access-control") {
@@ -715,6 +734,12 @@ async function openDirectNavigationNode(node: TreeNode, requestId: number) {
 
 async function toggle(requestId = beginNavigationRequest()) {
   const node = activeNode.value;
+  // Remote sidebar search intentionally descends into one active connection.
+  // Keep that scope aligned even when this toggle is satisfied entirely from
+  // already-loaded children and therefore performs no connection request.
+  if (node.connectionId && connectionStore.connectedIds.has(node.connectionId)) {
+    connectionStore.activeConnectionId = node.connectionId;
+  }
   const treeLoadSearchOptions = sidebarTreeContext?.getTreeLoadSearchOptions?.(node);
   if (isDirectNavigationTreeNode(node.type)) {
     try {
@@ -912,19 +937,6 @@ async function toggle(requestId = beginNavigationRequest()) {
       await connectionStore.ensureConnected(node.connectionId);
       const topicFromId = node.id.endsWith(":mqtt-topic:__console__") ? undefined : node.id.split(":mqtt-topic:")[1] || node.label;
       queryStore.openMqttAdmin(node.connectionId, topicFromId ? { initialTopic: topicFromId } : undefined);
-    } else if (node.type === "etcd-root" && node.connectionId) {
-      await connectionStore.ensureConnected(node.connectionId);
-      const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:keys`;
-      queryStore.createTab(node.connectionId, "", tabTitle, "etcd");
-      refreshActiveKvBrowserAfterOpen("etcd", node.connectionId);
-    } else if (node.type === "etcd-dashboard" && node.connectionId) {
-      await connectionStore.ensureConnected(node.connectionId);
-      const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:dashboard`;
-      queryStore.createTab(node.connectionId, "", tabTitle, "etcd-dashboard");
-    } else if (node.type === "etcd-access-control" && node.connectionId) {
-      await connectionStore.ensureConnected(node.connectionId);
-      const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "etcd"}:access-control`;
-      queryStore.createTab(node.connectionId, "", tabTitle, "etcd-access-control");
     } else if (node.type === "zookeeper-root" && node.connectionId) {
       await connectionStore.ensureConnected(node.connectionId);
       const tabTitle = `${connectionStore.getConfig(node.connectionId)?.name || "ZooKeeper"}:keys`;
@@ -1094,8 +1106,9 @@ function openDriverStoreForInstallError(errMsg: string, node: TreeNode = activeN
 
 async function loadMoreObjectGroupChildren() {
   const node = activeNode.value;
+  const searchFilter = node.loadMore?.parentId ? connectionStore.sidebarTableSearchQueries[node.loadMore.parentId]?.trim() || "" : "";
   try {
-    await connectionStore.loadMoreObjectGroupChildren(node);
+    await connectionStore.loadMoreObjectGroupChildren(node, { searchFilter });
   } catch (e: any) {
     toast(t("connection.connectFailed", { message: translateBackendError(t, e) }), 5000);
   }
@@ -1139,6 +1152,11 @@ function onKeydown(event: KeyboardEvent) {
     event.stopPropagation();
     return;
   }
+  if (isSidebarTreeArrowKey(event) && handleSidebarTreeArrowKey(event)) {
+    event.preventDefault();
+    event.stopPropagation();
+    return;
+  }
   if (!event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && event.key === "F2") {
     if (!requestRenameSelectedNode()) return;
     event.preventDefault();
@@ -1175,6 +1193,27 @@ function onKeydown(event: KeyboardEvent) {
 
 function isPasteTreeClipboardShortcut(event: KeyboardEvent): boolean {
   return isPasteSidebarSelectionShortcut(event, settingsStore.editorSettings.shortcuts);
+}
+
+function isSidebarTreeArrowKey(event: KeyboardEvent): boolean {
+  return !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && (event.key === "ArrowUp" || event.key === "ArrowDown" || event.key === "ArrowLeft" || event.key === "ArrowRight");
+}
+
+function handleSidebarTreeArrowKey(event: KeyboardEvent): boolean {
+  const rows = sidebarTreeContext?.getVisibleFlatNodes?.();
+  if (!rows?.length) return false;
+  const action = sidebarTreeArrowAction(rows, activeNode.value.id, event.key, { databaseType: currentDatabaseType() });
+  if (action.kind === "none") return false;
+  if (action.kind === "toggle") {
+    toggleNode(activeNode.value);
+    return true;
+  }
+  connectionStore.connectionMultiSelectActive = false;
+  connectionStore.selectedTreeNodeId = action.nodeId;
+  connectionStore.selectedTreeNodeIds = [action.nodeId];
+  connectionStore.treeSelectionAnchorId = action.nodeId;
+  sidebarTreeContext?.focusTreeNode?.(action.nodeId);
+  return true;
 }
 
 function isEditConnectionShortcut(event: KeyboardEvent): boolean {
@@ -1494,6 +1533,11 @@ function openMongoTreeData(node: TreeNode) {
     return;
   }
   if (node.type !== "mongo-collection") return;
+  const existing = queryStore.tabs.find((tab) => tab.mode === "mongo" && tab.connectionId === node.connectionId && tab.database === node.database && tab.tableMeta?.tableName === node.label);
+  if (existing) {
+    queryStore.switchTab(existing.id);
+    return;
+  }
   const tab = queryStore.createTab(node.connectionId, node.database, tabTitle, "mongo");
   queryStore.updateSql(tab, node.label);
   queryStore.setTableMeta(tab, {
@@ -1699,6 +1743,8 @@ async function openServerDashboard() {
     connectionStore.activeConnectionId = node.connectionId;
     if (currentDatabaseType() === "nacos") {
       queryStore.openNacosDashboard(node.connectionId);
+    } else if (connectionSupportsXuguServerDashboard(connectionStore.getConfig(node.connectionId))) {
+      queryStore.openXuguDashboard(node.connectionId);
     } else if (connectionSupportsPgServerDashboard(connectionStore.getConfig(node.connectionId))) {
       queryStore.openPostgresDashboard(node.connectionId);
     } else {
@@ -1775,6 +1821,7 @@ async function newQuery() {
           database: node.database,
           schema: node.schema,
           includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+          quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
           tableName: node.label,
           columns: [],
         });
@@ -1874,6 +1921,7 @@ async function newSelectTemplate() {
             database: context.node.database,
             schema: context.tableSchema,
             includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+            quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
             tableName: context.node.label,
             columns: context.columns,
           }),
@@ -1892,6 +1940,7 @@ async function newSelectTemplate() {
       database: context.node.database,
       schema: context.tableSchema,
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+      quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
       tableName: context.node.label,
       columns: context.columns,
     });
@@ -1916,6 +1965,7 @@ async function newInsertTemplate() {
             database: context.node.database,
             schema: context.tableSchema,
             includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+            quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
             tableName: context.node.label,
             columns: context.columns,
             tableType: context.tableType,
@@ -1935,6 +1985,7 @@ async function newInsertTemplate() {
       database: context.node.database,
       schema: context.tableSchema,
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+      quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
       tableName: context.node.label,
       columns: context.columns,
       tableType: context.tableType,
@@ -1960,6 +2011,7 @@ async function newUpdateTemplate() {
             database: context.node.database,
             schema: context.tableSchema,
             includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+            quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
             tableName: context.node.label,
             columns: context.columns,
           }),
@@ -1978,6 +2030,7 @@ async function newUpdateTemplate() {
       database: context.node.database,
       schema: context.tableSchema,
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+      quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
       tableName: context.node.label,
       columns: context.columns,
     });
@@ -2002,6 +2055,7 @@ async function newDeleteTemplate() {
             database: context.node.database,
             schema: context.tableSchema,
             includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+            quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
             tableName: context.node.label,
             columns: context.columns,
           }),
@@ -2020,6 +2074,7 @@ async function newDeleteTemplate() {
       database: context.node.database,
       schema: context.tableSchema,
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
+      quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
       tableName: context.node.label,
       columns: context.columns,
     });
@@ -2047,7 +2102,11 @@ async function openSidebarMultiTableDdlTab(targets: Array<TreeNode & { connectio
         source: result.source,
       });
     },
-    (ddl, target) => formatSqlForDisplay(ddl, sqlFormatDialectForDbType(databaseTypeForNode(target)), settingsStore.editorSettings.sqlFormatter),
+    async (ddl, target) => {
+      const formatDialect = sqlFormatDialectForDbType(databaseTypeForNode(target));
+      const formatted = await formatSqlForDisplay(ddl, formatDialect, settingsStore.editorSettings.sqlFormatter);
+      return settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, formatDialect);
+    },
   );
   connectionStore.activeConnectionId = tabTarget.connectionId;
   const title = `DDL - ${targets.map((target) => target.label).join(", ")}`;
@@ -2425,7 +2484,7 @@ function openObjectSourceDialog(initialEditing: boolean, viewPackageBody = false
             },
           });
         } else {
-          queryStore.createTab(connectionId, database, `Source - ${node.label}`, "query", schema, editableSource, node.catalog, { forceNew: true });
+          queryStore.createTab(connectionId, database, `Source - ${node.label}`, "query", schema, editableSource, node.catalog, { forceNew: true, sourceView: true });
         }
       })
       .catch((e: any) => {
@@ -2448,6 +2507,25 @@ function openProcedureExecution() {
   const node = activeNode.value;
   if (node.type !== "procedure" || !node.connectionId || !node.database) return;
   emit("open-procedure", node);
+}
+
+async function openDatabaseObjectDependencies() {
+  const node = activeNode.value;
+  const provider = databaseDependencyProviderFor(currentDatabaseType());
+  if (!provider || !node.connectionId || !node.database || !provider.supports(node)) return;
+  const sql = provider.buildQuery(node);
+  if (!sql) return;
+
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    connectionStore.activeConnectionId = node.connectionId;
+    const objectName = node.objectName || node.label;
+    const tabId = queryStore.createTab(node.connectionId, node.database, `${t("contextMenu.viewDependencies")} - ${objectName}`, "query", node.schema, undefined, node.catalog, { forceNew: true });
+    queryStore.updateSql(tabId, sql);
+    await queryStore.executeTabSql(tabId, sql);
+  } catch (e: any) {
+    toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+  }
 }
 
 async function compileXuguObject() {
@@ -2744,6 +2822,87 @@ function requestBatchEmpty() {
       batchEmptyTargets.value = [];
       toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
     });
+}
+
+function selectedBatchMysqlAutoIncrementTargets(): TreeNode[] {
+  const targets = selectedBatchTableTargets();
+  return targets.filter((node) => {
+    const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+    return supportsNativeMysqlAutoIncrement(config);
+  });
+}
+
+function batchMysqlAutoIncrementMenuLabel(): string {
+  return t("contextMenu.batchMysqlAutoIncrement", { count: selectedBatchMysqlAutoIncrementTargets().length });
+}
+
+function batchMysqlAutoIncrementSqlOptionsForNode(node: TreeNode): MysqlAutoIncrementSqlOptions {
+  const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
+  return {
+    databaseType: config?.db_type ?? databaseTypeForNode(node) ?? "mysql",
+    driverProfile: config?.driver_profile,
+    schema: node.database || node.schema,
+    tableName: node.label,
+    value: mysqlAutoIncrementValue.value,
+  };
+}
+
+async function refreshBatchMysqlAutoIncrementPreviewSql() {
+  const targets = batchMysqlAutoIncrementTargets.value;
+  const statements: string[] = [];
+  for (const target of targets) {
+    const sql = await buildMysqlAutoIncrementSql(batchMysqlAutoIncrementSqlOptionsForNode(target)).catch(() => "");
+    if (sql) statements.push(sql);
+  }
+  batchMysqlAutoIncrementPreviewSql.value = statements.join("\n");
+}
+
+function requestBatchMysqlAutoIncrement() {
+  const targets = selectedBatchMysqlAutoIncrementTargets();
+  if (!targets.length) return;
+  batchMysqlAutoIncrementTargets.value = targets.slice();
+  mysqlAutoIncrementValue.value = "1";
+  batchMysqlAutoIncrementPreviewSql.value = "";
+  void refreshBatchMysqlAutoIncrementPreviewSql();
+  showBatchMysqlAutoIncrementConfirm.value = true;
+}
+
+async function confirmBatchMysqlAutoIncrement() {
+  const targets = batchMysqlAutoIncrementTargets.value.slice();
+  if (!targets.length) return;
+  const succeeded: TreeNode[] = [];
+  let failedCount = 0;
+  let firstError: unknown;
+  for (const target of targets) {
+    if (!target.connectionId || !target.database) {
+      failedCount++;
+      continue;
+    }
+    try {
+      const config = connectionStore.getConfig(target.connectionId);
+      if (!supportsNativeMysqlAutoIncrement(config)) throw new Error("Setting AUTO_INCREMENT is supported only for native MySQL connections.");
+      await connectionStore.ensureConnected(target.connectionId);
+      const sqlOptions = batchMysqlAutoIncrementSqlOptionsForNode(target);
+      const sql = await buildMysqlAutoIncrementSql(sqlOptions);
+      await executeTreeNodeSqlWithProductionGuard(target, sql, { database: target.database, schema: target.schema });
+      succeeded.push(target);
+    } catch (error) {
+      failedCount++;
+      firstError ??= error;
+    }
+  }
+  if (succeeded.length > 0) {
+    await refreshMutatedTableDataTabsForNodes(succeeded);
+  }
+  if (failedCount > 0 && firstError) {
+    toast(t("contextMenu.batchMysqlAutoIncrementPartialFail", { success: succeeded.length, failed: failedCount }), 5000);
+  } else if (succeeded.length > 0) {
+    toast(t("contextMenu.batchMysqlAutoIncrementSuccess", { count: succeeded.length, value: mysqlAutoIncrementValue.value }), 3000);
+  } else if (firstError) {
+    toast(t("contextMenu.tableOperationFailed", { message: (firstError as any)?.message || String(firstError) }), 5000);
+  }
+  batchMysqlAutoIncrementTargets.value = [];
+  showBatchMysqlAutoIncrementConfirm.value = false;
 }
 
 function requestDropSelectedNodes(): boolean {
@@ -4612,6 +4771,31 @@ routeDangerDialog(showMysqlAutoIncrementConfirm, () =>
   }),
 );
 
+routeDangerDialog(showBatchMysqlAutoIncrementConfirm, () =>
+  dangerRequest({
+    title: t("contextMenu.batchMysqlAutoIncrementTitle", { count: batchMysqlAutoIncrementTargets.value.length }),
+    message: t("contextMenu.batchMysqlAutoIncrementMessage", { count: batchMysqlAutoIncrementTargets.value.length }),
+    detailsText: t("contextMenu.mysqlAutoIncrementNonemptyHint"),
+    get sql() {
+      return batchMysqlAutoIncrementPreviewSql.value;
+    },
+    get confirmLabel() {
+      return t("contextMenu.batchMysqlAutoIncrement", { count: batchMysqlAutoIncrementTargets.value.length });
+    },
+    textInput: {
+      value: mysqlAutoIncrementValue.value,
+      label: t("contextMenu.mysqlAutoIncrementValue"),
+      placeholder: "1",
+      inputMode: "numeric",
+      async onInput(value) {
+        mysqlAutoIncrementValue.value = value;
+        await refreshBatchMysqlAutoIncrementPreviewSql();
+      },
+    },
+    confirm: confirmBatchMysqlAutoIncrement,
+  }),
+);
+
 routeDangerDialog(showDropObjectConfirm, () =>
   dangerRequest({
     title: dropObjectConfirmTitle(),
@@ -5134,6 +5318,9 @@ interface SidebarMenuFactoryContext {
   truncateMenuAction: (singleAction: () => void) => () => void;
   emptyMenuLabel: (singleLabel: string) => string;
   emptyMenuAction: (singleAction: () => void) => () => void;
+  batchAutoIncrementCount: number;
+  autoIncrementMenuLabel: (singleLabel: string) => string;
+  autoIncrementMenuAction: (singleAction: () => void) => () => void;
 }
 
 type SidebarMenuFactory = (context: SidebarMenuFactoryContext) => boolean;
@@ -5192,7 +5379,10 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
     if (currentDatabaseType() === "sqlserver") {
       items.push({ label: t("contextMenu.sqlServerTrace"), action: openSqlServerActivityTrace, icon: Activity });
     }
-    if (node.connectionId && (currentDatabaseType() === "nacos" || connectionSupportsServerDashboard(connectionStore.getConfig(node.connectionId)) || connectionSupportsPgServerDashboard(connectionStore.getConfig(node.connectionId)))) {
+    if (
+      node.connectionId &&
+      (currentDatabaseType() === "nacos" || connectionSupportsXuguServerDashboard(connectionStore.getConfig(node.connectionId)) || connectionSupportsServerDashboard(connectionStore.getConfig(node.connectionId)) || connectionSupportsPgServerDashboard(connectionStore.getConfig(node.connectionId)))
+    ) {
       items.push({ label: t("contextMenu.serverDashboard"), action: openServerDashboard, icon: Gauge });
     }
     if (currentDatabaseType() === "dameng") {
@@ -5706,7 +5896,7 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
 }
 
 function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
-  const { node, items, deleteMenuLabel, deleteMenuAction, truncateMenuLabel, truncateMenuAction, emptyMenuLabel, emptyMenuAction } = context;
+  const { node, items, deleteMenuLabel, deleteMenuAction, truncateMenuLabel, truncateMenuAction, emptyMenuLabel, emptyMenuAction, batchAutoIncrementCount, autoIncrementMenuLabel, autoIncrementMenuAction } = context;
   // 6. Table / View / Materialized View
   if (node.type === "table" || node.type === "view" || node.type === "materialized_view") {
     if (currentDatabaseType() === "victoriametrics" && node.type === "table") {
@@ -5743,6 +5933,9 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
         action: openDdl,
         icon: FileCode,
       });
+    }
+    if (canViewDatabaseObjectDependencies(currentDatabaseType(), node)) {
+      items.push({ label: t("contextMenu.viewDependencies"), action: openDatabaseObjectDependencies, icon: Network });
     }
     if (node.type === "view" || node.type === "materialized_view") {
       items.push({ label: t("contextMenu.editView"), action: () => openObjectSourceDialog(true), icon: Pencil });
@@ -5814,8 +6007,8 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       if (supportsVacuum.value) {
         destructiveActions.push({ label: t("contextMenu.vacuumTable"), action: vacuumTable, icon: Activity, variant: "destructive" as const });
       }
-      if (supportsMysqlAutoIncrement.value) {
-        items.push({ label: t("contextMenu.mysqlAutoIncrement"), action: mysqlAutoIncrement, icon: Gauge });
+      if (supportsMysqlAutoIncrement.value || batchAutoIncrementCount > 1) {
+        items.push({ label: autoIncrementMenuLabel(t("contextMenu.mysqlAutoIncrement")), action: autoIncrementMenuAction(mysqlAutoIncrement), icon: Gauge });
       }
       if (supportsTruncate.value) {
         destructiveActions.push({
@@ -5885,6 +6078,9 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (currentDatabaseType() === "xugu" && buildXuguCompileSql({ objectType: node.type, schema: node.schema, name: node.objectName || node.label })) {
       items.push({ label: t("contextMenu.compileObject"), action: compileXuguObject, icon: Wrench });
     }
+    if (canViewDatabaseObjectDependencies(currentDatabaseType(), node)) {
+      items.push({ label: t("contextMenu.viewDependencies"), action: openDatabaseObjectDependencies, icon: Network });
+    }
     if (node.type === "index" && canOpenStructureEditor.value) {
       items.push({ label: "", separator: true });
       items.push({ label: t("contextMenu.editIndex"), action: openStructureEditor, icon: PencilRuler });
@@ -5921,6 +6117,9 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       items.push({ label: t("contextMenu.compileObject"), action: compileXuguObject, icon: Wrench });
     }
     items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (!isPackageMember && canViewDatabaseObjectDependencies(currentDatabaseType(), node)) {
+      items.push({ label: t("contextMenu.viewDependencies"), action: openDatabaseObjectDependencies, icon: Network });
+    }
     if (currentDatabaseType() === "mysql") {
       items.push(copyNameMenuItem());
     }
@@ -5986,6 +6185,9 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       items.push({ label: t("contextMenu.compileObject"), action: compileXuguObject, icon: Wrench });
     }
     items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (canViewDatabaseObjectDependencies(currentDatabaseType(), node)) {
+      items.push({ label: t("contextMenu.viewDependencies"), action: openDatabaseObjectDependencies, icon: Network });
+    }
     if (node.type === "package" && currentDatabaseType() === "xugu" && node.xuguPackageBodyAvailable === true) {
       items.push({
         label: `${t("contextMenu.viewSource")} (${t("objects.packageBody")})`,
@@ -6117,12 +6319,15 @@ function treeItemMenuItems(): ContextMenuItem[] {
   const batchDropCount = selectedBatchDropTargets().length;
   const batchEmptyCount = selectedBatchEmptyTargets().length;
   const batchTruncateCount = selectedBatchTruncateTargets().length;
+  const batchAutoIncrementCount = selectedBatchMysqlAutoIncrementTargets().length;
   const deleteMenuLabel = (singleLabel: string) => (batchDropCount > 1 ? batchDropMenuLabel() : singleLabel);
   const deleteMenuAction = (singleAction: () => void) => (batchDropCount > 1 ? requestBatchDrop : singleAction);
   const truncateMenuLabel = (singleLabel: string) => (batchTruncateCount > 1 ? batchTruncateMenuLabel() : singleLabel);
   const truncateMenuAction = (singleAction: () => void) => (batchTruncateCount > 1 ? requestBatchTruncate : singleAction);
   const emptyMenuLabel = (singleLabel: string) => (batchEmptyCount > 1 ? batchEmptyMenuLabel() : singleLabel);
   const emptyMenuAction = (singleAction: () => void) => (batchEmptyCount > 1 ? requestBatchEmpty : singleAction);
+  const autoIncrementMenuLabel = (singleLabel: string) => (batchAutoIncrementCount > 1 ? batchMysqlAutoIncrementMenuLabel() : singleLabel);
+  const autoIncrementMenuAction = (singleAction: () => void) => (batchAutoIncrementCount > 1 ? requestBatchMysqlAutoIncrement : singleAction);
 
   // 1. Pin toggle
   if (canPin.value) {
@@ -6142,6 +6347,9 @@ function treeItemMenuItems(): ContextMenuItem[] {
     truncateMenuAction,
     emptyMenuLabel,
     emptyMenuAction,
+    batchAutoIncrementCount,
+    autoIncrementMenuLabel,
+    autoIncrementMenuAction,
   };
   for (const factory of sidebarMenuFactories) {
     if (factory(factoryContext)) return items;
@@ -6232,6 +6440,14 @@ function handleRowClick(node: TreeNode, clickDetail: number) {
 }
 
 function handleRowDoubleClick(node: TreeNode, event: MouseEvent) {
+  // Direct-navigation rows already handle every click in the click sequence.
+  // Starting a new request for their trailing dblclick would invalidate the
+  // still-pending single-click navigation without providing a replacement in
+  // single-click activation mode.
+  if (isDirectNavigationTreeNode(node.type)) {
+    activateRuntimeNode(node);
+    return;
+  }
   beginNavigationRequest();
   activateRuntimeNode(node);
   onDoubleClick(event);

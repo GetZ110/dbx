@@ -2017,7 +2017,7 @@ dependencies = [
 
 [[package]]
 name = "dbx"
-version = "0.6.2"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -2050,6 +2050,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sys-locale",
+ "sysinfo",
  "tauri",
  "tauri-build",
  "tauri-plugin-clipboard-manager",
@@ -2075,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-cli"
-version = "0.4.79"
+version = "0.4.84"
 dependencies = [
  "async-trait",
  "dbx-core",
@@ -2171,7 +2172,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-mcp"
-version = "0.4.79"
+version = "0.4.84"
 dependencies = [
  "async-trait",
  "axum",
@@ -2219,7 +2220,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-web"
-version = "0.6.2"
+version = "0.6.9"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2",
@@ -8949,8 +8950,6 @@ dependencies = [
 [[package]]
 name = "tauri-plugin-updater"
 version = "2.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "806d9dac662c2e4594ff03c647a552f2c9bd544e7d0f683ec58f872f952ce4af"
 dependencies = [
  "base64 0.22.1",
  "dirs",

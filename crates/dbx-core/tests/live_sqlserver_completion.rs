@@ -63,6 +63,7 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         redis_scan_page_size: None,
         redis_database_aliases: Default::default(),
         redis_key_templates: Vec::new(),
+        redis_key_grouping: None,
         etcd_endpoints: String::new(),
         gbase_server: String::new(),
         informix_server: String::new(),
@@ -999,6 +1000,7 @@ async fn live_sqlserver_table_structure_default_changes_drop_existing_constraint
     active.original_position = Some(1);
     let result = build_table_structure_change_sql(TableStructureSqlOptions {
         database_type: Some(DatabaseType::SqlServer),
+        driver_profile: None,
         schema: Some(schema.clone()),
         table_name: table.to_string(),
         columns: vec![sku, active],
@@ -1010,6 +1012,7 @@ async fn live_sqlserver_table_structure_default_changes_drop_existing_constraint
         mysql_engine: None,
         partitioned: false,
         is_gaussdb_m_mode: false,
+        table_collation: None,
     });
     assert_eq!(result.warnings, Vec::<String>::new());
     assert_eq!(result.statements.len(), 4);
@@ -1194,6 +1197,7 @@ async fn live_sqlserver_query_result_export_streams_cte_query_to_csv() {
         use_agent_cursor: false,
         file_path: file_path.to_string_lossy().to_string(),
         format: "csv".to_string(),
+        insert_mode: Default::default(),
         include_sql_sheet: false,
         page_size: 1,
         row_limit: None,
@@ -1376,6 +1380,8 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         target_catalog: None,
         tables: vec![source_table.clone()],
         create_table: true,
+        drop_target_before_create: false,
+        drop_target_confirmed: false,
         content: dbx_core::transfer::TransferContent::default(),
         objects: Vec::new(),
         mode: dbx_core::transfer::TransferMode::Append,
@@ -1395,6 +1401,7 @@ async fn live_sqlserver_transfer_table_skips_rowversion_insert_column() {
         &target_pool_key,
         &std::collections::HashMap::new(),
         &mut Vec::new(),
+        None,
         |_| {},
     )
     .await;

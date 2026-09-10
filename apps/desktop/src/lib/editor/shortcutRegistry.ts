@@ -3,6 +3,7 @@ import { isMacShortcutPlatform, parseShortcutStrokes, shortcutDisplayParts } fro
 export type ShortcutActionId =
   | "executeSql"
   | "executeSqlInNewResultTab"
+  | "explainSql"
   | "formatSql"
   | "expandSelectStar"
   | "toggleLineComment"
@@ -28,6 +29,7 @@ export type ShortcutActionId =
   | "selectAllSelectionOccurrences"
   | "uppercaseSelection"
   | "lowercaseSelection"
+  | "convertNamingStyle"
   | "exPasteSqlInCondition"
   | "toggleFold"
   | "editTableStructure"
@@ -44,6 +46,7 @@ export type ShortcutActionId =
   | "closeOtherTabs"
   | "focusSearch"
   | "quickOpen"
+  | "toggleAiPanel"
   | "navigateTabHistoryBack"
   | "navigateTabHistoryForward"
   | "tabSwitcher"
@@ -117,15 +120,23 @@ export function tabNavigationHistoryDefaultShortcut(direction: "back" | "forward
   return `${modifier}+Alt+${key}`;
 }
 
+// Match the shortcut used by VS Code to open its chat sidebar on macOS while
+// keeping a reachable, non-conflicting equivalent on Windows/Linux.
+export function toggleAiPanelDefaultShortcut(platform = globalThis.navigator?.platform || ""): string {
+  return isMacShortcutPlatform(platform) ? "Ctrl+Mod+I" : "Ctrl+Alt+I";
+}
+
 const PLATFORM_DEFAULT_SHORTCUTS: Partial<Record<ShortcutActionId, ReadonlySet<string>>> = {
   closeOtherTabs: new Set(["Alt+Mod+W", "Shift+Alt+W"]),
   navigateTabHistoryBack: new Set(["Ctrl+Alt+ArrowLeft", "Mod+Alt+ArrowLeft"]),
   navigateTabHistoryForward: new Set(["Ctrl+Alt+ArrowRight", "Mod+Alt+ArrowRight"]),
   addNextSelectionOccurrence: new Set(["Ctrl+G", "Alt+J"]),
   selectAllSelectionOccurrences: new Set(["Ctrl+Mod+G", "Ctrl+Alt+Shift+J"]),
+  toggleAiPanel: new Set(["Ctrl+Mod+I", "Ctrl+Alt+I"]),
 };
 const LEGACY_CLOSE_TAB_DEFAULT = "Meta+W";
 const LEGACY_COPY_CURRENT_ROW_DEFAULT = "Mod+D";
+const EDIT_TABLE_STRUCTURE_DEFAULT = "Mod+Shift+D";
 const TAB_NAVIGATION_HISTORY_ACTIONS: ShortcutActionId[] = ["navigateTabHistoryBack", "navigateTabHistoryForward"];
 
 export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
@@ -140,6 +151,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutExecuteSqlInNewResultTab",
     scope: "editor",
     defaultShortcut: "Mod+\\",
+  },
+  {
+    id: "explainSql",
+    labelKey: "toolbar.explainPlan",
+    scope: "editor",
+    defaultShortcut: "Mod+E",
   },
   {
     id: "formatSql",
@@ -292,6 +309,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Shift+Alt+L",
   },
   {
+    id: "convertNamingStyle",
+    labelKey: "settings.shortcutConvertNamingStyle",
+    scope: "editor",
+    defaultShortcut: "Shift+Alt+C",
+  },
+  {
     id: "exPasteSqlInCondition",
     labelKey: "settings.shortcutExPasteSqlInCondition",
     scope: "editor",
@@ -307,13 +330,13 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     id: "editTableStructure",
     labelKey: "settings.shortcutEditTableStructure",
     scope: "grid",
-    defaultShortcut: "Mod+D",
+    defaultShortcut: EDIT_TABLE_STRUCTURE_DEFAULT,
   },
   {
     id: "copyCurrentRow",
     labelKey: "settings.shortcutCopyCurrentRow",
     scope: "grid",
-    defaultShortcut: "",
+    defaultShortcut: LEGACY_COPY_CURRENT_ROW_DEFAULT,
   },
   {
     id: "deleteCurrentRow",
@@ -386,6 +409,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutQuickOpen",
     scope: "global",
     defaultShortcut: "Mod+P",
+  },
+  {
+    id: "toggleAiPanel",
+    labelKey: "settings.shortcutToggleAiPanel",
+    scope: "global",
+    defaultShortcut: toggleAiPanelDefaultShortcut(),
   },
   {
     id: "navigateTabHistoryBack",
@@ -606,6 +635,7 @@ function shortcutDefaultForPlatform(definition: ShortcutDefinition, platform: st
   if (definition.id === "closeOtherTabs") return closeOtherTabsDefaultShortcut(platform);
   if (definition.id === "navigateTabHistoryBack") return tabNavigationHistoryDefaultShortcut("back", platform);
   if (definition.id === "navigateTabHistoryForward") return tabNavigationHistoryDefaultShortcut("forward", platform);
+  if (definition.id === "toggleAiPanel") return toggleAiPanelDefaultShortcut(platform);
   return definition.defaultShortcut;
 }
 
@@ -635,9 +665,9 @@ export function normalizeShortcutSettings(settings?: Partial<ShortcutSettings>, 
     }),
   ) as ShortcutSettings;
 
-  if (!hasExplicitShortcut(settings, "editTableStructure") && settings?.copyCurrentRow === LEGACY_COPY_CURRENT_ROW_DEFAULT) {
-    normalized.editTableStructure = LEGACY_COPY_CURRENT_ROW_DEFAULT;
-    normalized.copyCurrentRow = "";
+  if (settings?.copyCurrentRow === "" && settings?.editTableStructure === LEGACY_COPY_CURRENT_ROW_DEFAULT) {
+    normalized.editTableStructure = EDIT_TABLE_STRUCTURE_DEFAULT;
+    normalized.copyCurrentRow = LEGACY_COPY_CURRENT_ROW_DEFAULT;
   }
 
   for (const actionId of TAB_NAVIGATION_HISTORY_ACTIONS) {

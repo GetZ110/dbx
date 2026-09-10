@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use crate::csv_export::{
 pub use crate::database_export::ExportStatus;
 use crate::database_export::{
     build_export_insert_statements, is_export_cancelled, is_internal_export_column, BuildExportInsertStatementsOptions,
+    SqlInsertMode,
 };
 use crate::db::agent_driver::AgentTableReadStartParams;
 use crate::models::connection::DatabaseType;
@@ -53,6 +55,8 @@ pub struct TableExportRequest {
     pub file_path: String,
     /// "csv", "xlsx", "json", "markdown", "sql", or "txt"
     pub format: String,
+    #[serde(default)]
+    pub insert_mode: SqlInsertMode,
     #[serde(default)]
     pub csv_quote_mode: CsvQuoteMode,
     #[serde(default)]
@@ -195,6 +199,7 @@ fn resolve_requested_export_column_types(
     requested_column_types: &[Option<String>],
     table_columns: &[crate::db::ColumnInfo],
 ) -> Vec<Option<String>> {
+    let table_columns_by_name = table_columns_by_name(table_columns);
     requested_columns
         .iter()
         .enumerate()
@@ -205,26 +210,29 @@ fn resolve_requested_export_column_types(
                 .flatten()
                 .filter(|column_type| !column_type.trim().is_empty())
                 .or_else(|| {
-                    table_columns
-                        .iter()
-                        .find(|column| column.name.eq_ignore_ascii_case(requested))
-                        .map(|column| column.data_type.clone())
+                    table_columns_by_name.get(&requested.to_ascii_lowercase()).map(|column| column.data_type.clone())
                 })
         })
         .collect()
+}
+
+fn table_columns_by_name(table_columns: &[crate::db::ColumnInfo]) -> HashMap<String, &crate::db::ColumnInfo> {
+    let mut by_name = HashMap::with_capacity(table_columns.len());
+    for column in table_columns {
+        by_name.entry(column.name.to_ascii_lowercase()).or_insert(column);
+    }
+    by_name
 }
 
 fn resolve_requested_export_column_extras(
     requested_columns: &[String],
     table_columns: &[crate::db::ColumnInfo],
 ) -> Vec<Option<String>> {
+    let table_columns_by_name = table_columns_by_name(table_columns);
     requested_columns
         .iter()
         .map(|requested| {
-            table_columns
-                .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(requested))
-                .and_then(|column| column.extra.clone())
+            table_columns_by_name.get(&requested.to_ascii_lowercase()).and_then(|column| column.extra.clone())
         })
         .collect()
 }
@@ -351,6 +359,11 @@ fn table_page_sql(
     offset: u64,
     batch_size: usize,
 ) -> String {
+    let default_order_columns = if sql_context.database_type == DatabaseType::InfluxDb {
+        primary_keys.iter().find(|column| column.eq_ignore_ascii_case("time")).map(std::slice::from_ref).unwrap_or(&[])
+    } else {
+        primary_keys
+    };
     let sql = if use_keyset {
         keyset_pagination_sql_with_identifier_quote(
             col_names,
@@ -372,7 +385,7 @@ fn table_page_sql(
             batch_size,
             request.where_input.as_deref(),
             request.order_by.as_deref(),
-            primary_keys,
+            default_order_columns,
             request.identifier_quote.as_deref(),
         )
     };
@@ -1005,10 +1018,11 @@ async fn try_export_native_table_stream(
                 &cancelled,
                 cancel_token.clone(),
                 |row| {
-                    let formatted = crate::temporal_format::format_temporal_export_row_cow(
+                    let formatted = crate::temporal_format::format_temporal_export_row_for_csv_cow(
                         row,
                         column_types,
                         request.date_time_format.as_deref(),
+                        request.format.eq_ignore_ascii_case("csv"),
                     );
                     write_table_text_row(&mut file, true, formatted.as_ref(), &mut row_buffer, request.csv_quote_mode)?;
                     rows_exported += 1;
@@ -1262,7 +1276,7 @@ async fn try_export_native_table_stream(
                         spatial_columns: Vec::new(),
                         spatial_values: Vec::new(),
                         rows: std::mem::take(pending_rows),
-                        batch_size: Some(SQL_INSERT_BATCH_SIZE),
+                        batch_size: Some(request.insert_mode.batch_size(SQL_INSERT_BATCH_SIZE)),
                     })?;
                     if !statements.is_empty() {
                         if wrote_statements {
@@ -1284,7 +1298,7 @@ async fn try_export_native_table_stream(
                 cancel_token.clone(),
                 |row| {
                     pending_rows.push(row.to_vec());
-                    if pending_rows.len() >= SQL_INSERT_BATCH_SIZE {
+                    if request.insert_mode.flush_each_row() || pending_rows.len() >= SQL_INSERT_BATCH_SIZE {
                         flush_pending(&mut file, &mut pending_rows)?;
                     }
                     rows_exported += 1;
@@ -1472,8 +1486,10 @@ async fn export_table_data_core_inner(
     // When no PK is available, falls back to offset-based pagination.
     let has_custom_filter_or_order = request.where_input.as_ref().is_some_and(|value| !value.trim().is_empty())
         || request.order_by.as_ref().is_some_and(|value| !value.trim().is_empty());
-    let use_keyset =
-        !has_custom_filter_or_order && !primary_keys.is_empty() && primary_keys.iter().all(|pk| col_names.contains(pk));
+    let use_keyset = db_type != DatabaseType::InfluxDb
+        && !has_custom_filter_or_order
+        && !primary_keys.is_empty()
+        && primary_keys.iter().all(|pk| col_names.contains(pk));
 
     // PK column indices within result rows (for extracting last-row values)
     let pk_indices: Vec<usize> = if use_keyset {
@@ -1609,10 +1625,11 @@ async fn export_table_data_core_inner(
                 if row_count == 0 {
                     break;
                 }
-                let formatted_rows = crate::temporal_format::format_temporal_export_rows_cow(
+                let formatted_rows = crate::temporal_format::format_temporal_export_rows_for_csv_cow(
                     &result.rows,
                     &column_types,
                     request.date_time_format.as_deref(),
+                    request.format.eq_ignore_ascii_case("csv"),
                 );
 
                 if is_first_batch {
@@ -2093,7 +2110,7 @@ async fn export_table_data_core_inner(
                     spatial_columns: result.spatial_columns.clone(),
                     spatial_values: result.spatial_values.clone(),
                     rows: result.rows.clone(),
-                    batch_size: Some(100),
+                    batch_size: Some(request.insert_mode.batch_size(SQL_INSERT_BATCH_SIZE)),
                 })?;
                 if !statements.is_empty() {
                     if wrote_statements {
@@ -2156,19 +2173,33 @@ async fn export_table_data_core_inner(
 mod tests {
     use super::*;
     use crate::database_export::{clear_export_cancelled, set_export_cancelled};
-    #[cfg(unix)]
     use crate::models::connection::ConnectionConfig;
     #[cfg(unix)]
     use crate::plugins::{
         InstalledPlugin, PluginDriverManifest, PluginDriverSession, PluginManifest, PluginRuntimeEnv,
     };
-    #[cfg(unix)]
     use crate::storage::Storage;
     use crate::xlsx_export::{build_xlsx_workbook, XlsxWorksheetData};
     use serde_json::json;
     use std::io::Read;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn table_export_request_defaults_to_batch_insert_mode() {
+        let request: TableExportRequest = serde_json::from_value(json!({
+            "exportId": "export-1",
+            "connectionId": "conn-1",
+            "database": "db",
+            "schema": null,
+            "tableName": "users",
+            "filePath": "users.sql",
+            "format": "sql"
+        }))
+        .expect("deserialize table export request");
+
+        assert_eq!(request.insert_mode, SqlInsertMode::Batch);
+    }
 
     #[cfg(unix)]
     struct ExternalDriverExportFixture {
@@ -2259,6 +2290,7 @@ mod tests {
             table_name: "EXPORT_SAMPLE".to_string(),
             file_path: output.to_string_lossy().into_owned(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: Some(vec!["id".to_string(), "name".to_string()]),
             column_types: Some(vec![Some("INTEGER".to_string()), Some("VARCHAR".to_string())]),
             primary_keys: Some(vec!["id".to_string()]),
@@ -2308,6 +2340,150 @@ mod tests {
     #[cfg(unix)]
     fn cleanup_external_driver_export_fixture(fixture: ExternalDriverExportFixture) {
         let _ = std::fs::remove_dir_all(fixture.dir);
+    }
+
+    async fn read_table_export_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0_u8; 2048];
+            let bytes_read = socket.read(&mut chunk).await.unwrap();
+            assert!(bytes_read > 0, "request ended before headers were complete");
+            request.extend_from_slice(&chunk[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    async fn write_table_export_http_json(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    fn table_export_query_param(target: &str, name: &str) -> Option<String> {
+        target.split_once('?')?.1.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (key == name).then(|| percent_encoding::percent_decode_str(value).decode_utf8_lossy().into_owned())
+        })
+    }
+
+    async fn spawn_influxdb_table_export_server() -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut queries = Vec::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_table_export_http_request(&mut socket).await;
+                let target = request.lines().next().unwrap().split_whitespace().nth(1).unwrap();
+                let query = table_export_query_param(target, "q").expect("InfluxDB request must include q");
+                if query != "SHOW DATABASES" {
+                    assert_eq!(table_export_query_param(target, "db").as_deref(), Some("dbx_issue_8022"));
+                }
+                let final_page = query.ends_with("ORDER BY \"time\" LIMIT 1 OFFSET 2");
+                let body = match query.as_str() {
+                    "SHOW DATABASES" => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"databases","columns":["name"],"values":[["dbx_issue_8022"]]}]}]}"#
+                    }
+                    "SHOW TAG KEYS FROM \"weather\"" => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"weather","columns":["tagKey"],"values":[["location"]]}]}]}"#
+                    }
+                    "SHOW FIELD KEYS FROM \"weather\"" => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"weather","columns":["fieldKey","fieldType"],"values":[["temperature","float"]]}]}]}"#
+                    }
+                    value if value.ends_with("ORDER BY \"time\" LIMIT 1 OFFSET 0") => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"weather","columns":["time","location","temperature"],"values":[["2023-09-03T12:00:00Z","us-midwest",82]]}]}]}"#
+                    }
+                    value if value.ends_with("ORDER BY \"time\" LIMIT 1 OFFSET 1") => {
+                        r#"{"results":[{"statement_id":0,"series":[{"name":"weather","columns":["time","location","temperature"],"values":[["2023-09-03T12:01:00Z","us-midwest",83]]}]}]}"#
+                    }
+                    value if value.ends_with("ORDER BY \"time\" LIMIT 1 OFFSET 2") => {
+                        r#"{"results":[{"statement_id":0}]}"#
+                    }
+                    unexpected => panic!("unexpected InfluxDB export query: {unexpected}"),
+                };
+                queries.push(query);
+                write_table_export_http_json(&mut socket, "200 OK", body).await;
+                if final_page {
+                    break;
+                }
+            }
+            queries
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[tokio::test]
+    async fn influxdb_table_export_exports_paginated_rows() {
+        let (base_url, server) = spawn_influxdb_table_export_server().await;
+        let port = base_url.rsplit_once(':').unwrap().1.parse::<u16>().unwrap();
+        let dir = std::env::temp_dir().join(format!("dbx-influxdb-table-export-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config: ConnectionConfig = serde_json::from_value(json!({
+            "id": "conn-influxdb-export",
+            "name": "InfluxDB export",
+            "db_type": "influxdb",
+            "host": "127.0.0.1",
+            "port": port,
+            "username": "",
+            "password": "",
+            "database": "dbx_issue_8022",
+            "query_timeout_secs": 30
+        }))
+        .unwrap();
+        let storage = Storage::open(&dir.join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        state.configs.write().await.insert(config.id.clone(), config);
+        let export_id = format!("export-{}", uuid::Uuid::new_v4());
+        let output = dir.join("weather.csv");
+        let request = TableExportRequest {
+            export_id,
+            connection_id: "conn-influxdb-export".to_string(),
+            database: "dbx_issue_8022".to_string(),
+            schema: None,
+            identifier_quote: None,
+            table_name: "weather".to_string(),
+            file_path: output.to_string_lossy().into_owned(),
+            format: "csv".to_string(),
+            insert_mode: Default::default(),
+            csv_quote_mode: CsvQuoteMode::All,
+            columns: None,
+            column_types: None,
+            primary_keys: None,
+            where_input: None,
+            order_by: None,
+            skip_count: true,
+            batch_size: Some(1),
+            row_limit: None,
+            date_time_format: None,
+            numeric_column_right_align: false,
+            column_comments: None,
+            auto_filter: None,
+        };
+
+        export_table_data_core(&state, &request, |_| {}).await.unwrap();
+        let queries = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .expect("InfluxDB export server did not receive the final page")
+            .unwrap();
+        let csv = std::fs::read_to_string(&output).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let first_page = queries.iter().find(|query| query.contains("LIMIT 1 OFFSET 0")).unwrap();
+        assert!(first_page.contains("ORDER BY \"time\""));
+        assert!(!first_page.contains("ORDER BY \"time\", \"location\""));
+        assert!(csv.contains("location"));
+        assert!(csv.contains("temperature"));
+        assert!(csv.contains("us-midwest"));
+        assert!(csv.contains("82"));
+        assert!(csv.contains("83"));
     }
 
     /// Read and decompress a single entry from an in-memory XLSX (ZIP) buffer.
@@ -2441,6 +2617,7 @@ mod tests {
             table_name: "device2".to_string(),
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2498,6 +2675,7 @@ mod tests {
             table_name: "device2".to_string(),
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2533,6 +2711,7 @@ mod tests {
             table_name: "device2".to_string(),
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2563,6 +2742,7 @@ mod tests {
             table_name: "device2".to_string(),
             file_path: "device2.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2601,6 +2781,7 @@ mod tests {
             table_name: "samples".to_string(),
             file_path: "samples.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2651,6 +2832,7 @@ mod tests {
             table_name: "events".to_string(),
             file_path: "events.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2695,6 +2877,7 @@ mod tests {
             table_name: "orders".to_string(),
             file_path: "orders.txt".to_string(),
             format: "txt".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2767,6 +2950,7 @@ mod tests {
             table_name: "order".to_string(),
             file_path: "order.csv".to_string(),
             format: "csv".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2821,6 +3005,7 @@ mod tests {
             table_name: "spatial_data".to_string(),
             file_path: "spatial_data.sql".to_string(),
             format: "sql".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,
@@ -2877,6 +3062,7 @@ mod tests {
             table_name: "USERS".to_string(),
             file_path: "users.sql".to_string(),
             format: "sql".to_string(),
+            insert_mode: Default::default(),
             columns: None,
             column_types: None,
             primary_keys: None,

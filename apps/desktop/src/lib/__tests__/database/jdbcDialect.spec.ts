@@ -20,6 +20,7 @@ import {
   gaussdbTargetServerType,
   inferJdbcDialect,
   metadataSchemaForConnection,
+  objectListSchemaForConnection,
   setGaussdbConnectionMode,
   setGaussdbCountQueryDop,
   setGaussdbIdentifierQuoteStyle,
@@ -56,6 +57,21 @@ describe("jdbc dialect inference", () => {
         jdbc_driver_paths: ["/drivers/intersystems-jdbc-3.10.5.jar"],
       }),
     ).toBe("iris");
+    // Legacy Caché connections pick the CacheDB.jar from the driver store; the
+    // jar file name and driver label are the only Intersystems markers there.
+    expect(
+      inferJdbcDialect({
+        db_type: "jdbc",
+        jdbc_driver_paths: ["/drivers/CacheDB.jar"],
+      }),
+    ).toBe("iris");
+    expect(
+      inferJdbcDialect({
+        db_type: "jdbc",
+        driver_label: "CacheDB",
+      }),
+    ).toBe("iris");
+    expect(inferJdbcDialect({ db_type: "jdbc", driver_profile: "cache" })).toBe("iris");
   });
 
   it("uses IRIS table preview dialect for generic JDBC IRIS connections", () => {
@@ -74,6 +90,19 @@ describe("jdbc dialect inference", () => {
         driver_profile: "sqlserver",
       }),
     ).toBe("sqlserver");
+  });
+
+  it("detects TDengine JDBC connections and keeps the selected database in the object tree", () => {
+    const connection = {
+      db_type: "jdbc" as const,
+      connection_string: "jdbc:TAOS-RS://tdengine.example:6041/",
+      jdbc_driver_class: "com.taosdata.jdbc.rs.RestfulDriver",
+    };
+
+    expect(inferJdbcDialect(connection)).toBe("tdengine");
+    expect(effectiveDatabaseTypeForConnection(connection)).toBe("tdengine");
+    expect(connectionUsesDatabaseObjectTreeMode(connection)).toBe(false);
+    expect(connectionObjectTreeQuerySchema(connection, "dbx_test")).toBe("dbx_test");
   });
 
   it("keeps Phoenix as generic JDBC while preserving its schema tree", () => {
@@ -284,6 +313,7 @@ describe("jdbc dialect inference", () => {
     expect(inferJdbcDialect({ db_type: "jdbc", driver_label: "Kyuubi JDBC", connection_string: "jdbc:hive2://kyuubi.example.com/default" })).toBe("mysql");
     expect(inferJdbcDialect({ db_type: "jdbc", connection_string: "jdbc:hive2://hiveserver.example.com/default" })).toBe("mysql");
     expect(inferJdbcDialect({ db_type: "jdbc", connection_string: "jdbc:mysql://mysql.example.com/app" })).toBe("mysql");
+    expect(inferJdbcDialect({ db_type: "jdbc", jdbc_driver_paths: ["/drivers/mysql-connector-j-8.0.33.jar"] })).toBe("mysql");
   });
 
   it("prefers explicit Kyuubi identity over Apache Hive product metadata", () => {
@@ -347,8 +377,8 @@ describe("query execution schema", () => {
     expect(connectionQueryExecutionSchema({ db_type: dbType }, "ai_test", undefined, false)).toBe("ai_test");
   });
 
-  it("prefers an explicit schema for PostgreSQL", () => {
-    expect(connectionQueryExecutionSchema({ db_type: "postgres" }, "app", "reporting", false)).toBe("reporting");
+  it.each(["postgres", "gaussdb", "opengauss"] as const)("prefers an explicit schema for %s", (dbType) => {
+    expect(connectionQueryExecutionSchema({ db_type: dbType }, "app", "reporting", false)).toBe("reporting");
   });
 
   it("prefers an explicit schema for Kingbase query execution", () => {
@@ -471,5 +501,30 @@ describe("object tree node schema", () => {
     expect(connectionDatabaseMetadataSchema({ db_type: "spanner" }, "projects/p/instances/i/databases/db")).toBe("");
     expect(connectionDatabaseMetadataSchema({ db_type: "spanner" }, "projects/p/instances/i/databases/db", "")).toBe("");
     expect(connectionDatabaseMetadataSchema({ db_type: "spanner" }, "projects/p/instances/i/databases/db", "public")).toBe("public");
+  });
+});
+
+describe("object list schema", () => {
+  it("falls back to the uppercased Dameng connection username when no schema is selected", () => {
+    // Dameng's object SQL filters on a fixed WHERE o.OWNER = ?, so a blank schema
+    // matches nothing and the object tab renders empty (#8301).
+    expect(objectListSchemaForConnection({ db_type: "dameng", username: "sales_app" })).toBe("SALES_APP");
+  });
+
+  it("applies the Dameng fallback to generic jdbc:dm connections", () => {
+    expect(objectListSchemaForConnection({ db_type: "jdbc", connection_string: "jdbc:dm://localhost:5236", username: "sysdba" })).toBe("SYSDBA");
+  });
+
+  it("keeps an explicitly selected schema for Dameng", () => {
+    expect(objectListSchemaForConnection({ db_type: "dameng", username: "sales_app" }, "OTHER_SCHEMA")).toBe("OTHER_SCHEMA");
+  });
+
+  it("returns a blank schema for Dameng when the connection has no usable username", () => {
+    expect(objectListSchemaForConnection({ db_type: "dameng" })).toBe("");
+    expect(objectListSchemaForConnection({ db_type: "dameng", username: "   " })).toBe("");
+  });
+
+  it.each(["oracle", "oceanbase-oracle", "postgres", "mysql"] as const)("does not fall back to the username for %s", (dbType) => {
+    expect(objectListSchemaForConnection({ db_type: dbType, username: "app_user" })).toBe("");
   });
 });

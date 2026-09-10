@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::models::connection::DatabaseType;
 use crate::sql_dialect::{
     is_schema_aware, profile_for, qualified_table_name, quote_table_data_identifier, quote_table_identifier,
-    uses_connection_identifier_quote,
+    uses_connection_identifier_quote, DdlDialectProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -415,35 +415,28 @@ pub fn build_drop_table_sql(options: TableAdminSqlOptions) -> String {
         &options.table_name,
         options.identifier_quote.as_deref(),
     );
+    // IoTDB is the one engine whose drop target is a derived path pattern rather than the
+    // qualified name, so it cannot be expressed as a profile template.
     if matches!(options.database_type, Some(DatabaseType::Iotdb)) {
         return format!("DELETE TIMESERIES {};", iotdb_timeseries_pattern(&table));
-    } else if matches!(options.database_type, Some(DatabaseType::InfluxDb)) {
-        return format!("DROP MEASUREMENT {};", table);
     }
-    // CASCADE is valid for PostgreSQL-family dialects; keep default RESTRICT behavior elsewhere.
     let cascade = if options.cascade.unwrap_or(false) && supports_drop_table_cascade(options.database_type) {
         " CASCADE"
     } else {
         ""
     };
-    format!("DROP TABLE {table}{cascade};")
+    // Unknown database type: fall back to the ANSI shape rather than guessing a profile.
+    let Some(database_type) = options.database_type else {
+        return format!("DROP TABLE {table}{cascade};");
+    };
+    DdlDialectProfile::render_template(
+        profile_for(database_type).drop_table_template,
+        &[("table", &table), ("cascade", cascade)],
+    )
 }
 
 fn supports_drop_table_cascade(database_type: Option<DatabaseType>) -> bool {
-    matches!(
-        database_type,
-        Some(
-            DatabaseType::Postgres
-                | DatabaseType::Redshift
-                | DatabaseType::Gaussdb
-                | DatabaseType::Kwdb
-                | DatabaseType::Kingbase
-                | DatabaseType::Highgo
-                | DatabaseType::Uxdb
-                | DatabaseType::Vastbase
-                | DatabaseType::OpenGauss
-        )
-    )
+    database_type.is_some_and(|database_type| profile_for(database_type).drop_table_supports_cascade)
 }
 
 pub fn build_drop_table_child_object_sql(options: DropTableChildObjectSqlOptions) -> Result<String, String> {
@@ -536,11 +529,16 @@ pub fn build_empty_table_sql(options: TableAdminSqlOptions) -> String {
         Some(DatabaseType::Bigquery | DatabaseType::Spanner) => format!("DELETE FROM {table} WHERE TRUE;"),
         Some(
             DatabaseType::Cassandra
-            | DatabaseType::Hive
-            | DatabaseType::Kyuubi
-            | DatabaseType::Argo
-            | DatabaseType::Kylin
-            | DatabaseType::Questdb,
+                | DatabaseType::Hive
+                | DatabaseType::Kyuubi
+                | DatabaseType::Argo
+                | DatabaseType::Kylin
+                | DatabaseType::Questdb
+                // StarRocks and Doris reject a WHERE-less DELETE (StarRocks analyzer:
+                // "Where clause is not set"), and both officially support TRUNCATE TABLE
+                // as the way to clear a whole table.
+                | DatabaseType::Doris
+                | DatabaseType::StarRocks,
         ) => {
             format!("TRUNCATE TABLE {table};")
         }
@@ -1007,7 +1005,11 @@ fn is_postgres_like_rename(database_type: DatabaseType) -> bool {
 
 fn is_oracle_like_rename(database_type: DatabaseType) -> bool {
     // 神通 Oscar 实测支持 `ALTER TABLE old RENAME TO new`（PG 风格，与 Dameng/Oracle 一致）。
-    matches!(database_type, DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::Oscar)
+    // OceanBase Oracle 模式同样接受该语法。
+    matches!(
+        database_type,
+        DatabaseType::Oracle | DatabaseType::Dameng | DatabaseType::OceanbaseOracle | DatabaseType::Oscar
+    )
 }
 
 fn is_postgres_like_structure_copy(database_type: DatabaseType) -> bool {
@@ -1781,6 +1783,72 @@ mod tests {
             }),
             "TRUNCATE TABLE `table_sample`;"
         );
+        // StarRocks and Doris require a WHERE clause on DELETE (StarRocks analyzer:
+        // "Where clause is not set"), so clearing a table must emit the same
+        // TRUNCATE TABLE statement the truncate action already produces.
+        for database_type in [DatabaseType::Doris, DatabaseType::StarRocks] {
+            assert_eq!(
+                build_empty_table_sql(TableAdminSqlOptions {
+                    database_type: Some(database_type),
+                    schema: None,
+                    table_name: "events".to_string(),
+                    cascade: None,
+                    identifier_quote: None,
+                }),
+                "TRUNCATE TABLE `events`;"
+            );
+        }
+    }
+
+    /// `build_drop_table_sql` renders `DdlDialectProfile::drop_table_template`, so the six
+    /// profile families plus DuckDB (which resolves to `conservative_ansi`, not the SQLite
+    /// family) must all produce a valid statement.
+    #[test]
+    fn builds_drop_table_sql_per_profile_family() {
+        let drop_sql = |database_type: DatabaseType, schema: Option<&str>, cascade: Option<bool>| {
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: Some(database_type),
+                schema: schema.map(str::to_string),
+                table_name: "events".to_string(),
+                cascade,
+                identifier_quote: None,
+            })
+        };
+
+        assert_eq!(drop_sql(DatabaseType::Mysql, None, None), "DROP TABLE `events`;");
+        assert_eq!(drop_sql(DatabaseType::Postgres, Some("public"), None), "DROP TABLE \"public\".\"events\";");
+        assert_eq!(drop_sql(DatabaseType::Oracle, Some("APP"), None), "DROP TABLE \"APP\".\"events\";");
+        assert_eq!(drop_sql(DatabaseType::SqlServer, Some("dbo"), None), "DROP TABLE [dbo].[events];");
+        assert_eq!(drop_sql(DatabaseType::Sqlite, None, None), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::DuckDb, None, None), "DROP TABLE \"events\";");
+        // No database type: the ANSI shape, with the default double-quote from
+        // `qualified_name_with_quote`, and no CASCADE.
+        assert_eq!(
+            build_drop_table_sql(TableAdminSqlOptions {
+                database_type: None,
+                schema: None,
+                table_name: "events".to_string(),
+                cascade: Some(true),
+                identifier_quote: None,
+            }),
+            "DROP TABLE \"events\";"
+        );
+
+        // CASCADE stays limited to the PostgreSQL-family profiles. Oracle spells it
+        // `CASCADE CONSTRAINTS` and is deliberately excluded; Firebird, Vertica and Exasol
+        // share the PostgreSQL profile but opt out.
+        assert_eq!(
+            drop_sql(DatabaseType::Postgres, Some("public"), Some(true)),
+            "DROP TABLE \"public\".\"events\" CASCADE;"
+        );
+        assert_eq!(drop_sql(DatabaseType::OpenGauss, None, Some(true)), "DROP TABLE \"events\" CASCADE;");
+        assert_eq!(drop_sql(DatabaseType::Firebird, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::Vertica, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::Oracle, None, Some(true)), "DROP TABLE \"events\";");
+        assert_eq!(drop_sql(DatabaseType::DuckDb, None, Some(true)), "DROP TABLE \"events\";");
+
+        // InfluxDB drops a measurement; the profile template carries the whole shape.
+        assert_eq!(drop_sql(DatabaseType::InfluxDb, None, None), "DROP MEASUREMENT \"events\";");
     }
 
     #[test]
@@ -2392,6 +2460,7 @@ mod tests {
         let create =
             crate::table_structure_sql::build_create_table_sql(crate::table_structure_sql::TableStructureSqlOptions {
                 database_type: Some(DatabaseType::Oracle),
+                driver_profile: None,
                 schema: Some("APP".to_string()),
                 table_name: "orders_copy".to_string(),
                 columns: vec![column("user_id"), column("userName")],
@@ -2403,6 +2472,7 @@ mod tests {
                 mysql_engine: None,
                 partitioned: false,
                 is_gaussdb_m_mode: false,
+                table_collation: None,
             });
         assert_eq!(create.warnings, Vec::<String>::new());
         assert_eq!(
@@ -2591,6 +2661,20 @@ mod tests {
             })
             .unwrap(),
             "ALTER VIEW \"SYSDBA\".\"ACTIVE_USERS\" RENAME TO \"ENABLED_USERS\";"
+        );
+        // OceanBase in Oracle mode accepts the same statement; without it the transfer
+        // rename-then-drop path has no way to back up a target table.
+        assert!(supports_object_rename(Some(DatabaseType::OceanbaseOracle), DatabaseObjectType::Table));
+        assert_eq!(
+            build_rename_object_sql(RenameObjectSqlOptions {
+                database_type: Some(DatabaseType::OceanbaseOracle),
+                object_type: DatabaseObjectType::Table,
+                schema: Some("APP".to_string()),
+                old_name: "ORDERS".to_string(),
+                new_name: "ORDERS__DBX_BAK".to_string(),
+            })
+            .unwrap(),
+            "ALTER TABLE \"APP\".\"ORDERS\" RENAME TO \"ORDERS__DBX_BAK\";"
         );
     }
 

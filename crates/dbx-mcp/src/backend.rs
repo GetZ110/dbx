@@ -8,8 +8,9 @@ use async_trait::async_trait;
 use dbx_core::{
     agent_events::{ToolCall, ToolResult},
     agent_tools::{self, format_query_result_as_text, AgentSqlPermissions, QueryCellWindow},
-    connection::AppState,
+    connection::{connection_configs_pool_equivalent, AppState},
     db::{mongo_driver::MongoIndexSpec, redis_driver::RedisCommandResult, ColumnInfo, TableInfo},
+    mcp_policy::{connection_group_paths, McpConnectionGroupPath},
     models::connection::{ConnectionConfig, DatabaseType},
     storage::{DesktopSettings, McpGlobalPolicy, McpGlobalPolicyState, Storage},
 };
@@ -50,73 +51,6 @@ impl From<&ConnectionConfig> for ConnectionSummary {
     }
 }
 
-#[derive(Deserialize)]
-struct SidebarLayout {
-    #[serde(default)]
-    groups: Vec<SidebarGroup>,
-    #[serde(default)]
-    order: Vec<SidebarOrderEntry>,
-}
-
-#[derive(Deserialize)]
-struct SidebarGroup {
-    id: String,
-    name: String,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-enum SidebarOrderEntry {
-    #[serde(rename = "group")]
-    Group {
-        id: String,
-        children: Option<Vec<SidebarOrderEntry>>,
-        #[serde(rename = "connectionIds")]
-        connection_ids: Option<Vec<String>>,
-    },
-    #[serde(rename = "connection")]
-    Connection { id: String },
-}
-
-fn connection_group_paths(layout: Value) -> HashMap<String, Vec<String>> {
-    let Ok(layout) = serde_json::from_value::<SidebarLayout>(layout) else {
-        return HashMap::new();
-    };
-    let groups = layout.groups.into_iter().map(|group| (group.id, group.name)).collect::<HashMap<_, _>>();
-    let mut paths = HashMap::new();
-    collect_connection_group_paths(&layout.order, &groups, &mut Vec::new(), &mut paths);
-    paths
-}
-
-fn collect_connection_group_paths(
-    entries: &[SidebarOrderEntry],
-    groups: &HashMap<String, String>,
-    path: &mut Vec<String>,
-    paths: &mut HashMap<String, Vec<String>>,
-) {
-    for entry in entries {
-        match entry {
-            SidebarOrderEntry::Connection { id } => {
-                paths.insert(id.clone(), path.clone());
-            }
-            SidebarOrderEntry::Group { id, children, connection_ids } => {
-                let Some(name) = groups.get(id) else {
-                    continue;
-                };
-                path.push(name.clone());
-                if let Some(children) = children {
-                    collect_connection_group_paths(children, groups, path, paths);
-                } else if let Some(connection_ids) = connection_ids {
-                    for connection_id in connection_ids {
-                        paths.insert(connection_id.clone(), path.clone());
-                    }
-                }
-                path.pop();
-            }
-        }
-    }
-}
-
 fn legacy_mcp_allow_writes() -> Option<bool> {
     match std::env::var("DBX_MCP_ALLOW_WRITES").ok()?.trim().to_ascii_lowercase().as_str() {
         "1" | "true" => Some(true),
@@ -141,8 +75,91 @@ fn effective_mcp_policy_with_legacy_allow_writes(
     // can execute unconfirmed writes through CLI providers.
     if legacy_allow_writes == Some(false) {
         policy.read_only = true;
+        policy.allow_dangerous_sql = false;
+        for rule in &mut policy.group_policies {
+            rule.read_only = true;
+            rule.allow_dangerous_sql = false;
+        }
+        for rule in &mut policy.connection_policies {
+            rule.read_only = true;
+            rule.allow_dangerous_sql = false;
+            rule.execution_mode_configured = true;
+            rule.execution_mode_policy_version = Some(dbx_core::mcp_policy::MCP_EXECUTION_POLICY_VERSION);
+            for database_policy in &mut rule.database_policies {
+                database_policy.read_only = true;
+                database_policy.allow_dangerous_sql = false;
+            }
+        }
     }
     policy
+}
+
+/// Wire-level result for one statement within a `dbx_execute_batch` call.
+///
+/// Mirrors the per-statement metadata the Web `/api/query/execute-multi` route
+/// returns. `dbx_core::query::ExecuteMultiResult` only derives `Serialize`, so
+/// a separate type that also derives `Deserialize` lets the Web backend decode
+/// the JSON response while LocalBackend adapts from the core type. The error is
+/// kept as an optional message string so `Deserialize` never has to handle the
+/// private-field `BackendError` envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchStatementResult {
+    #[serde(flatten)]
+    pub result: dbx_core::db::QueryResult,
+    #[serde(skip_serializing_if = "is_false")]
+    pub execution_error: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statement_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+    /// True when this entry is the single merged outcome of a `use_transaction`
+    /// batch rather than an auto-commit per-statement result. Set by the MCP
+    /// server, which knows the requested mode; the wire decoders default to
+    /// false.
+    #[serde(skip_serializing_if = "is_false")]
+    pub merged: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl From<dbx_core::query::ExecuteMultiResult> for BatchStatementResult {
+    fn from(result: dbx_core::query::ExecuteMultiResult) -> Self {
+        let error_message = result.error.as_ref().and_then(|error| error.detail().map(str::to_owned)).or_else(|| {
+            result.result.rows.first().and_then(|row| row.first()).and_then(Value::as_str).map(str::to_owned)
+        });
+        Self {
+            result: result.result,
+            execution_error: result.execution_error,
+            statement_index: result.statement_index,
+            error_message,
+            merged: false,
+        }
+    }
+}
+
+/// Optionally decode a loose per-statement JSON object from the Web
+/// `/api/query/execute-multi` response into a `BatchStatementResult`.
+///
+/// The Web route serializes `dbx_core::query::ExecuteMultiResult`, whose fields
+/// are flattened onto the `QueryResult` and whose `error` is a `BackendError`
+/// envelope with private fields and no `Deserialize` impl. This decodes only
+/// the fields the MCP renderer needs instead of reconstructing the envelope.
+/// Returns an explicit error when the response shape is not what this client
+/// expects, so a protocol drift fails loudly instead of silently dropping
+/// statements from the batch.
+fn batch_statement_result_from_json(value: &Value) -> Result<BatchStatementResult, String> {
+    let result: dbx_core::db::QueryResult = serde_json::from_value(value.clone())
+        .map_err(|error| format!("Invalid execute-multi statement envelope: {error} (element: {value})"))?;
+    let execution_error = value.get("execution_error").and_then(Value::as_bool).unwrap_or(false);
+    let statement_index = value.get("statement_index").and_then(Value::as_u64).map(|index| index as usize);
+    let error_message = value
+        .pointer("/error/detail")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| value.pointer("/rows/0/0").and_then(Value::as_str).map(str::to_owned));
+    Ok(BatchStatementResult { result, execution_error, statement_index, error_message, merged: false })
 }
 
 /// Wire-level options for a documentation snapshot. Mirrors
@@ -173,6 +190,14 @@ pub trait DbxBackend: Send + Sync {
     async fn load_connection_group_paths(&self) -> Result<HashMap<String, Vec<String>>, String> {
         Ok(HashMap::new())
     }
+    async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
+        Ok(self
+            .load_connection_group_paths()
+            .await?
+            .into_iter()
+            .map(|(connection_id, names)| (connection_id, McpConnectionGroupPath { ids: Vec::new(), names }))
+            .collect())
+    }
     async fn execute_agent_tool(
         &self,
         connection: &ConnectionConfig,
@@ -190,6 +215,17 @@ pub trait DbxBackend: Send + Sync {
         let _ = (connection, request);
         Err("Message queue sending is not supported by this backend.".to_string())
     }
+    #[cfg(feature = "mq-admin")]
+    async fn peek_messages(
+        &self,
+        connection: &ConnectionConfig,
+        topic: dbx_core::mq::TopicRef,
+        count: u32,
+        options: dbx_core::mq::PeekMessagesOptions,
+    ) -> Result<dbx_core::mq::PeekMessagesResult, String> {
+        let _ = (connection, topic, count, options);
+        Err("Message queue reading is not supported by this backend.".to_string())
+    }
     async fn execute_query(
         &self,
         connection: &ConnectionConfig,
@@ -200,6 +236,38 @@ pub trait DbxBackend: Send + Sync {
     ) -> Result<dbx_core::db::QueryResult, String> {
         let _ = (connection, database, sql, max_rows, timeout_secs);
         Err("SQL queries are not supported by this backend.".to_string())
+    }
+    /// Execute a multi-statement SQL script, returning one result per statement.
+    ///
+    /// The script text is split using the database-dialect-aware splitter so
+    /// semicolons inside strings, comments, and stored procedures are handled.
+    /// `schema` carries the configured scope schema when present. `continue_on_error`
+    /// / `use_transaction` / `client_session_id` are carried through `options`.
+    /// Mirrors the Web `/api/query/execute-multi` route.
+    async fn execute_batch(
+        &self,
+        connection: &ConnectionConfig,
+        database: &str,
+        schema: Option<&str>,
+        sql: &str,
+        options: dbx_core::query::QueryExecutionOptions,
+    ) -> Result<Vec<BatchStatementResult>, String> {
+        let _ = (connection, database, schema, sql, options);
+        Err("SQL batch execution is not supported by this backend.".to_string())
+    }
+    /// Dialect-aware execution plan for a batch script, computed the way the core
+    /// will split it (including the SQL Server agent `GO`-batch splitter), so the
+    /// MCP pre-check's transaction-entry decision never diverges from the core.
+    /// The in-process backend overrides this to resolve the pool's agent-ness;
+    /// the default is the database-dialect splitter.
+    async fn execution_plan(
+        &self,
+        connection: &ConnectionConfig,
+        database: &str,
+        sql: &str,
+    ) -> dbx_core::sql::SqlExecutionPlan {
+        let _ = database;
+        dbx_core::sql::sql_execution_plan_for_database(sql, connection.db_type)
     }
     async fn add_connection_for_mcp(&self, config: ConnectionConfig) -> Result<ConnectionConfig, String>;
     async fn duplicate_connection_for_mcp(
@@ -551,19 +619,34 @@ impl LocalBackend {
     /// needs this — WebBackend talks HTTP and holds no local AppState, and the desktop mcp_bridge
     /// shares the DBX process so it is unaffected by this cache desync.
     async fn sync_runtime_configs(&self, configs: &[ConnectionConfig]) {
-        let mut runtime = self.state.configs.write().await;
-        for config in configs {
-            match runtime.get(&config.id) {
-                Some(existing) if existing == config => {}
-                _ => {
-                    runtime.insert(config.id.clone(), config.clone());
+        let pool_ids_to_drop = {
+            let mut runtime = self.state.configs.write().await;
+            let mut pool_ids_to_drop = Vec::new();
+            for config in configs {
+                match runtime.get(&config.id) {
+                    Some(existing) if existing == config => {}
+                    Some(existing) => {
+                        if !connection_configs_pool_equivalent(existing, config) {
+                            pool_ids_to_drop.push(config.id.clone());
+                        }
+                        runtime.insert(config.id.clone(), config.clone());
+                    }
+                    None => {
+                        runtime.insert(config.id.clone(), config.clone());
+                    }
                 }
             }
-        }
-        let stale_ids: Vec<String> =
-            runtime.keys().filter(|id| !configs.iter().any(|config| &config.id == *id)).cloned().collect();
-        for id in stale_ids {
-            runtime.remove(&id);
+            let stale_ids: Vec<String> =
+                runtime.keys().filter(|id| !configs.iter().any(|config| &config.id == *id)).cloned().collect();
+            for id in &stale_ids {
+                runtime.remove(id);
+            }
+            pool_ids_to_drop.extend(stale_ids);
+            pool_ids_to_drop
+        };
+
+        for id in pool_ids_to_drop {
+            self.state.remove_connection_pools_detached(&id).await;
         }
     }
 }
@@ -632,6 +715,17 @@ impl DbxBackend for LocalBackend {
     }
 
     async fn list_databases(&self, connection: &ConnectionConfig) -> Result<Vec<String>, String> {
+        if connection.db_type == DatabaseType::MongoDb {
+            if self.state.pool_handle(&connection.id).await.is_none() {
+                self.state.get_or_create_pool(&connection.id, None).await?;
+            }
+            if matches!(self.state.pool_handle(&connection.id).await, Some(dbx_core::connection::PoolKind::MongoDb(_)))
+            {
+                return dbx_core::mongo_ops::mongo_list_databases_core(&self.state, &connection.id).await;
+            }
+            // Keep the existing metadata retry path for MongoDB agent pools.
+        }
+
         // `list_databases_core` supports many database engines and therefore
         // produces a very large future. Boxing it here keeps the async-trait
         // implementation below Rust's type-layout recursion limit in desktop
@@ -642,7 +736,23 @@ impl DbxBackend for LocalBackend {
     }
 
     async fn load_connection_group_paths(&self) -> Result<HashMap<String, Vec<String>>, String> {
-        Ok(self.state.storage.load_sidebar_layout().await?.map(connection_group_paths).unwrap_or_default())
+        Ok(self
+            .load_connection_group_details()
+            .await?
+            .into_iter()
+            .map(|(connection_id, path)| (connection_id, path.names))
+            .collect())
+    }
+
+    async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
+        self.state
+            .storage
+            .load_sidebar_layout()
+            .await?
+            .as_ref()
+            .map(connection_group_paths)
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
 
     async fn execute_agent_tool(
@@ -677,6 +787,25 @@ impl DbxBackend for LocalBackend {
         dbx_core::mq::service::mq_send_message_core(&self.state, &connection.id, request).await
     }
 
+    #[cfg(feature = "mq-admin")]
+    async fn peek_messages(
+        &self,
+        connection: &ConnectionConfig,
+        topic: dbx_core::mq::TopicRef,
+        count: u32,
+        options: dbx_core::mq::PeekMessagesOptions,
+    ) -> Result<dbx_core::mq::PeekMessagesResult, String> {
+        dbx_core::mq::service::mq_peek_messages_core(
+            &self.state,
+            &connection.id,
+            topic,
+            "__dbx_kafka_viewer__".into(),
+            count,
+            Some(options),
+        )
+        .await
+    }
+
     async fn execute_query(
         &self,
         connection: &ConnectionConfig,
@@ -695,6 +824,42 @@ impl DbxBackend for LocalBackend {
             dbx_core::query::QueryExecutionOptions { max_rows, timeout_secs, ..Default::default() },
         )
         .await
+    }
+
+    async fn execute_batch(
+        &self,
+        connection: &ConnectionConfig,
+        database: &str,
+        schema: Option<&str>,
+        sql: &str,
+        options: dbx_core::query::QueryExecutionOptions,
+    ) -> Result<Vec<BatchStatementResult>, String> {
+        // The multi-statement executor dispatches across every database engine
+        // and produces a very large future. Boxing it keeps the async-trait
+        // implementation below Rust's type-layout recursion limit (query depth
+        // overflow reported at this async block) without changing behaviour.
+        let results = Box::pin(dbx_core::query::execute_multi_core_with_options_for_client(
+            &self.state,
+            &connection.id,
+            database,
+            sql,
+            schema,
+            None,
+            options,
+        ))
+        .await?;
+        Ok(results.into_iter().map(BatchStatementResult::from).collect())
+    }
+
+    async fn execution_plan(
+        &self,
+        connection: &ConnectionConfig,
+        database: &str,
+        sql: &str,
+    ) -> dbx_core::sql::SqlExecutionPlan {
+        let is_sqlserver_agent =
+            dbx_core::query::connection_pool_is_sqlserver_agent(self.state.as_ref(), &connection.id, database).await;
+        dbx_core::query::query_execution_plan(sql, Some(connection.db_type), is_sqlserver_agent)
     }
 
     async fn add_connection_for_mcp(&self, config: ConnectionConfig) -> Result<ConnectionConfig, String> {
@@ -718,6 +883,7 @@ impl DbxBackend for LocalBackend {
         let removed = self.state.storage.remove_connection_for_mcp(connection_id).await?;
         if removed {
             self.state.configs.write().await.remove(connection_id);
+            self.state.remove_connection_pools_detached(connection_id).await;
         }
         Ok(removed)
     }
@@ -930,13 +1096,22 @@ impl DbxBackend for WebBackend {
     }
 
     async fn load_connection_group_paths(&self) -> Result<HashMap<String, Vec<String>>, String> {
+        Ok(self
+            .load_connection_group_details()
+            .await?
+            .into_iter()
+            .map(|(connection_id, path)| (connection_id, path.names))
+            .collect())
+    }
+
+    async fn load_connection_group_details(&self) -> Result<HashMap<String, McpConnectionGroupPath>, String> {
         let layout = self
             .request(reqwest::Method::GET, "/api/layout/sidebar", None)
             .await?
             .json::<Option<Value>>()
             .await
             .map_err(|error| format!("Invalid sidebar layout response: {error}"))?;
-        Ok(layout.map(connection_group_paths).unwrap_or_default())
+        layout.as_ref().map(connection_group_paths).transpose().map(Option::unwrap_or_default)
     }
 
     async fn execute_agent_tool(
@@ -1039,6 +1214,21 @@ impl DbxBackend for WebBackend {
         .map_err(|error| format!("Invalid message send response: {error}"))
     }
 
+    #[cfg(feature = "mq-admin")]
+    async fn peek_messages(
+        &self,
+        connection: &ConnectionConfig,
+        topic: dbx_core::mq::TopicRef,
+        count: u32,
+        options: dbx_core::mq::PeekMessagesOptions,
+    ) -> Result<dbx_core::mq::PeekMessagesResult, String> {
+        self.request(
+            reqwest::Method::POST,
+            "/api/mq/subscriptions/peek-messages",
+            Some(json!({ "connectionId": connection.id, "topic": topic, "sub": "__dbx_kafka_viewer__", "count": count, "options": options })),
+        ).await?.json().await.map_err(|error| format!("Invalid message peek response: {error}"))
+    }
+
     async fn execute_query(
         &self,
         connection: &ConnectionConfig,
@@ -1060,6 +1250,55 @@ impl DbxBackend for WebBackend {
         .json()
         .await
         .map_err(|error| format!("Invalid query response: {error}"))
+    }
+
+    async fn execute_batch(
+        &self,
+        connection: &ConnectionConfig,
+        database: &str,
+        schema: Option<&str>,
+        sql: &str,
+        options: dbx_core::query::QueryExecutionOptions,
+    ) -> Result<Vec<BatchStatementResult>, String> {
+        if connection.db_type == DatabaseType::MongoDb {
+            return Err("MongoDB batch execution in DBX Web mode is not implemented by the Rust CLI yet.".to_string());
+        }
+        self.ensure_connected(connection).await?;
+        let mut body = json!({
+            "connectionId": connection.id,
+            "database": database,
+            "sql": sql,
+            // Keep Web-mode structured results within the MCP 100-row contract.
+            "maxRows": options.max_rows,
+            "timeoutSecs": agent_tools::agent_query_timeout_secs(options.timeout_secs, Some(connection)),
+        });
+        if let Some(schema) = schema.map(str::trim).filter(|schema| !schema.is_empty()) {
+            body["schema"] = json!(schema);
+        }
+        if let Some(client_session_id) = options.client_session_id.as_deref().filter(|id| !id.trim().is_empty()) {
+            body["clientSessionId"] = json!(client_session_id);
+        }
+        if options.continue_on_error {
+            body["continueOnError"] = json!(true);
+        }
+        if options.use_transaction == Some(true) {
+            body["useTransaction"] = json!(true);
+        }
+        let value: Value = self
+            .request(reqwest::Method::POST, "/api/query/execute-multi", Some(body))
+            .await?
+            .json()
+            .await
+            .map_err(|error| format!("Invalid execute-multi response: {error}"))?;
+        // Fail loudly on any element that does not match the expected envelope
+        // instead of silently dropping statements from the batch.
+        let results = value
+            .as_array()
+            .ok_or_else(|| "Invalid execute-multi response: expected an array of per-statement results".to_string())?
+            .iter()
+            .map(batch_statement_result_from_json)
+            .collect::<Result<Vec<BatchStatementResult>, String>>()?;
+        Ok(results)
     }
 
     async fn close_client_session(
@@ -2095,8 +2334,10 @@ mod tests {
             read_only,
             allow_dangerous_sql: false,
             allowed_connection_ids: None,
+            allowed_group_ids: Vec::new(),
             allowed_tool_names: None,
             connection_policies: Vec::new(),
+            group_policies: Vec::new(),
             query_timeout_secs: None,
         }
     }
@@ -2126,7 +2367,7 @@ mod tests {
 
     #[test]
     fn parses_nested_current_and_legacy_connection_group_paths() {
-        let paths = connection_group_paths(json!({
+        let layout = json!({
             "groups": [
                 { "id": "project", "name": "Project" },
                 { "id": "staging", "name": "Staging" },
@@ -2146,25 +2387,26 @@ mod tests {
                     ]
                 },
                 { "type": "group", "id": "legacy", "connectionIds": ["legacy-connection"] },
-                {
-                    "type": "group",
-                    "id": "missing-group",
-                    "children": [{ "type": "connection", "id": "dangling" }]
-                },
                 { "type": "connection", "id": "root" }
             ]
-        }));
+        });
+        let paths = connection_group_paths(&layout).unwrap();
 
-        assert_eq!(paths.get("nested"), Some(&vec!["Project".to_string(), "Staging".to_string()]));
-        assert_eq!(paths.get("grouped"), Some(&vec!["Project".to_string()]));
-        assert_eq!(paths.get("legacy-connection"), Some(&vec!["Legacy".to_string()]));
-        assert_eq!(paths.get("root"), Some(&Vec::new()));
-        assert!(!paths.contains_key("dangling"));
+        assert_eq!(paths["nested"].ids, vec!["project".to_string(), "staging".to_string()]);
+        assert_eq!(paths["nested"].names, vec!["Project".to_string(), "Staging".to_string()]);
+        assert_eq!(paths["grouped"].names, vec!["Project".to_string()]);
+        assert_eq!(paths["legacy-connection"].names, vec!["Legacy".to_string()]);
+        assert_eq!(paths["root"], McpConnectionGroupPath::default());
     }
 
     #[test]
-    fn malformed_sidebar_layout_has_no_group_paths() {
-        assert!(connection_group_paths(json!({ "groups": "invalid", "order": [] })).is_empty());
+    fn malformed_sidebar_layout_is_rejected() {
+        assert!(connection_group_paths(&json!({ "groups": "invalid", "order": [] })).is_err());
+        assert!(connection_group_paths(&json!({
+            "groups": [],
+            "order": [{ "type": "group", "id": "missing-group", "children": [] }]
+        }))
+        .is_err());
     }
 
     #[tokio::test]
@@ -2349,6 +2591,184 @@ mod tests {
         let (_request_line, second_body) = request_receiver.recv().unwrap();
         let second_request: Value = serde_json::from_str(&second_body).unwrap();
         assert_eq!(second_request["timeoutSecs"], 300);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn web_peek_messages_forwards_kafka_options_and_preserves_partial_results() {
+        use dbx_core::mq::{PeekMessagesOptions, PeekStartPosition, TopicRef};
+        use std::io::BufRead;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = std::io::BufReader::new(&mut stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line.trim(), "POST /api/mq/subscriptions/peek-messages HTTP/1.1");
+            let mut content_length = 0;
+            loop {
+                line.clear();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["connectionId"], "kafka-peek");
+            assert_eq!(body["topic"]["topic"], "events");
+            assert_eq!(body["sub"], "__dbx_kafka_viewer__");
+            assert_eq!(body["count"], 7);
+            assert_eq!(body["options"], json!({"startPosition":"offset", "partition":2, "offset":17}));
+            let response = r#"{"messages":[{"position":1,"messageId":"2:17","payloadBase64":"/w==","headers":{"type":"binary"}}],"incomplete":true}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+        let backend =
+            WebBackend::new_with_config(format!("http://{address}"), String::new(), None, None, None, false, None)
+                .unwrap();
+        backend.auth.lock().await.checked = true;
+        let connection = new_connection_config(
+            "kafka-peek".into(),
+            "Kafka".into(),
+            DatabaseType::MessageQueue,
+            "localhost".into(),
+            9092,
+            String::new(),
+            String::new(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let result = backend
+            .peek_messages(
+                &connection,
+                TopicRef { topic: "events".into(), ..Default::default() },
+                7,
+                PeekMessagesOptions {
+                    start_position: Some(PeekStartPosition::Offset),
+                    partition: Some(2),
+                    offset: Some(17),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(result.incomplete);
+        assert_eq!(result.messages[0].payload_base64, "/w==");
+        assert_eq!(result.messages[0].message_id.as_deref(), Some("2:17"));
+        assert_eq!(result.messages[0].headers.get("type").map(String::as_str), Some("binary"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn web_execute_batch_hits_execute_multi_and_decodes_statement_results() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_sender, request_receiver) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            let header_end = loop {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break position + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length").then_some(value.trim())
+                })
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let body = request[header_end..header_end + content_length].to_string();
+            request_sender.send((request.lines().next().unwrap().to_string(), body)).unwrap();
+
+            let response_body = r#"[{"columns":["id"],"column_types":[],"column_sortables":[],"rows":[["1"],["2"]],"affected_rows":0,"execution_time_ms":1,"truncated":false,"has_more":false,"statement_index":0},{"columns":[],"column_types":[],"column_sortables":[],"rows":[],"affected_rows":2,"execution_time_ms":1,"truncated":false,"has_more":false,"statement_index":1}]"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            )
+            .unwrap();
+        });
+
+        // The mock is a loopback server, so it must not inherit a contributor's
+        // outbound proxy configuration.
+        let backend =
+            WebBackend::new_with_config(format!("http://{address}"), String::new(), None, None, None, false, None)
+                .unwrap();
+        backend.auth.lock().await.checked = true;
+        let connection = new_connection_config(
+            "web-batch".to_string(),
+            "web-batch".to_string(),
+            DatabaseType::Postgres,
+            "localhost".to_string(),
+            5432,
+            String::new(),
+            String::new(),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        // Pre-seed so the mock only needs to answer /api/query/execute-multi.
+        backend.connected.lock().await.insert(connection.id.clone(), connection.clone());
+
+        let results = backend
+            .execute_batch(
+                &connection,
+                "postgres",
+                None,
+                "SELECT 1; INSERT INTO t VALUES (1)",
+                dbx_core::query::QueryExecutionOptions {
+                    max_rows: Some(100),
+                    timeout_secs: Some(0),
+                    continue_on_error: true,
+                    use_transaction: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        // Two metadata fields are transferred from the JSON envelope.
+        assert_eq!(results[0].result.columns, vec!["id".to_string()]);
+        assert_eq!(results[0].result.rows.len(), 2);
+        assert_eq!(results[1].statement_index, Some(1));
+        assert_eq!(results[1].result.affected_rows, 2);
+
+        let (request_line, body) = request_receiver.recv().unwrap();
+        assert_eq!(request_line, "POST /api/query/execute-multi HTTP/1.1");
+        let request: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(request["sql"], "SELECT 1; INSERT INTO t VALUES (1)");
+        assert_eq!(request["continueOnError"], true);
+        assert_eq!(request["useTransaction"], true);
+        assert_eq!(request["maxRows"], 100);
+        assert_eq!(request["timeoutSecs"], 0);
+
+        server.join().unwrap();
     }
 
     #[test]

@@ -112,8 +112,19 @@ export function supportsClearableQuerySchema(dbType?: DatabaseType): boolean {
   return !!dbType && CLEARABLE_QUERY_SCHEMA_TYPES.has(dbType);
 }
 
+/**
+ * ZooKeeper has no query surface: its agent implements only kv_* operations,
+ * so the sidebar "new query" flow would call list-databases and fail
+ * (issue #8215). It is excluded alongside the other specialized surfaces
+ * (nacos, consul, hbase) whose connection workbench replaces query tabs.
+ *
+ * The message-queue surfaces (`mq` — Pulsar/Kafka/RocketMQ/RabbitMQ — and
+ * `mqtt`) belong to the same group: brokers have no SQL engine, and their
+ * workbench is the MQ/MQTT admin tab. The sidebar entry used to open a plain
+ * SQL editor against a broker (issue #8415).
+ */
 export function supportsConnectionQueryActions(dbType?: DatabaseType): boolean {
-  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase";
+  return dbType !== "nacos" && dbType !== "consul" && dbType !== "hbase" && dbType !== "zookeeper" && dbType !== "mq" && dbType !== "mqtt";
 }
 
 /**
@@ -217,7 +228,13 @@ export function supportsObjectBrowser(dbType?: DatabaseType): boolean {
 
 export function supportsConnectionDatabaseBrowser(dbType?: DatabaseType): boolean {
   // MongoDB reuses the object browser for collections, not the SQL database list.
-  return supportsObjectBrowser(dbType) && dbType !== "mongodb";
+  //
+  // Message brokers (`mq` — Kafka/Pulsar/RocketMQ/RabbitMQ/NATS, separated only by
+  // driver_profile) keep the objectBrowser capability for their tenant/topic tree,
+  // but they expose no database namespace: the connection-level browser tab listed
+  // nothing and rendered "no databases found" (issue #8515). Their workbench is the
+  // MQ admin tab instead. MQTT is already excluded: it has no objectBrowser at all.
+  return supportsObjectBrowser(dbType) && dbType !== "mongodb" && dbType !== "mq";
 }
 
 export function supportsObjectBrowserTreeNode(dbType: DatabaseType | undefined, nodeType: TreeNodeType): boolean {

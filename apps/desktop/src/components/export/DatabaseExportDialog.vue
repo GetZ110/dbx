@@ -12,13 +12,14 @@ import * as api from "@/lib/backend/api";
 import type { ExportProgress } from "@/lib/backend/api";
 import { isSchemaAware, isSingleDatabase } from "@/lib/database/databaseFeatureSupport";
 import { databaseOptionsForConnection, fetchNamespaceOptionsForConnection } from "@/composables/useDatabaseOptions";
-import { buildAllDatabaseExportPlan, generateDatabaseExportId, runDatabaseExportUntilTerminal, runWithDatabaseBackupSnapshot, shouldUseDatabaseBackupSnapshot, type AllDatabaseExportPlanItem } from "@/lib/export/databaseExport";
+import { buildAllDatabaseExportPlan, filterExportableSchemas, generateDatabaseExportId, runDatabaseExportUntilTerminal, runWithDatabaseBackupSnapshot, shouldUseDatabaseBackupSnapshot, type AllDatabaseExportPlanItem } from "@/lib/export/databaseExport";
 import { buildSelectedTablesPayload, isDatabaseExportTableSelectionValid } from "@/lib/export/databaseExportSelection";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { useToast } from "@/composables/useToast";
 import { Input } from "@/components/ui/input";
-import { Download, Square, CheckSquare, Search, X, Loader2 } from "@lucide/vue";
+import { Download, Square, CheckSquare, Search, X, Loader2, Wrench } from "@lucide/vue";
 import { formatDataTransferDuration, useExportTracker } from "@/composables/useExportTracker";
+import { isQueryTimeoutErrorMessage } from "@/lib/sql/queryError";
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -33,6 +34,10 @@ const props = defineProps<{
   prefillTable?: string;
   prefillTables?: string[];
   prefillAllDatabases?: boolean;
+}>();
+
+const emit = defineEmits<{
+  openConnectionSettings: [connectionId: string];
 }>();
 
 // Connection / Database / Schema selectors
@@ -54,6 +59,7 @@ const filteredTables = computed(() => {
   return tables.value.filter((name) => name.toLowerCase().includes(q));
 });
 const tableError = ref<string | null>(null);
+const POSTGRES_ALL_SCHEMAS = "__DBX_ALL_SCHEMAS__";
 
 // Options
 const includeStructure = ref(true);
@@ -65,6 +71,7 @@ const omitAutoIncrement = ref(false);
 // `AUTO_INCREMENT` stripping is a MySQL-only DDL transform (backend gates on
 // db_type == mysql, which also covers MariaDB / TiDB / OceanBase-MySQL-mode).
 const isMysqlFamily = computed(() => store.getConfig(connectionId.value)?.db_type === "mysql");
+const isPostgresAllSchemas = computed(() => store.getConfig(connectionId.value)?.db_type === "postgres" && schema.value === POSTGRES_ALL_SCHEMAS);
 
 // Export state
 const isExporting = ref(false);
@@ -72,6 +79,7 @@ const exportProgress = ref<ExportProgress | null>(null);
 const exportId = ref("");
 const exportDone = ref(false);
 const exportError = ref<string | null>(null);
+const exportWarning = ref<string | null>(null);
 const exportCancelled = ref(false);
 const exportStartedAt = ref<number | null>(null);
 const exportFinishedAt = ref<number | null>(null);
@@ -109,6 +117,7 @@ const canExport = computed(() => {
   const hasContent = includeStructure.value || includeData.value || includeObjects.value;
   if (!connectionId.value || !hasContent || isExporting.value) return false;
   if (exportAllDatabases.value) return selectedDatabases.value.length > 0 && !loadingMeta.value;
+  if (isPostgresAllSchemas.value) return database.value && schemas.value.length > 0 && !loadingMeta.value;
   return (
     database.value &&
     schema.value &&
@@ -151,6 +160,19 @@ function joinExportPath(directory: string, fileName: string): string {
   const separator = directory.includes("\\") ? "\\" : "/";
   return `${directory.replace(/[\\/]+$/, "")}${separator}${fileName}`;
 }
+
+// Lenient exports write per-object failures into the SQL file as `-- ERROR`
+// comments and still finish; completion must warn instead of reporting plain
+// success (#8184).
+function toastDatabaseExportCompletion(errorCount: number, errorSummary: string | null) {
+  if (errorCount > 0) {
+    toast(t("databaseExport.exportSuccessWithErrors", { count: errorCount, firstError: errorSummary ?? "" }), 8000);
+    return;
+  }
+  toast(t("databaseExport.exportSuccess"), 3000);
+}
+
+const canChangeQueryTimeout = computed(() => !!connectionId.value && !!exportWarning.value && isQueryTimeoutErrorMessage(exportWarning.value));
 
 async function loadDatabases(connId: string) {
   if (!connId) return;
@@ -204,13 +226,20 @@ async function loadSchemas(preferredSchema = "") {
     return;
   }
 
-  const schemaList = await api.listSchemas(connectionId.value, database.value);
+  const schemaList = filterExportableSchemas(await api.listSchemas(connectionId.value, database.value), config?.db_type);
   const selected = preferredSchema && schemaList.includes(preferredSchema) ? preferredSchema : schemaList.includes("public") ? "public" : (schemaList[0] ?? "");
   schemas.value = schemaList;
   schema.value = selected;
 }
 
 async function loadTables(preferredTable = "", preferredTables: string[] = []) {
+  if (schema.value === POSTGRES_ALL_SCHEMAS) {
+    tables.value = [];
+    selectedTables.value = [];
+    loadingTables.value = false;
+    tableError.value = null;
+    return;
+  }
   if (!connectionId.value || !database.value || !schema.value) return;
   loadingTables.value = true;
   tableError.value = null;
@@ -278,7 +307,7 @@ async function buildExportPlanForDatabases(dbs: string[]): Promise<AllDatabaseEx
   const schemasByDatabase: Record<string, string[]> = {};
   if (schemaAware) {
     for (const db of dbs) {
-      schemasByDatabase[db] = await api.listSchemas(connectionId.value, db);
+      schemasByDatabase[db] = filterExportableSchemas(await api.listSchemas(connectionId.value, db), dbType);
     }
   }
   return buildAllDatabaseExportPlan({ databases: dbs, schemaAware, schemasByDatabase, dbType });
@@ -323,6 +352,7 @@ async function startExport() {
   exportFinishedAt.value = null;
   exportDone.value = false;
   exportError.value = null;
+  exportWarning.value = null;
   exportCancelled.value = false;
   exportProgress.value = {
     exportId: exportId.value,
@@ -351,9 +381,9 @@ async function startExport() {
           exportId: exportId.value,
           connectionId: connectionId.value,
           database: database.value,
-          schema: schema.value,
+          schema: isPostgresAllSchemas.value ? "" : schema.value,
           filePath,
-          selectedTables: includeStructure.value || includeData.value ? buildSelectedTablesPayload(tables.value, selectedTables.value) : undefined,
+          selectedTables: !isPostgresAllSchemas.value && (includeStructure.value || includeData.value) ? buildSelectedTablesPayload(tables.value, selectedTables.value) : undefined,
           includeStructure: includeStructure.value,
           includeData: includeData.value,
           includeObjects: includeObjects.value,
@@ -369,11 +399,13 @@ async function startExport() {
           if (progress.status === "Done") {
             finishExportTiming();
             exportDone.value = true;
+            exportWarning.value = progress.errorSummary ?? null;
             isExporting.value = false;
-            toast(t("databaseExport.exportSuccess"), 3000);
+            toastDatabaseExportCompletion(progress.errorCount ?? 0, progress.errorSummary ?? null);
           } else if (progress.status === "Error") {
             finishExportTiming();
             exportError.value = progress.error;
+            exportWarning.value = null;
             isExporting.value = false;
           } else if (progress.status === "Cancelled") {
             finishExportTiming();
@@ -386,6 +418,7 @@ async function startExport() {
     );
   } catch (e: any) {
     exportError.value = e?.message || String(e);
+    exportWarning.value = null;
     const lastProgress = exportProgress.value as api.ExportProgress | null;
     const fallbackProgress: api.ExportProgress = {
       exportId: exportId.value,
@@ -429,9 +462,12 @@ async function startAllDatabasesExport() {
   exportFinishedAt.value = null;
   exportDone.value = false;
   exportError.value = null;
+  exportWarning.value = null;
   exportCancelled.value = false;
   batchDatabaseIndex.value = 0;
   batchRowsExported.value = 0;
+  let batchLenientErrorCount = 0;
+  let batchFirstErrorSummary: string | null = null;
 
   const dbs = [...selectedDatabases.value];
   const connectionType = store.getConfig(connectionId.value)?.db_type;
@@ -475,7 +511,7 @@ async function startAllDatabasesExport() {
       const filePath = isTauriRuntime() ? joinExportPath(directoryPath, `${sanitizeFileName(item.fileStem)}.sql`) : `__web_export_${currentExportId}.sql`;
       let currentDatabaseRowsExported = 0;
 
-      await runWithDatabaseBackupSnapshot(
+      const terminal = await runWithDatabaseBackupSnapshot(
         {
           connectionId: connectionId.value,
           database: item.database,
@@ -519,6 +555,7 @@ async function startAllDatabasesExport() {
               if (progress.status === "Error") {
                 finishExportTiming();
                 exportError.value = progress.error;
+                exportWarning.value = null;
                 isExporting.value = false;
               } else if (progress.status === "Cancelled") {
                 finishExportTiming();
@@ -530,12 +567,15 @@ async function startAllDatabasesExport() {
         (terminal) => terminal.status === "Done",
       );
 
+      batchLenientErrorCount += terminal.errorCount ?? 0;
+      batchFirstErrorSummary ??= terminal.errorSummary ?? null;
       if (exportError.value || exportCancelled.value) break;
       activeDatabaseExportId.value = "";
     }
 
     if (!exportError.value && !exportCancelled.value) {
       exportDone.value = true;
+      exportWarning.value = batchFirstErrorSummary;
       finishExportTiming();
       isExporting.value = false;
       const finalProgress: api.ExportProgress = {
@@ -547,13 +587,20 @@ async function startAllDatabasesExport() {
         totalRows: null,
         status: "Done",
         error: null,
+        errorCount: batchLenientErrorCount,
+        errorSummary: batchFirstErrorSummary,
       };
       exportProgress.value = finalProgress;
       updateDatabaseExportTask(batchId, finalProgress);
-      toast(t("databaseExport.exportAllSuccess", { count: dbs.length }), 3000);
+      if (batchLenientErrorCount > 0) {
+        toast(t("databaseExport.exportAllSuccessWithErrors", { count: dbs.length, errorCount: batchLenientErrorCount, firstError: batchFirstErrorSummary ?? "" }), 8000);
+      } else {
+        toast(t("databaseExport.exportAllSuccess", { count: dbs.length }), 3000);
+      }
     }
   } catch (e: any) {
     exportError.value = e?.message || String(e);
+    exportWarning.value = null;
     updateDatabaseExportTask(batchId, {
       exportId: batchId,
       currentObject: t("databaseExport.allDatabasesTask", { count: dbs.length }),
@@ -608,6 +655,7 @@ function resetState() {
   exportProgress.value = null;
   exportDone.value = false;
   exportError.value = null;
+  exportWarning.value = null;
   exportCancelled.value = false;
   exportStartedAt.value = null;
   exportFinishedAt.value = null;
@@ -699,6 +747,7 @@ watch(schema, (value) => {
   const preferredTables = pendingPrefillTables.value;
   pendingPrefillTable.value = "";
   pendingPrefillTables.value = [];
+  if (value === POSTGRES_ALL_SCHEMAS) return;
   if (value) loadTables(preferredTable, preferredTables).catch((e) => toast(String(e), 5000));
 });
 
@@ -808,12 +857,13 @@ watch(
                 <SelectValue :placeholder="t('diff.selectSchema')" />
               </SelectTrigger>
               <SelectContent position="popper" align="start">
+                <SelectItem v-if="store.getConfig(connectionId)?.db_type === 'postgres'" :value="POSTGRES_ALL_SCHEMAS">{{ t("databaseExport.allSchemas") }}</SelectItem>
                 <SelectItem v-for="s in schemas" :key="s" :value="s">{{ s }}</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
-          <div v-if="!exportAllDatabases && schema" class="space-y-2">
+          <div v-if="!exportAllDatabases && schema && !isPostgresAllSchemas" class="space-y-2">
             <div class="flex items-center justify-between gap-2">
               <Label class="text-xs">{{ t("databaseExport.tableSelection") }}</Label>
               <div v-if="tables.length" class="text-[11px] text-muted-foreground">
@@ -918,6 +968,15 @@ watch(
           <!-- Status messages -->
           <div v-if="exportDone" class="text-xs text-green-600 font-medium">
             {{ t("databaseExport.exportSuccess") }}
+          </div>
+          <div v-if="exportDone && exportWarning" class="space-y-2">
+            <div class="whitespace-pre-wrap break-words text-xs text-amber-600 dark:text-amber-400">
+              {{ exportWarning }}
+            </div>
+            <Button v-if="canChangeQueryTimeout" variant="outline" size="sm" @click="emit('openConnectionSettings', connectionId)">
+              <Wrench class="mr-1 h-3.5 w-3.5" />
+              {{ t("editor.changeQueryTimeout") }}
+            </Button>
           </div>
           <div v-else-if="exportError" class="text-xs text-destructive font-medium">
             {{ t("databaseExport.exportError", { error: exportError }) }}

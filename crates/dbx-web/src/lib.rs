@@ -1026,6 +1026,11 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
             "/app-settings/max-retries",
             get(routes::app_settings::load_max_retries).put(routes::app_settings::save_max_retries),
         )
+        .route(
+            "/app-settings/sql-file-upload-max-bytes",
+            get(routes::app_settings::load_sql_file_upload_max_bytes)
+                .put(routes::app_settings::save_sql_file_upload_max_mb),
+        )
         .route("/app-settings/config/decrypt", post(routes::app_settings::decrypt_config))
         .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
         // Cloud sync

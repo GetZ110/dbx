@@ -15,6 +15,7 @@ use crate::ai::{
     AiRunStatus,
 };
 use crate::connection_secrets::{
+    CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TLS_SECRET_PREFIX, CASSANDRA_TRUSTSTORE_PASSWORD_KEY,
     MQ_AUTH_API_KEY_VALUE_KEY, MQ_AUTH_CLIENT_SECRET_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_SECRET_PREFIX,
     MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, MQ_TOKEN_SIGNING_SECRET_PREFIX, NACOS_AUTH_PASSWORD_KEY,
     NACOS_AUTH_SECRET_PREFIX, NACOS_RNACOS_CONSOLE_PASSWORD_KEY,
@@ -38,6 +39,7 @@ const APP_STATE_TRANSFER_TASK_LIBRARY_KEY: &str = "transfer_task_library";
 const MCP_GLOBAL_POLICY_KEY: &str = "mcp_global_policy";
 const MCP_HTTP_SERVER_SETTINGS_KEY: &str = "mcp_http_server_settings";
 const MAX_RETRIES_KEY: &str = "max_retries";
+const SQL_FILE_UPLOAD_MAX_MB_KEY: &str = "sql_file_upload_max_mb";
 const APP_STATE_AI_GLOBAL_INSTRUCTIONS_KEY: &str = "ai_global_custom_instructions";
 const APP_STATE_AI_CHAT_SELECTION_KEY: &str = "ai_chat_selection_v1";
 const SNIPPET_SYNC_IDS_KEY: &str = "snippet_sync_ids";
@@ -234,6 +236,10 @@ pub struct McpGlobalPolicy {
     #[serde(default)]
     pub allow_dangerous_sql: bool,
     pub allowed_connection_ids: Option<Vec<String>>,
+    /// Stable sidebar group ids whose current descendant connections are
+    /// exposed when an explicit connection scope is configured.
+    #[serde(default)]
+    pub allowed_group_ids: Vec<String>,
     /// `None` exposes every built-in MCP tool. A list is an explicit
     /// allowlist and is enforced independently of connection permissions.
     #[serde(default)]
@@ -242,8 +248,23 @@ pub struct McpGlobalPolicy {
     /// the current execution policy version remain legacy ceilings.
     #[serde(default)]
     pub connection_policies: Vec<McpConnectionPolicy>,
+    /// Execution defaults inherited by every connection currently contained
+    /// in the referenced sidebar group. Nested groups are resolved from root
+    /// to leaf, so the closest configured group wins.
+    #[serde(default)]
+    pub group_policies: Vec<McpGroupPolicy>,
     #[serde(default)]
     pub query_timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpGroupPolicy {
+    pub group_id: String,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub allow_dangerous_sql: bool,
 }
 
 fn default_mcp_connection_execution_mode_configured() -> bool {
@@ -368,9 +389,13 @@ pub struct McpGlobalPolicyState {
     pub allow_dangerous_sql: bool,
     pub allowed_connection_ids: Option<Vec<String>>,
     #[serde(default)]
+    pub allowed_group_ids: Vec<String>,
+    #[serde(default)]
     pub allowed_tool_names: Option<Vec<String>>,
     #[serde(default)]
     pub connection_policies: Vec<McpConnectionPolicy>,
+    #[serde(default)]
+    pub group_policies: Vec<McpGroupPolicy>,
     #[serde(default)]
     pub query_timeout_secs: Option<u64>,
 }
@@ -381,8 +406,10 @@ impl McpGlobalPolicyState {
             read_only: self.read_only,
             allow_dangerous_sql: self.allow_dangerous_sql,
             allowed_connection_ids: self.allowed_connection_ids.clone(),
+            allowed_group_ids: self.allowed_group_ids.clone(),
             allowed_tool_names: self.allowed_tool_names.clone(),
             connection_policies: self.connection_policies.clone(),
+            group_policies: self.group_policies.clone(),
             query_timeout_secs: self.query_timeout_secs,
         }
     }
@@ -400,6 +427,8 @@ impl McpGlobalPolicy {
             ids.dedup();
             ids
         });
+        let allowed_group_ids =
+            if allowed_connection_ids.is_some() { normalize_mcp_ids(&self.allowed_group_ids) } else { Vec::new() };
         let allowed_tool_names = self.allowed_tool_names.as_ref().map(|tools| {
             let mut tools = tools
                 .iter()
@@ -481,15 +510,50 @@ impl McpGlobalPolicy {
             }
         }
 
+        let mut group_policies = HashMap::<String, McpGroupPolicy>::new();
+        for rule in &self.group_policies {
+            let group_id = rule.group_id.trim();
+            if group_id.is_empty() {
+                continue;
+            }
+            group_policies
+                .entry(group_id.to_string())
+                .and_modify(|current| {
+                    current.read_only |= rule.read_only;
+                    current.allow_dangerous_sql &= rule.allow_dangerous_sql;
+                })
+                .or_insert_with(|| McpGroupPolicy {
+                    group_id: group_id.to_string(),
+                    read_only: rule.read_only,
+                    allow_dangerous_sql: !rule.read_only && rule.allow_dangerous_sql,
+                });
+        }
+        let mut group_policies = group_policies.into_values().collect::<Vec<_>>();
+        group_policies.sort_by(|left, right| left.group_id.cmp(&right.group_id));
+        for rule in &mut group_policies {
+            if rule.read_only {
+                rule.allow_dangerous_sql = false;
+            }
+        }
+
         Self {
             read_only: self.read_only,
             allow_dangerous_sql: !self.read_only && self.allow_dangerous_sql,
             allowed_connection_ids,
+            allowed_group_ids,
             allowed_tool_names,
             connection_policies,
+            group_policies,
             query_timeout_secs: self.query_timeout_secs,
         }
     }
+}
+
+fn normalize_mcp_ids(ids: &[String]) -> Vec<String> {
+    let mut ids = ids.iter().map(|id| id.trim()).filter(|id| !id.is_empty()).map(ToOwned::to_owned).collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn normalize_mcp_database_names(databases: &[String]) -> Vec<String> {
@@ -1299,6 +1363,17 @@ fn scrub_nacos_auth_secrets(config: &mut ConnectionConfig) {
     }
 }
 
+fn scrub_cassandra_tls_secrets(config: &mut ConnectionConfig) {
+    if config.db_type != DatabaseType::Cassandra {
+        return;
+    }
+    let Some(tls) = cassandra_tls_object_mut(config.external_config.as_mut()) else {
+        return;
+    };
+    scrub_json_secret(tls, "truststore_password");
+    scrub_json_secret(tls, "keystore_password");
+}
+
 fn delete_secret_prefix_in_tx(
     tx: &rusqlite::Transaction<'_>,
     connection_id: &str,
@@ -1988,7 +2063,7 @@ impl Storage {
                 .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
                 .optional()
                 .map_err(|e| e.to_string())?;
-            let dedicated_keys = [MCP_GLOBAL_POLICY_KEY, MAX_RETRIES_KEY];
+            let dedicated_keys = [MCP_GLOBAL_POLICY_KEY, MAX_RETRIES_KEY, SQL_FILE_UPLOAD_MAX_MB_KEY];
             for key in dedicated_keys {
                 settings.remove(key);
             }
@@ -2034,8 +2109,10 @@ impl Storage {
                         read_only: policy.read_only,
                         allow_dangerous_sql: policy.allow_dangerous_sql,
                         allowed_connection_ids: policy.allowed_connection_ids,
+                        allowed_group_ids: policy.allowed_group_ids,
                         allowed_tool_names: policy.allowed_tool_names,
                         connection_policies: policy.connection_policies,
+                        group_policies: policy.group_policies,
                         query_timeout_secs: policy.query_timeout_secs,
                     });
                 };
@@ -2048,8 +2125,10 @@ impl Storage {
                         read_only: policy.read_only,
                         allow_dangerous_sql: policy.allow_dangerous_sql,
                         allowed_connection_ids: policy.allowed_connection_ids,
+                        allowed_group_ids: policy.allowed_group_ids,
                         allowed_tool_names: policy.allowed_tool_names,
                         connection_policies: policy.connection_policies,
+                        group_policies: policy.group_policies,
                         query_timeout_secs: policy.query_timeout_secs,
                     });
                 };
@@ -2061,8 +2140,10 @@ impl Storage {
                     read_only: policy.read_only,
                     allow_dangerous_sql: policy.allow_dangerous_sql,
                     allowed_connection_ids: policy.allowed_connection_ids,
+                    allowed_group_ids: policy.allowed_group_ids,
                     allowed_tool_names: policy.allowed_tool_names,
                     connection_policies: policy.connection_policies,
+                    group_policies: policy.group_policies,
                     query_timeout_secs: policy.query_timeout_secs,
                 })
             })
@@ -2595,6 +2676,39 @@ impl Storage {
             .map(|value| crate::ai::clamp_max_retries(value.min(u32::MAX as u64) as u32))
             .unwrap_or(crate::ai::DEFAULT_MAX_RETRIES))
     }
+
+    pub async fn save_sql_file_upload_max_mb(&self, max_mb: u32) -> Result<(), String> {
+        let max_mb = crate::sql_file_import::clamp_sql_file_upload_max_mb(max_mb);
+        self.with_conn(move |conn| {
+            let current: Option<String> = conn
+                .query_row("SELECT settings_json FROM app_settings WHERE id = 1", [], |row| row.get(0))
+                .optional()
+                .map_err(|e| e.to_string())?;
+            let mut settings = match current {
+                Some(json) => serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&json)
+                    .map_err(|e| format!("invalid app settings JSON: {e}"))?,
+                None => serde_json::Map::new(),
+            };
+            settings.insert(
+                SQL_FILE_UPLOAD_MAX_MB_KEY.to_string(),
+                serde_json::Value::Number(serde_json::Number::from(max_mb)),
+            );
+            let json = serde_json::Value::Object(settings).to_string();
+            conn.execute("INSERT OR REPLACE INTO app_settings (id, settings_json) VALUES (1, ?1)", [json])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
+
+    pub async fn load_sql_file_upload_max_mb(&self) -> Result<u32, String> {
+        let settings = self.load_app_settings_json().await?;
+        Ok(settings
+            .get(SQL_FILE_UPLOAD_MAX_MB_KEY)
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| crate::sql_file_import::clamp_sql_file_upload_max_mb(value.min(u32::MAX as u64) as u32))
+            .unwrap_or(crate::sql_file_import::DEFAULT_SQL_FILE_UPLOAD_MAX_MB))
+    }
 }
 
 // AI Conversations
@@ -3052,7 +3166,24 @@ fn ensure_mcp_connection_change_allowed_in_tx(
         );
     }
     if let Some(connection_id) = target_connection_id {
-        if policy.allowed_connection_ids.as_ref().is_some_and(|ids| !ids.iter().any(|id| id == connection_id)) {
+        let group_paths = if crate::mcp_policy::policy_uses_connection_groups(&policy) {
+            let layout_json: Option<String> = tx
+                .query_row("SELECT layout_json FROM sidebar_layout WHERE id = 1", [], |row| row.get(0))
+                .optional()
+                .map_err(|error| format!("MCP_POLICY_UNAVAILABLE: {error}"))?;
+            layout_json
+                .map(|json| {
+                    let layout = serde_json::from_str(&json)
+                        .map_err(|error| format!("MCP_POLICY_UNAVAILABLE: invalid sidebar layout JSON: {error}"))?;
+                    crate::mcp_policy::connection_group_paths(&layout)
+                        .map_err(|error| format!("MCP_POLICY_UNAVAILABLE: {error}"))
+                })
+                .transpose()?
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        if !crate::mcp_policy::policy_allows_connection(&policy, group_paths.get(connection_id), connection_id) {
             return Err(format!(
                 "CONNECTION_OUT_OF_SCOPE: connection '{connection_id}' is not allowed by the current DBX MCP policy"
             ));
@@ -3071,6 +3202,7 @@ fn sanitized_connection_config(config: &ConnectionConfig) -> ConnectionConfig {
     scrub_mq_auth_secrets(&mut sanitized);
     scrub_mq_token_signing_secret(&mut sanitized);
     scrub_nacos_auth_secrets(&mut sanitized);
+    scrub_cassandra_tls_secrets(&mut sanitized);
     sanitized
 }
 
@@ -3146,7 +3278,8 @@ fn persist_connection_in_tx(tx: &rusqlite::Transaction<'_>, config: &ConnectionC
     }
     persist_mq_auth_secrets_in_tx(tx, &config)?;
     persist_mq_token_signing_secret_in_tx(tx, &config)?;
-    persist_nacos_auth_secrets_in_tx(tx, &config)
+    persist_nacos_auth_secrets_in_tx(tx, &config)?;
+    persist_cassandra_tls_secrets_in_tx(tx, &config)
 }
 
 fn insert_connection_copy_next_to_source(entries: &mut Vec<serde_json::Value>, source_id: &str, copy_id: &str) -> bool {
@@ -3281,6 +3414,7 @@ impl Storage {
                 scrub_mq_auth_secrets(&mut sanitized);
                 scrub_mq_token_signing_secret(&mut sanitized);
                 scrub_nacos_auth_secrets(&mut sanitized);
+                scrub_cassandra_tls_secrets(&mut sanitized);
                 let json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
 
                 tx.execute("INSERT INTO connections (id, config_json) VALUES (?1, ?2)", params![config_id, json])
@@ -3602,13 +3736,17 @@ impl Storage {
             let needs_mq_auth_rewrite = self.hydrate_mq_auth_secrets(&id, &mut config).await?;
             let needs_mq_token_signing_rewrite = self.hydrate_mq_token_signing_secret(&id, &mut config).await?;
             let needs_nacos_auth_rewrite = self.hydrate_nacos_auth_secret(&id, &mut config).await?;
-            let needs_external_secret_rewrite =
-                needs_mq_auth_rewrite || needs_mq_token_signing_rewrite || needs_nacos_auth_rewrite;
+            let needs_cassandra_tls_rewrite = self.hydrate_cassandra_tls_secrets(&id, &mut config).await?;
+            let needs_external_secret_rewrite = needs_mq_auth_rewrite
+                || needs_mq_token_signing_rewrite
+                || needs_nacos_auth_rewrite
+                || needs_cassandra_tls_rewrite;
             if needs_external_secret_rewrite {
                 let mut sanitized = config.clone().canonicalized();
                 scrub_mq_auth_secrets(&mut sanitized);
                 scrub_mq_token_signing_secret(&mut sanitized);
                 scrub_nacos_auth_secrets(&mut sanitized);
+                scrub_cassandra_tls_secrets(&mut sanitized);
                 let sanitized_json = serde_json::to_string(&sanitized).map_err(|e| e.to_string())?;
                 let update_id = id.clone();
                 self.with_conn(move |conn| {
@@ -3718,6 +3856,26 @@ impl Storage {
             }
         }
         Ok(rewritten)
+    }
+
+    async fn hydrate_cassandra_tls_secrets(
+        &self,
+        connection_id: &str,
+        config: &mut ConnectionConfig,
+    ) -> Result<bool, String> {
+        if config.db_type != DatabaseType::Cassandra {
+            return Ok(false);
+        }
+        let Some(tls) = cassandra_tls_object_mut(config.external_config.as_mut()) else {
+            return Ok(false);
+        };
+        let truststore_rewrite =
+            hydrate_mq_json_secret(self, connection_id, CASSANDRA_TRUSTSTORE_PASSWORD_KEY, tls, "truststore_password")
+                .await?;
+        let keystore_rewrite =
+            hydrate_mq_json_secret(self, connection_id, CASSANDRA_KEYSTORE_PASSWORD_KEY, tls, "keystore_password")
+                .await?;
+        Ok(truststore_rewrite || keystore_rewrite)
     }
 }
 
@@ -4985,6 +5143,32 @@ fn persist_nacos_auth_secrets_in_tx(tx: &rusqlite::Transaction<'_>, config: &Con
     Ok(())
 }
 
+fn persist_cassandra_tls_secrets_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    config: &ConnectionConfig,
+) -> Result<(), String> {
+    if config.db_type != DatabaseType::Cassandra {
+        delete_secret_prefix_in_tx(tx, &config.id, CASSANDRA_TLS_SECRET_PREFIX)?;
+        return Ok(());
+    }
+    let Some(tls) = cassandra_tls_object(config.external_config.as_ref()) else {
+        delete_secret_prefix_in_tx(tx, &config.id, CASSANDRA_TLS_SECRET_PREFIX)?;
+        return Ok(());
+    };
+    persist_secret_in_tx(
+        tx,
+        &config.id,
+        CASSANDRA_TRUSTSTORE_PASSWORD_KEY,
+        tls.get("truststore_password").and_then(serde_json::Value::as_str).unwrap_or(""),
+    )?;
+    persist_secret_in_tx(
+        tx,
+        &config.id,
+        CASSANDRA_KEYSTORE_PASSWORD_KEY,
+        tls.get("keystore_password").and_then(serde_json::Value::as_str).unwrap_or(""),
+    )
+}
+
 fn persist_json_secret_if_present_in_tx(
     tx: &rusqlite::Transaction<'_>,
     connection_id: &str,
@@ -5046,6 +5230,16 @@ fn mq_token_signing_object_mut(
     value?.get_mut("tokenSigning")?.as_object_mut()
 }
 
+fn cassandra_tls_object(value: Option<&serde_json::Value>) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value?.get("tls")?.as_object()
+}
+
+fn cassandra_tls_object_mut(
+    value: Option<&mut serde_json::Value>,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    value?.get_mut("tls")?.as_object_mut()
+}
+
 fn nacos_auth_object(value: Option<&serde_json::Value>) -> Option<&serde_json::Map<String, serde_json::Value>> {
     value?.get("auth")?.as_object()
 }
@@ -5105,7 +5299,8 @@ mod tests {
     };
     use crate::connection_secrets::NACOS_RNACOS_CONSOLE_PASSWORD_KEY;
     use crate::connection_secrets::{
-        MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY, MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
+        CASSANDRA_KEYSTORE_PASSWORD_KEY, CASSANDRA_TRUSTSTORE_PASSWORD_KEY, MQ_AUTH_PASSWORD_KEY, MQ_AUTH_TOKEN_KEY,
+        MQ_TOKEN_SIGNING_KEY, NACOS_AUTH_PASSWORD_KEY,
     };
     use crate::history::{HistoryConnectionFilter, HistoryDatabaseFilter, HistoryEntry, HistorySearchRequest};
     use crate::models::connection::{
@@ -5266,6 +5461,7 @@ mod tests {
                 mentions: None,
                 reasoning: None,
                 kind: None,
+                failed: None,
                 covered_messages: None,
             }],
             queued_input: None,
@@ -5722,6 +5918,57 @@ mod tests {
         .unwrap()
     }
 
+    fn cassandra_connection(id: &str) -> ConnectionConfig {
+        let mut config = plain_connection(id, "");
+        config.name = "Cassandra".to_string();
+        config.db_type = DatabaseType::Cassandra;
+        config.port = 9042;
+        config.ssl = true;
+        config.external_config = Some(serde_json::json!({
+            "tls": {
+                "truststore_path": "/certs/client.truststore",
+                "truststore_password": "trust-secret",
+                "keystore_path": "/certs/client.keystore",
+                "keystore_password": "key-secret"
+            }
+        }));
+        config
+    }
+
+    #[tokio::test]
+    async fn save_connections_moves_cassandra_tls_passwords_to_secret_table_and_restores_them() {
+        let path = temp_db_path("cassandra-tls-secrets");
+        let storage = Storage::open(&path).await.unwrap();
+
+        storage.save_connections(&[cassandra_connection("cassandra")]).await.unwrap();
+
+        let raw_json = raw_connection_json(&storage, "cassandra").await;
+        assert!(!raw_json.contains("trust-secret"));
+        assert!(!raw_json.contains("key-secret"));
+        assert_eq!(
+            storage.get_secret("cassandra", CASSANDRA_TRUSTSTORE_PASSWORD_KEY).await.unwrap().as_deref(),
+            Some("trust-secret")
+        );
+        assert_eq!(
+            storage.get_secret("cassandra", CASSANDRA_KEYSTORE_PASSWORD_KEY).await.unwrap().as_deref(),
+            Some("key-secret")
+        );
+
+        let loaded = storage.load_connections().await.unwrap();
+        let tls = loaded[0].external_config.as_ref().unwrap().get("tls").unwrap();
+        assert_eq!(tls["truststore_password"], "trust-secret");
+        assert_eq!(tls["keystore_password"], "key-secret");
+
+        let mut disabled = cassandra_connection("cassandra");
+        disabled.ssl = false;
+        disabled.external_config = None;
+        storage.save_connections(&[disabled]).await.unwrap();
+        assert_eq!(storage.get_secret("cassandra", CASSANDRA_TRUSTSTORE_PASSWORD_KEY).await.unwrap(), None);
+        assert_eq!(storage.get_secret("cassandra", CASSANDRA_KEYSTORE_PASSWORD_KEY).await.unwrap(), None);
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn save_connections_does_not_persist_password_when_save_password_false() {
         let path = temp_db_path("save-password-false");
@@ -5848,6 +6095,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -5917,6 +6165,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
             informix_server: String::new(),
@@ -6584,8 +6833,10 @@ mod tests {
                 read_only: false,
                 allow_dangerous_sql: false,
                 allowed_connection_ids: None,
+                allowed_group_ids: Vec::new(),
                 allowed_tool_names: None,
                 connection_policies: Vec::new(),
+                group_policies: Vec::new(),
                 query_timeout_secs: None,
             }
         );
@@ -6609,8 +6860,10 @@ mod tests {
                 read_only: true,
                 allow_dangerous_sql: false,
                 allowed_connection_ids: Some(vec!["conn-1".to_string(), "conn-2".to_string()]),
+                allowed_group_ids: Vec::new(),
                 allowed_tool_names: None,
                 connection_policies: Vec::new(),
+                group_policies: Vec::new(),
                 query_timeout_secs: Some(120),
             }
         );
@@ -7108,6 +7361,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sql_file_upload_max_mb_defaults_and_persists_clamped() {
+        let path = temp_db_path("sql-file-upload-max-mb");
+        let storage = Storage::open(&path).await.unwrap();
+
+        assert_eq!(
+            storage.load_sql_file_upload_max_mb().await.unwrap(),
+            crate::sql_file_import::DEFAULT_SQL_FILE_UPLOAD_MAX_MB
+        );
+
+        storage.save_sql_file_upload_max_mb(512).await.unwrap();
+        assert_eq!(storage.load_sql_file_upload_max_mb().await.unwrap(), 512);
+
+        // Values above the cap are clamped so raw DB edits cannot bypass the limit.
+        storage.save_sql_file_upload_max_mb(u32::MAX).await.unwrap();
+        assert_eq!(
+            storage.load_sql_file_upload_max_mb().await.unwrap(),
+            crate::sql_file_import::MAX_SQL_FILE_UPLOAD_MAX_MB
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_file_upload_max_mb_survives_stale_app_settings_save() {
+        let path = temp_db_path("sql-file-upload-max-mb-stale-save");
+        let storage = Storage::open(&path).await.unwrap();
+        let stale_settings = storage.load_app_settings_json().await.unwrap();
+
+        storage.save_sql_file_upload_max_mb(256).await.unwrap();
+        storage.save_app_settings_json(&stale_settings).await.unwrap();
+
+        assert_eq!(storage.load_sql_file_upload_max_mb().await.unwrap(), 256);
+    }
+
+    #[tokio::test]
     async fn password_hash_preserves_existing_desktop_settings() {
         let path = temp_db_path("password-preserve-desktop-settings");
         let storage = Storage::open(&path).await.unwrap();
@@ -7243,6 +7529,7 @@ mod tests {
                 selection: AiEffortSelection::Enum("high".to_string()),
             }],
             default_mode: Some(AiAssistantMode::Agent),
+            restore_last_conversation: true,
             default_templates_by_db_type: BTreeMap::from([("postgresql".to_string(), vec!["tpl-1".to_string()])]),
             last_used_templates_by_db_type: BTreeMap::from([("mysql".to_string(), vec!["tpl-2".to_string()])]),
         };
@@ -7580,6 +7867,7 @@ mod tests {
                 custom_headers: Default::default(),
                 proxy_enabled: false,
                 proxy_url: String::new(),
+                skip_tls_verify: false,
                 enable_thinking: true,
                 reasoning_level: AiReasoningLevel::Default,
                 max_output_tokens: None,

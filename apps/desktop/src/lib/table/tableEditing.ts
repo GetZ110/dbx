@@ -9,6 +9,10 @@ function isViewTableType(tableType?: string): boolean {
   return tableType?.toUpperCase().includes("VIEW") === true;
 }
 
+function isKnownOracleBaseTableType(tableType?: string): boolean {
+  return tableType?.trim().toUpperCase() === "TABLE";
+}
+
 export function isTdengineStableTableType(tableType?: string): boolean {
   const normalized = tableType?.trim().toUpperCase();
   return normalized === "STABLE" || normalized === "SUPER TABLE" || normalized === "SUPERTABLE";
@@ -19,7 +23,8 @@ export function editablePrimaryKeys(databaseType: DatabaseType | undefined, colu
   if (isViewTableType(tableType)) return primaryKeys;
   if (databaseType === "tdengine" && primaryKeys.length > 0 && isTdengineStableTableType(tableType)) return [DBX_TDENGINE_TBNAME_COLUMN, ...primaryKeys];
   const syntheticKey = getDatabaseCapability(databaseType).syntheticKey;
-  if (syntheticKey === "oracle-rowid" && primaryKeys.length === 0) return [DBX_ROWID_COLUMN];
+  if (syntheticKey === "oracle-rowid" && primaryKeys.length === 0 && isKnownOracleBaseTableType(tableType)) return [DBX_ROWID_COLUMN];
+  if (syntheticKey === "xugu-rowid" && primaryKeys.length === 0) return [DBX_ROWID_COLUMN];
   if (syntheticKey === "neo4j-element-id" && primaryKeys.length === 0) return [DBX_NEO4J_ELEMENT_ID_COLUMN];
   return primaryKeys;
 }
@@ -93,12 +98,26 @@ export function hiveTablePropertiesIndicateTransactional(result: { rows: readonl
 export function usesSyntheticRowIdKey(databaseType: DatabaseType | undefined, primaryKeys: string[], tableType?: string): boolean {
   if (isViewTableType(tableType)) return false;
   const syntheticKey = getDatabaseCapability(databaseType).syntheticKey;
-  return primaryKeys.length === 1 && ((syntheticKey === "oracle-rowid" && primaryKeys[0].toUpperCase() === DBX_ROWID_COLUMN) || (syntheticKey === "neo4j-element-id" && primaryKeys[0] === DBX_NEO4J_ELEMENT_ID_COLUMN));
+  if (primaryKeys.length !== 1) return false;
+  if (syntheticKey === "oracle-rowid" || syntheticKey === "xugu-rowid") return primaryKeys[0].toUpperCase() === DBX_ROWID_COLUMN;
+  return syntheticKey === "neo4j-element-id" && primaryKeys[0] === DBX_NEO4J_ELEMENT_ID_COLUMN;
+}
+
+/**
+ * Table-data tabs may start before metadata has populated declared primary keys.
+ * Xugu base/partitioned/temp tables can still be addressed safely with ROWID,
+ * so request the hidden projection during that cold-cache window as well.
+ */
+export function shouldIncludeSyntheticRowId(databaseType: DatabaseType | undefined, primaryKeys: string[], tableType?: string): boolean {
+  if (isViewTableType(tableType)) return false;
+  if (getDatabaseCapability(databaseType).syntheticKey === "oracle-rowid" && !isKnownOracleBaseTableType(tableType)) return false;
+  if (usesSyntheticRowIdKey(databaseType, primaryKeys, tableType)) return true;
+  return databaseType === "xugu" && primaryKeys.length === 0;
 }
 
 export function isHiddenGridColumn(databaseType: DatabaseType | undefined, column: string, primaryKeys: string[], tableType?: string): boolean {
   if (databaseType === "neo4j" && column === DBX_NEO4J_ELEMENT_ID_COLUMN) return true;
-  return usesSyntheticRowIdKey(databaseType, primaryKeys, tableType) && column.toUpperCase() === DBX_ROWID_COLUMN;
+  return shouldIncludeSyntheticRowId(databaseType, primaryKeys, tableType) && column.toUpperCase() === DBX_ROWID_COLUMN;
 }
 
 export function isTdengineExistingRowReadonlyColumn(databaseType: DatabaseType | undefined, column: string, columns: ColumnInfo[]): boolean {

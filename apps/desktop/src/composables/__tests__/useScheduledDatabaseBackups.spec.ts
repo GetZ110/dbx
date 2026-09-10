@@ -70,6 +70,75 @@ const config: DatabaseBackupExecutionConfig = {
 };
 
 describe("useScheduledDatabaseBackups one-shot execution", () => {
+  it("deletes multiple completed runs and all of their backup files", async () => {
+    const backup = useScheduledDatabaseBackups();
+    const firstRun = {
+      id: "delete-many-first",
+      scheduleName: "First backup",
+      connectionId: "mysql-1",
+      connectionName: "Local MySQL",
+      destinationDirectory: "/backups",
+      trigger: "scheduled",
+      source: "scheduled",
+      status: "success",
+      startedAt: "2026-09-08T01:00:00.000Z",
+      files: [{ displayName: "first.sql", filePath: "/backups/first.sql" }],
+    } satisfies DatabaseBackupRun;
+    const secondRun = {
+      id: "delete-many-second",
+      scheduleName: "Second backup",
+      connectionId: "mysql-1",
+      connectionName: "Local MySQL",
+      destinationDirectory: "/backups",
+      trigger: "scheduled",
+      source: "scheduled",
+      status: "failed",
+      startedAt: "2026-09-08T02:00:00.000Z",
+      files: [{ displayName: "second.sql", filePath: "/backups/second.sql" }],
+    } satisfies DatabaseBackupRun;
+    backup.runs.value.push(firstRun, secondRun);
+    mocks.deleteFiles.mockClear();
+
+    try {
+      await backup.deleteRuns([firstRun.id, secondRun.id]);
+
+      expect(mocks.deleteFiles).toHaveBeenCalledWith(["/backups/first.sql", "/backups/second.sql"], ["/backups"]);
+      expect(backup.runs.value).not.toContainEqual(expect.objectContaining({ id: firstRun.id }));
+      expect(backup.runs.value).not.toContainEqual(expect.objectContaining({ id: secondRun.id }));
+    } finally {
+      backup.runs.value = backup.runs.value.filter((run) => run.id !== firstRun.id && run.id !== secondRun.id);
+    }
+  });
+
+  it("keeps a shared backup path when deleting one of its history records", async () => {
+    const backup = useScheduledDatabaseBackups();
+    const sharedPath = "/backups/before-migration__app.sql";
+    const firstRun = {
+      id: "shared-path-first",
+      scheduleName: "First backup",
+      connectionId: "mysql-1",
+      connectionName: "Local MySQL",
+      trigger: "scheduled",
+      source: "scheduled",
+      status: "success",
+      startedAt: "2026-09-08T01:00:00.000Z",
+      files: [{ displayName: "first.sql", filePath: sharedPath }],
+    } satisfies DatabaseBackupRun;
+    const secondRun = { ...firstRun, id: "shared-path-second", startedAt: "2026-09-08T02:00:00.000Z" } satisfies DatabaseBackupRun;
+    backup.runs.value.push(firstRun, secondRun);
+    mocks.deleteFiles.mockClear();
+
+    try {
+      await backup.deleteRun(firstRun.id);
+
+      expect(mocks.deleteFiles).not.toHaveBeenCalled();
+      expect(backup.runs.value).not.toContainEqual(expect.objectContaining({ id: firstRun.id }));
+      expect(backup.runs.value).toContainEqual(expect.objectContaining({ id: secondRun.id }));
+    } finally {
+      backup.runs.value = backup.runs.value.filter((run) => run.id !== firstRun.id && run.id !== secondRun.id);
+    }
+  });
+
   it("executes one-shot backups through the shared exporter without a schedule", async () => {
     mocks.runDatabaseExport.mockImplementationOnce(async (_request: unknown, onProgress: (progress: unknown) => void) => {
       onProgress({ status: "Done", objectIndex: 1, totalObjects: 1, currentObject: "app" });
@@ -83,7 +152,44 @@ describe("useScheduledDatabaseBackups one-shot execution", () => {
     expect(run).toEqual(expect.objectContaining({ status: "success", source: "one-shot", trigger: "manual", scheduleId: undefined }));
     expect(run).not.toHaveProperty("nextRunAt");
     expect(backup.schedules.value).toHaveLength(scheduleCountBefore);
+    expect(mocks.runDatabaseExport).toHaveBeenCalledWith(expect.objectContaining({ preventOverwrite: true }), expect.any(Function));
     expect(mocks.addTask).toHaveBeenCalledWith(expect.any(String), "One-time backup", "/backups", "manual");
+  });
+
+  it("rejects a repeated one-shot when its custom file name resolves to an existing path", async () => {
+    mocks.runDatabaseExport.mockImplementation(async (_request: unknown, onProgress: (progress: unknown) => void) => {
+      const progress = { status: "Done", objectIndex: 1, totalObjects: 1, currentObject: "app" };
+      onProgress(progress);
+      return progress;
+    });
+    const backup = useScheduledDatabaseBackups();
+    const customConfig = { ...config, fileNamePattern: "before-migration" };
+    let runIds: string[] = [];
+
+    try {
+      const firstRun = await backup.runOneShot(customConfig, "One-time backup");
+      runIds = [firstRun?.id].filter((id): id is string => Boolean(id));
+      const exportCallCount = mocks.runDatabaseExport.mock.calls.length;
+      const secondRun = await backup.runOneShot(customConfig, "One-time backup");
+      if (secondRun?.id) runIds.push(secondRun.id);
+
+      expect(firstRun).toEqual(expect.objectContaining({ status: "success" }));
+      expect(secondRun).toEqual(expect.objectContaining({ status: "failed", files: [] }));
+      expect(secondRun?.error).toContain("already used by another run");
+      expect(mocks.runDatabaseExport).toHaveBeenCalledTimes(exportCallCount);
+    } finally {
+      const ids = new Set(runIds);
+      backup.runs.value = backup.runs.value.filter((run) => !ids.has(run.id));
+    }
+  });
+
+  it("does not delete a pre-existing file when the exporter rejects overwrite", async () => {
+    mocks.runDatabaseExport.mockRejectedValueOnce(new Error("Backup file already exists: /backups/before-migration__app.sql"));
+    const backup = useScheduledDatabaseBackups();
+    const result = await backup.runOneShot({ ...config, fileNamePattern: "before-migration" }, "One-time backup");
+
+    expect(result).toEqual(expect.objectContaining({ status: "failed", files: [] }));
+    expect(mocks.deleteFiles).not.toHaveBeenCalled();
   });
 
   it("prevents a second one-shot while one is already running", async () => {
@@ -143,7 +249,7 @@ describe("useScheduledDatabaseBackups one-shot execution", () => {
 
     const finishedRun = await pendingRun;
     expect(finishedRun).toEqual(expect.objectContaining({ status: "cancelled", source: "one-shot", files: [] }));
-    expect(mocks.deleteFiles).toHaveBeenCalledWith([expect.stringContaining(activeRunId!)]);
+    expect(mocks.deleteFiles).toHaveBeenCalledWith([expect.stringContaining(activeRunId!)], ["/backups"]);
     expect(backup.runs.value.find((run) => run.id === activeRunId)).toEqual(expect.objectContaining({ status: "cancelled", files: [] }));
     expect(backup.cancellingRunIds.has(activeRunId!)).toBe(false);
   });

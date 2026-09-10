@@ -1,4 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
+import { assertUpdateAllowsCommand } from "@/lib/app/updatePreparation";
+
+function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  assertUpdateAllowsCommand(command);
+  return tauriInvoke<T>(command, args);
+}
 import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
 import { BackendErrorException, type BackendError } from "@/lib/backend/errorUtils";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -9,6 +15,7 @@ import { decodeMeilisearchDocumentPage, decodeMeilisearchSearchResult, type Meil
 import type { XuguTablespaceInfo } from "@/types/database";
 import type { CreatedKey, EnqueuedTaskSummary, KeyCreateInput, KeyListItem, KeyPage, KeyUpdateInput, MeilisearchSystemOverview, MeilisearchTask, TaskListInput, TaskPage, TaskSelector } from "@/types/meilisearchManagement";
 import type { CsvQuoteMode } from "@/lib/export/csvQuoteMode";
+import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
 
 /** Normalize Tauri rejections once at the public backend boundary. */
 async function invokeBackend<T>(command: string, args?: Record<string, unknown>): Promise<T> {
@@ -249,10 +256,18 @@ export interface McpGlobalPolicy {
   readOnly: boolean;
   allowDangerousSql: boolean;
   allowedConnectionIds: string[] | null;
+  allowedGroupIds: string[];
   allowedToolNames: string[] | null;
   connectionPolicies: McpConnectionPolicy[];
+  groupPolicies: McpGroupPolicy[];
   configured: boolean;
   queryTimeoutSecs: number | null;
+}
+
+export interface McpGroupPolicy {
+  groupId: string;
+  readOnly: boolean;
+  allowDangerousSql: boolean;
 }
 
 export interface McpConnectionPolicy {
@@ -708,6 +723,14 @@ export async function loadMaxAgentTurns(): Promise<number> {
   return invoke("load_max_agent_turns");
 }
 
+export async function loadSqlFileUploadMaxBytes(): Promise<number> {
+  return 200 * 1024 * 1024;
+}
+
+export async function saveSqlFileUploadMaxMb(_sqlFileUploadMaxMb: number): Promise<void> {
+  // No-op on desktop: SQL files are streamed directly from disk, no server upload cap applies.
+}
+
 export async function saveMaxAgentTurns(maxAgentTurns: number): Promise<void> {
   return invoke("save_max_agent_turns", { maxAgentTurns });
 }
@@ -720,10 +743,8 @@ export async function saveMaxRetries(maxRetries: number): Promise<void> {
   return invoke("save_max_retries", { maxRetries });
 }
 
-export interface OpenTabsStatePayload {
-  tabs: unknown[];
-  activeTabId: string | null;
-}
+export type { OpenTabsStatePayload, PersistedEditorGroup } from "@/lib/app/openTabsPersistence";
+import type { OpenTabsStatePayload } from "@/lib/app/openTabsPersistence";
 
 export async function loadEditorSettings(): Promise<unknown | null> {
   return invoke("load_editor_settings");
@@ -731,6 +752,27 @@ export async function loadEditorSettings(): Promise<unknown | null> {
 
 export async function saveEditorSettings(settings: unknown): Promise<void> {
   return invoke("save_editor_settings", { settings });
+}
+
+export interface BackgroundImageInfo {
+  storedPath: string;
+  fileName: string;
+}
+
+export async function saveBackgroundImage(sourcePath: string): Promise<BackgroundImageInfo> {
+  return invoke("save_background_image", { sourcePath });
+}
+
+export async function clearBackgroundImage(storedPath: string): Promise<void> {
+  return invoke("clear_background_image", { storedPath });
+}
+
+export async function readBackgroundImage(storedPath: string): Promise<string> {
+  return invoke("read_background_image", { storedPath });
+}
+
+export async function checkBackgroundImage(storedPath: string): Promise<boolean> {
+  return invoke("check_background_image", { storedPath });
 }
 
 export async function loadOpenTabsState(): Promise<OpenTabsStatePayload | null> {
@@ -942,16 +984,16 @@ export type ExternalSqlFileStatus = { kind: "present"; sizeBytes: number; modifi
 
 export type ExternalSqlFileWriteResult = { kind: "written"; version: ExternalSqlFileVersion } | { kind: "conflict"; currentVersion: ExternalSqlFileVersion } | { kind: "missing" };
 
-export async function readExternalSqlFileSnapshot(path: string): Promise<ExternalSqlFileSnapshot> {
-  const result = await invoke<{ kind: "content"; content: string; version: ExternalSqlFileVersion } | { kind: "tooLarge"; sizeBytes: number; maxSizeBytes: number }>("read_external_sql_file", { path });
+export async function readExternalSqlFileSnapshot(path: string, maxSizeBytes?: number): Promise<ExternalSqlFileSnapshot> {
+  const result = await invoke<{ kind: "content"; content: string; version: ExternalSqlFileVersion } | { kind: "tooLarge"; sizeBytes: number; maxSizeBytes: number }>("read_external_sql_file", { path, maxSizeBytes });
   if (result.kind === "tooLarge") {
     throw new ExternalSqlFileTooLargeError(result.sizeBytes, result.maxSizeBytes);
   }
   return { content: result.content, version: result.version };
 }
 
-export async function readExternalSqlFile(path: string): Promise<string> {
-  return (await readExternalSqlFileSnapshot(path)).content;
+export async function readExternalSqlFile(path: string, maxSizeBytes?: number): Promise<string> {
+  return (await readExternalSqlFileSnapshot(path, maxSizeBytes)).content;
 }
 
 export async function inspectExternalSqlFile(path: string): Promise<ExternalSqlFileStatus> {
@@ -1002,6 +1044,8 @@ export interface AiChatMessage {
   mentions?: unknown[];
   reasoning?: string;
   kind?: "contextSummary" | "writeSqlConfirmation" | "productionWriteBlocked";
+  /** Set on the assistant message whose generation failed; persisted (mirrors dbx-core `AiChatMessage.failed`). */
+  failed?: boolean;
 }
 
 export interface AiConversation {
@@ -1833,11 +1877,23 @@ export async function analyzeEditableQueryEditability(sql: string): Promise<Quer
   return invoke("analyze_editable_query_editability", { sql });
 }
 
+/// A server-side check that must pass before `statements` may run. Without a
+/// primary key a row is addressed by matching every column value, so the same
+/// predicate can match rows outside the loaded page; `sql` counts the matches
+/// of a predicate the save actually sends, and the save must be refused with
+/// `message` unless the returned count is at most `maxMatchedRows`.
+export interface DataGridSaveGuard {
+  sql: string;
+  maxMatchedRows: number;
+  message: string;
+}
+
 export interface DataGridSavePreparation {
   validationError?: string;
   statements: string[];
   rollbackStatements: string[];
   executionSchema?: string;
+  keylessGuards?: DataGridSaveGuard[];
 }
 
 export async function prepareDataGridSave(options: DataGridSaveStatementOptions, driverProfile?: string): Promise<DataGridSavePreparation> {
@@ -2377,8 +2433,8 @@ export async function revealPathInFileManager(path: string): Promise<void> {
   return invoke("reveal_path_in_file_manager", { path });
 }
 
-export async function deleteDatabaseBackupFiles(paths: string[]): Promise<number> {
-  return invoke("delete_database_backup_files", { paths });
+export async function deleteDatabaseBackupFiles(paths: string[], allowedRoots: string[] = []): Promise<number> {
+  return invoke("delete_database_backup_files", { paths, allowedRoots });
 }
 
 export async function isSqliteDatabaseFile(path: string): Promise<boolean> {
@@ -2419,7 +2475,18 @@ export interface UpdateInfo {
 
 export type UpdateDownloadSource = "official" | "cnb";
 
+export interface DownloadedUpdate {
+  cache_id: string;
+  version: string;
+  portable_mode: boolean;
+  release_url: string;
+  release_notes: string;
+  downloaded_at: number;
+}
+
 export interface UpdateDownloadProgress {
+  attempt_id: string;
+  version: string;
   downloaded: number;
   total: number | null;
 }
@@ -2466,16 +2533,24 @@ export async function getSystemProxyUrl(): Promise<string | null> {
   return invoke("get_system_proxy_url");
 }
 
-export async function downloadUpdate(source: UpdateDownloadSource, latestVersion?: string): Promise<void> {
-  return invoke("download_update", { source, latestVersion });
+export async function downloadUpdate(source: UpdateDownloadSource, latestVersion: string, attemptId: string, releaseNotes?: string): Promise<DownloadedUpdate> {
+  return invoke("download_update", { source, latestVersion, attemptId, releaseNotes });
 }
 
 export async function cancelUpdateDownload(): Promise<void> {
   return invoke("cancel_update_download");
 }
 
-export async function installDownloadedUpdate(): Promise<void> {
-  return invoke("install_downloaded_update");
+export async function getDownloadedUpdate(): Promise<DownloadedUpdate | null> {
+  return invoke("get_downloaded_update");
+}
+
+export async function discardDownloadedUpdate(cacheId: string): Promise<void> {
+  return invoke("discard_downloaded_update", { cacheId });
+}
+
+export async function installDownloadedUpdate(cacheId: string, expectedVersion: string): Promise<void> {
+  return invoke("install_downloaded_update", { cacheId, expectedVersion });
 }
 
 export async function getAppVersion(): Promise<string> {
@@ -2851,9 +2926,9 @@ export async function redisPubSubPublish(connectionId: string, db: number, chann
   return invoke("redis_pubsub_publish", { connectionId, db, channel, message });
 }
 
-export async function redisPubSubConnect(connectionId: string): Promise<WebSocket> {
+export async function redisPubSubConnect(connectionId: string, monitor = false): Promise<WebSocket> {
   const port = await invoke<number>("redis_pubsub_server_port");
-  return new WebSocket(`ws://127.0.0.1:${port}/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}`);
+  return new WebSocket(`ws://127.0.0.1:${port}/api/redis/pubsub/ws?connectionId=${encodeURIComponent(connectionId)}&monitor=${monitor}`);
 }
 
 export async function redisSlowlogGet(connectionId: string, count: number, nodeHost?: string, nodePort?: number): Promise<RedisSlowlogEntry[]> {
@@ -3142,6 +3217,7 @@ export interface EtcdAuthUserListResponse {
 export interface EtcdAuthUserDetail {
   user: string;
   roles: string[];
+  authEnabled?: boolean;
 }
 export interface EtcdAuthPermission {
   access: "read" | "write" | "readwrite";
@@ -4583,11 +4659,17 @@ export interface TransferRequest {
   quoteTargetColumnNames: boolean;
   ownershipPolicy?: TransferOwnershipPolicy;
   batchSize: number;
+  dropTargetBeforeCreate: boolean;
+  dropTargetConfirmed: boolean;
 }
 
 export interface TransferOwnershipPreview {
   missingOwners: string[];
   targetOwner: string;
+  rebuild?: {
+    sql: string;
+    tables: Array<{ sourceTable: string; targetTable: string; backupTable?: string }>;
+  };
 }
 
 export interface TransferProgress {
@@ -4805,6 +4887,7 @@ export interface DatabaseExportRequest {
   dropTableIfExists?: boolean;
   omitAutoIncrement?: boolean;
   failOnError?: boolean;
+  preventOverwrite?: boolean;
   outputCompression?: "none" | "gzip";
   snapshotSessionId?: string;
   batchSize: number;
@@ -4826,6 +4909,10 @@ export interface ExportProgress {
   error: string | null;
   /** True while listing schema / prefetching metadata before objects are written. */
   preparing?: boolean;
+  /** Per-object failures written into the file as `-- ERROR` comments (lenient mode). */
+  errorCount?: number;
+  /** First lenient failure, for completion warnings without opening the file. */
+  errorSummary?: string | null;
 }
 
 // --- Table Export ---
@@ -4840,6 +4927,7 @@ export interface TableExportRequest {
   tableName: string;
   filePath: string;
   format: "csv" | "xlsx" | "json" | "markdown" | "sql" | "txt";
+  insertMode?: SqlInsertMode;
   csvQuoteMode?: CsvQuoteMode;
   columns?: string[];
   columnTypes?: Array<string | null | undefined>;
@@ -4889,6 +4977,7 @@ export interface QueryResultExportRequest {
   useAgentCursor: boolean;
   filePath: string;
   format: "csv" | "xlsx" | "txt" | "sql";
+  insertMode?: SqlInsertMode;
   csvQuoteMode?: CsvQuoteMode;
   includeSqlSheet?: boolean;
   pageSize: number;
@@ -5029,6 +5118,10 @@ export async function clearDatabaseExportCancellation(exportId: string): Promise
   await invoke("clear_database_export_cancellation", { exportId });
 }
 
+export async function databaseExportDestinationNeedsConfirmation(directory: string): Promise<boolean> {
+  return invoke("database_export_destination_needs_confirmation", { directory });
+}
+
 export async function recordDatabaseExportDestination(directory: string): Promise<void> {
   await invoke("record_database_export_destination", { directory });
 }
@@ -5057,6 +5150,7 @@ export async function exportQueryResultXlsx(
   rows: readonly (readonly XlsxCellValue[])[],
   numericColumnRightAlign?: boolean,
   autoFilter?: boolean,
+  dateTimeFormat?: string,
 ): Promise<void> {
   return invoke("export_query_result_xlsx", {
     request: {
@@ -5068,6 +5162,7 @@ export async function exportQueryResultXlsx(
       rows,
       numericColumnRightAlign,
       autoFilter,
+      dateTimeFormat,
     },
   });
 }
@@ -5084,12 +5179,14 @@ export async function exportQueryResultsXlsx(
     autoFilter?: boolean;
   }[],
   autoFilter?: boolean,
+  dateTimeFormat?: string,
 ): Promise<void> {
   return invoke("export_query_results_xlsx", {
     request: {
       filePath,
       worksheets,
       autoFilter,
+      dateTimeFormat,
     },
   });
 }
