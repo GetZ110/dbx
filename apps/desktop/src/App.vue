@@ -1168,6 +1168,16 @@ const saveSqlFolders = computed(() => {
 
 const uiScaleApplyQueue = createUiScaleApplyQueue(
   async (scale) => {
+    // Page zoom is another Tauri-only path (see initializeUpdatePreparation).
+    // ArkWeb's WebviewController exposes no zoom-factor API, and the HarmonyOS
+    // runtime deliberately never sets `__TAURI_INTERNALS__`, so the Tauri call
+    // below rejected there and logged "[DBX] Failed to apply UI scale" on every
+    // mount. Chromium's CSS `zoom` on the root element gives the same whole-page
+    // scaling, so use it for every non-Tauri runtime.
+    if (!isTauriRuntime()) {
+      applyUiScaleWithCss(scale);
+      return;
+    }
     const { getCurrentWebview } = await import("@tauri-apps/api/webview");
     await getCurrentWebview().setZoom(scale);
   },
@@ -1178,6 +1188,21 @@ const uiScaleApplyQueue = createUiScaleApplyQueue(
     console.warn("[DBX] Failed to apply UI scale", { scale, error });
   },
 );
+
+/**
+ * Whole-page zoom fallback for runtimes without a native webview zoom API
+ * (HarmonyOS/ArkWeb). Scaling the root element keeps existing layouts and
+ * `position: fixed` overlays consistent with the webview zoom it replaces.
+ */
+function applyUiScaleWithCss(scale: number) {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  if (!Number.isFinite(scale) || scale <= 0 || Math.abs(scale - 1) < 0.0001) {
+    root.style.removeProperty("zoom");
+    return;
+  }
+  root.style.setProperty("zoom", String(scale));
+}
 
 function applyUiScale(scale: number) {
   if (isDesktop) uiScaleApplyQueue.request(scale);

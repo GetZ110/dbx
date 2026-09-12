@@ -38,6 +38,9 @@ pub fn start_server(options: ServerOptions) -> napi_ohos::Result<u16> {
   std::env::set_var("DBX_PORT", port.to_string());
   std::env::set_var("DBX_STATIC_DIR", static_dir);
   std::env::set_var("DBX_DATA_DIR", data_dir);
+  // The embedded server runs with authentication disabled, so it must stay on
+  // the loopback interface instead of the standalone default of 0.0.0.0.
+  std::env::set_var("DBX_BIND_HOST", "127.0.0.1");
   if disable_password {
     std::env::set_var("DBX_DISABLE_PASSWORD", "1");
   } else {

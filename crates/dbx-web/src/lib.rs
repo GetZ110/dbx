@@ -12,10 +12,12 @@ use std::sync::Arc;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
-use axum::extract::DefaultBodyLimit;
-use axum::http::Uri;
+use axum::body::{Body, HttpBody};
+use axum::extract::{DefaultBodyLimit, Request};
+use axum::http::{header, HeaderValue, StatusCode, Uri};
 use axum::middleware;
-use axum::response::Redirect;
+use axum::middleware::Next;
+use axum::response::{Redirect, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use dbx_core::connection::AppState;
@@ -68,6 +70,130 @@ mod data_grid_extractor_openapi_tests {
 fn web_compression_predicate() -> impl Predicate {
     // XLSX exports are already compressed ZIP archives, so gzip would only add CPU overhead.
     DefaultPredicate::new().and(NotForContentType::const_new(XLSX_CONTENT_TYPE))
+}
+
+/// Cache policy for the embedded SPA.
+///
+/// The frontend is served from the local filesystem, but clients still keep an
+/// HTTP cache keyed on validators: the HarmonyOS shell used to rewrite every
+/// file on every cold start (new mtime, no validators), so the WebView
+/// re-downloaded and re-compiled the whole boot module graph on every launch.
+/// Vite/rolldown name every chunk under `assets/` after its content hash, so
+/// those files may be cached forever; `index.html` and other stable names must
+/// be revalidated so a rebuilt bundle immediately points at the new hashes.
+const STATIC_ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
+const STATIC_ENTRY_CACHE_CONTROL: &str = "no-cache";
+
+fn static_cache_control_for_path(path: &str) -> &'static str {
+    if path.contains("/assets/") {
+        STATIC_ASSET_CACHE_CONTROL
+    } else {
+        STATIC_ENTRY_CACHE_CONTROL
+    }
+}
+
+/// `true` when the request's `If-None-Match` covers the response validator.
+fn if_none_match_matches(if_none_match: &HeaderValue, etag: &HeaderValue) -> bool {
+    let Ok(if_none_match) = if_none_match.to_str() else {
+        return false;
+    };
+    let Ok(etag) = etag.to_str() else {
+        return false;
+    };
+    if if_none_match.trim() == "*" {
+        return true;
+    }
+    // A weak validator matches on the opaque tag, ignoring the `W/` prefix.
+    let normalize = |value: &str| value.trim().trim_start_matches("W/").trim_matches('"').to_string();
+    let etag = normalize(etag);
+    if_none_match.split(',').any(|candidate| normalize(candidate) == etag)
+}
+
+/// Adds revalidation/immutability metadata to statically served files.
+///
+/// `ServeDir` already emits `Last-Modified` and answers `If-Modified-Since`
+/// with `304`, but it emits neither `Cache-Control` nor `ETag`. Without an
+/// explicit policy Chromium has to fall back to heuristic freshness, which is
+/// zero for a file whose mtime keeps moving.
+async fn add_static_cache_headers(req: Request, next: Next) -> Response {
+    let path = req.uri().path().to_string();
+    let if_none_match = req.headers().get(header::IF_NONE_MATCH).cloned();
+    let mut response = next.run(req).await;
+    let status = response.status();
+    let headers = response.headers_mut();
+
+    headers.entry(header::CACHE_CONTROL).or_insert_with(|| HeaderValue::from_static(static_cache_control_for_path(&path)));
+
+    // Derive a cheap validator from the metadata `ServeDir` already produced.
+    if !headers.contains_key(header::ETAG) {
+        let validator = match (headers.get(header::LAST_MODIFIED), headers.get(header::CONTENT_LENGTH)) {
+            (Some(last_modified), Some(content_length)) => match (last_modified.to_str(), content_length.to_str()) {
+                (Ok(last_modified), Ok(content_length)) => {
+                    // FNV-1a over the two components; the exact hash does not
+                    // matter, only that it changes when the file changes.
+                    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                    for byte in last_modified.as_bytes().iter().chain(content_length.as_bytes()) {
+                        hash ^= u64::from(*byte);
+                        hash = hash.wrapping_mul(0x100_0000_01b3);
+                    }
+                    HeaderValue::from_str(&format!("W/\"{content_length}-{hash:016x}\"")).ok()
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(validator) = validator {
+            headers.insert(header::ETAG, validator);
+        }
+    }
+
+    let not_modified = if status == StatusCode::OK {
+        match (if_none_match.as_ref(), headers.get(header::ETAG)) {
+            (Some(if_none_match), Some(etag)) if if_none_match_matches(if_none_match, etag) => true,
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    if !not_modified {
+        return response;
+    }
+    let mut not_modified_response = Response::new(Body::empty());
+    *not_modified_response.status_mut() = StatusCode::NOT_MODIFIED;
+    for name in [header::CACHE_CONTROL, header::ETAG, header::LAST_MODIFIED] {
+        if let Some(value) = response.headers().get(&name).cloned() {
+            not_modified_response.headers_mut().insert(name, value);
+        }
+    }
+    not_modified_response
+}
+
+/// Compression policy for statically served files.
+///
+/// `DefaultPredicate` only looks at the content type and size, so it would also
+/// compress `206 Partial Content` (breaking `Content-Range` semantics for
+/// `ServeDir`'s range support) and `304 Not Modified` (which carries no body).
+#[derive(Clone)]
+struct StaticCompressionPredicate(DefaultPredicate);
+
+impl Predicate for StaticCompressionPredicate {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: HttpBody,
+    {
+        if matches!(response.status(), StatusCode::PARTIAL_CONTENT | StatusCode::NOT_MODIFIED) {
+            return false;
+        }
+        self.0.should_compress(response)
+    }
+}
+
+fn static_compression_predicate() -> impl Predicate {
+    // Small files: gzip framing costs more than the bytes saved.
+    tower_http::compression::predicate::SizeAbove::new(4096)
+        .and(NotForContentType::const_new(XLSX_CONTENT_TYPE))
+        .and(StaticCompressionPredicate(DefaultPredicate::new()))
 }
 
 fn web_body_limit_bytes() -> usize {
@@ -135,7 +261,16 @@ fn mount_public_base_path(mut app: Router, public_base_path: &str, static_dir: O
         use tower_http::services::{ServeDir, ServeFile};
         let index_path = static_dir.join("index.html");
         let serve_dir = ServeDir::new(static_dir).not_found_service(ServeFile::new(index_path));
-        app = app.fallback_service(serve_dir);
+        // Wrap the static service on its own router (not the whole app) so the
+        // API and MCP routes keep their existing layers. `Router::layer` also
+        // covers the fallback because it is registered first. The cache policy
+        // sits inside the compression layer so the validator describes the
+        // stored file while compression still applies to the response body.
+        let static_app = Router::new()
+            .fallback_service(serve_dir)
+            .layer(middleware::from_fn(add_static_cache_headers))
+            .layer(CompressionLayer::new().compress_when(static_compression_predicate()));
+        app = app.fallback_service(static_app);
     }
 
     if public_base_path == "/" {
@@ -1092,8 +1227,17 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
     app = mount_public_base_path(app, &public_base_path, static_dir.as_deref());
 
     // Bind address
+    //
+    // `DBX_BIND_HOST` lets an embedder restrict the listener. The HarmonyOS HAP
+    // passes `127.0.0.1` because it runs the server with authentication disabled
+    // (`DBX_DISABLE_PASSWORD`), so binding every interface would expose the full
+    // database-client API to the local network. Standalone/browser deployments
+    // keep the historical `0.0.0.0` default.
     let port: u16 = std::env::var("DBX_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4224);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let bind_host = std::env::var("DBX_BIND_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let addr: SocketAddr = format!("{bind_host}:{port}")
+        .parse()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)));
 
     tracing::info!("DBX Web server starting on http://{}", addr);
     if public_base_path != "/" {
