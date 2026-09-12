@@ -196,6 +196,22 @@ fn static_compression_predicate() -> impl Predicate {
         .and(StaticCompressionPredicate(DefaultPredicate::new()))
 }
 
+/// Whether statically served files should be gzipped.
+///
+/// Only worth it when the client is behind a real network. The HarmonyOS shell
+/// binds `127.0.0.1` and loads the WebView from there, where compressing the
+/// ~4.6MB startup graph costs about a second of CPU and saves nothing:
+/// measured on device, fetching the 243 startup chunks took 2.16s with
+/// `Accept-Encoding: gzip` versus 1.21s with `identity`.
+fn static_compression_enabled() -> bool {
+    let Ok(host) = std::env::var("DBX_BIND_HOST") else {
+        // Standalone/browser deployments default to every interface.
+        return true;
+    };
+    let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+    !matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
 fn web_body_limit_bytes() -> usize {
     let value = std::env::var("DBX_MAX_UPLOAD_MB").ok();
     web_body_limit_bytes_from_value(value.as_deref())
@@ -263,13 +279,16 @@ fn mount_public_base_path(mut app: Router, public_base_path: &str, static_dir: O
         let serve_dir = ServeDir::new(static_dir).not_found_service(ServeFile::new(index_path));
         // Wrap the static service on its own router (not the whole app) so the
         // API and MCP routes keep their existing layers. `Router::layer` also
-        // covers the fallback because it is registered first. The cache policy
-        // sits inside the compression layer so the validator describes the
-        // stored file while compression still applies to the response body.
-        let static_app = Router::new()
+        // covers the fallback because it is registered first.
+        let mut static_app = Router::new()
             .fallback_service(serve_dir)
-            .layer(middleware::from_fn(add_static_cache_headers))
-            .layer(CompressionLayer::new().compress_when(static_compression_predicate()));
+            .layer(middleware::from_fn(add_static_cache_headers));
+        // Skip gzip when the server is loopback-only (HarmonyOS); see
+        // `static_compression_enabled`. The cache policy stays inside, so the
+        // validator always describes the stored file.
+        if static_compression_enabled() {
+            static_app = static_app.layer(CompressionLayer::new().compress_when(static_compression_predicate()));
+        }
         app = app.fallback_service(static_app);
     }
 
