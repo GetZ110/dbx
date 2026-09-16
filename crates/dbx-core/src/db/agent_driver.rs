@@ -1,8 +1,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,11 +24,68 @@ struct CachedAgentQuery {
     result: Result<Value, String>,
 }
 
+/// A live agent runtime process.
+///
+/// On desktop this is an ordinary `std::process::Child` spawned from the driver
+/// executable. On OHOS the sandbox cannot `execve` a downloaded ELF, so the agent
+/// runs in an appspawn native child process and the handle is an
+/// [`crate::db::agent_ncp::NcpChild`] (see `docs/ohos-agent-exec-denied.md`).
+pub enum AgentProcess {
+    Child(Child),
+    #[cfg(target_env = "ohos")]
+    Ncp(crate::db::agent_ncp::NcpChild),
+}
+
+impl AgentProcess {
+    fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            AgentProcess::Child(child) => child.kill(),
+            #[cfg(target_env = "ohos")]
+            AgentProcess::Ncp(ncp) => ncp.kill(),
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            AgentProcess::Child(child) => child.wait(),
+            #[cfg(target_env = "ohos")]
+            AgentProcess::Ncp(ncp) => ncp.wait(),
+        }
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            AgentProcess::Child(child) => child.try_wait(),
+            #[cfg(target_env = "ohos")]
+            AgentProcess::Ncp(ncp) => ncp.try_wait(),
+        }
+    }
+
+    fn id(&self) -> u32 {
+        match self {
+            AgentProcess::Child(child) => child.id(),
+            #[cfg(target_env = "ohos")]
+            AgentProcess::Ncp(ncp) => ncp.id(),
+        }
+    }
+}
+
+/// A spawned agent process together with its JSON-RPC channels.
+///
+/// `stdin`/`stdout` are boxed so the same client code works for both an OS pipe
+/// pair (desktop) and a socketpair to a native child process (OHOS).
+pub struct SpawnedAgent {
+    pub process: AgentProcess,
+    pub stdin: Box<dyn Write + Send>,
+    pub stdout: Box<dyn Read + Send>,
+    pub stderr: Box<dyn Read + Send>,
+}
+
 pub struct AgentRuntimeClient {
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<AgentProcess>>,
     child_reaper_started: Arc<AtomicBool>,
     child_reaped: Arc<AtomicBool>,
-    stdin: Arc<Mutex<BufWriter<ChildStdin>>>,
+    stdin: Arc<Mutex<BufWriter<Box<dyn Write + Send>>>>,
     pending: Arc<Mutex<HashMap<u64, PendingAgentResponse>>>,
     stderr_tail: Arc<Mutex<StderrTail>>,
     next_id: AtomicU64,
@@ -39,10 +96,8 @@ pub struct AgentRuntimeClient {
 
 impl AgentRuntimeClient {
     pub async fn spawn(launch: AgentLaunchSpec, app_version: &str) -> Result<Arc<Self>, String> {
-        let mut child = spawn_agent_process(&launch)?;
-        let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
-        let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
-        let child_stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
+        let SpawnedAgent { process: child, stdin: child_stdin, stdout: child_stdout, stderr: child_stderr } =
+            spawn_agent_io(&launch)?;
         let stderr_tail = Arc::new(Mutex::new(StderrTail::default()));
         start_stderr_collector(child_stderr, stderr_tail.clone());
 
@@ -107,7 +162,7 @@ impl AgentRuntimeClient {
         Ok(Arc::new(Self { handshake, ..runtime }))
     }
 
-    fn start_response_reader(self: &Arc<Self>, mut stdout: BufReader<ChildStdout>) {
+    fn start_response_reader(self: &Arc<Self>, mut stdout: BufReader<Box<dyn Read + Send>>) {
         let pending = self.pending.clone();
         let failed = self.failed.clone();
         let child = self.child.clone();
@@ -325,7 +380,7 @@ impl AgentRuntimeClient {
 }
 
 fn terminate_and_reap_shared_agent(
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<AgentProcess>>,
     child_reaper_started: Arc<AtomicBool>,
     child_reaped: Arc<AtomicBool>,
 ) {
@@ -336,7 +391,7 @@ fn terminate_and_reap_shared_agent(
 }
 
 fn start_shared_agent_reaper(
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<AgentProcess>>,
     child_reaper_started: Arc<AtomicBool>,
     child_reaped: Arc<AtomicBool>,
 ) {
@@ -968,11 +1023,23 @@ pub struct AgentLaunchSpec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub working_dir: Option<PathBuf>,
+    /// OHOS native child process entry (`libdbx_agent_oracle.so:Main`).
+    ///
+    /// When set, the agent is started by appspawn through
+    /// `OH_Ability_StartNativeChildProcess` instead of `execve`-ing `program`.
+    /// This is the only transport that works inside the OHOS app sandbox.
+    pub ncp_entry: Option<String>,
 }
 
 impl AgentLaunchSpec {
     pub fn new(program: impl Into<PathBuf>) -> Self {
-        Self { program: program.into(), args: Vec::new(), working_dir: None }
+        Self { program: program.into(), args: Vec::new(), working_dir: None, ncp_entry: None }
+    }
+
+    /// Bundled OHOS agent library started as an appspawn native child process.
+    pub fn ncp(entry: impl Into<String>) -> Self {
+        let entry = entry.into();
+        Self { program: PathBuf::from(&entry), args: Vec::new(), working_dir: None, ncp_entry: Some(entry) }
     }
 
     pub fn java_jar(java_path: impl Into<PathBuf>, jar_path: impl AsRef<Path>) -> Self {
@@ -989,6 +1056,7 @@ impl AgentLaunchSpec {
             program: java_path.into(),
             args: agent_java_args_with_extra_args(&jar_path.to_string_lossy(), extra_java_args),
             working_dir: jar_path.parent().map(Path::to_path_buf),
+            ncp_entry: None,
         }
     }
 
@@ -3193,6 +3261,48 @@ fn spawn_agent_process(launch: &AgentLaunchSpec) -> Result<Child, String> {
     }
 }
 
+fn spawn_agent_child_io(launch: &AgentLaunchSpec) -> Result<SpawnedAgent, String> {
+    let mut child = spawn_agent_process(launch)?;
+    let stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
+    let stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
+    Ok(SpawnedAgent {
+        process: AgentProcess::Child(child),
+        stdin: Box::new(stdin),
+        stdout: Box::new(stdout),
+        stderr: Box::new(stderr),
+    })
+}
+
+#[cfg(not(target_env = "ohos"))]
+fn spawn_agent_io(launch: &AgentLaunchSpec) -> Result<SpawnedAgent, String> {
+    spawn_agent_child_io(launch)
+}
+
+/// OHOS: run bundled agents as appspawn native child processes.
+///
+/// The sandbox forbids `execve` on the downloaded driver ELF (BinSec returns
+/// `EACCES`), so whenever the launch spec points at a bundled library we start it
+/// through `OH_Ability_StartNativeChildProcess` and speak JSON-RPC over a
+/// socketpair. Anything without an NCP entry keeps the ordinary child behaviour
+/// (and therefore still fails with `Permission denied`, as expected).
+#[cfg(target_env = "ohos")]
+fn spawn_agent_io(launch: &AgentLaunchSpec) -> Result<SpawnedAgent, String> {
+    if let Some(entry) = launch.ncp_entry.as_deref() {
+        let (child, stream) = crate::db::agent_ncp::spawn(entry)
+            .map_err(|error| format!("Failed to start bundled agent {entry}: {error}"))?;
+        let writer =
+            stream.try_clone().map_err(|error| format!("Failed to clone bundled agent channel {entry}: {error}"))?;
+        return Ok(SpawnedAgent {
+            process: AgentProcess::Ncp(child),
+            stdin: Box::new(writer),
+            stdout: Box::new(stream),
+            stderr: Box::new(std::io::empty()),
+        });
+    }
+    spawn_agent_child_io(launch)
+}
+
 fn agent_command(launch: &AgentLaunchSpec) -> Command {
     let mut command = crate::process::new_std_command(&launch.program);
     command.args(&launch.args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -3321,7 +3431,7 @@ fn sample_agent_stdout_noise(line: &str) -> String {
     format!("{sample:?}")
 }
 
-fn start_stderr_collector(stderr: ChildStderr, stderr_tail: Arc<Mutex<StderrTail>>) {
+fn start_stderr_collector<R: std::io::Read + Send + 'static>(stderr: R, stderr_tail: Arc<Mutex<StderrTail>>) {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();

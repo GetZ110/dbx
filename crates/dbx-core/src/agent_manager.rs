@@ -883,6 +883,15 @@ impl AgentManager {
         if driver_key == "dameng" {
             validate_dameng_java_system_properties(extra_java_args)?;
         }
+        // OHOS: a downloaded driver ELF can never be exec'd from the app sandbox
+        // (BinSec `code_protect` -> EACCES). The agents we ship inside the HAP run
+        // as appspawn native child processes instead; see
+        // docs/ohos-agent-exec-denied.md and `db::agent_ncp`.
+        #[cfg(target_env = "ohos")]
+        if let Some(spec) = ohos_bundled_agent_launch(driver_key) {
+            log::info!("[agent:ncp] using bundled agent for {driver_key}: {}", spec.program.display());
+            return Ok(spec);
+        }
         let driver_dir = self.driver_dir(driver_key);
         let config_path = self.driver_launch_config_path(driver_key);
         if config_path.exists() {
@@ -1271,4 +1280,19 @@ fn is_executable_file(path: &Path) -> bool {
     {
         true
     }
+}
+
+/// Maps a driver key to the agent library bundled in the HAP's `libs/arm64/`
+/// directory (built with `harmony/tools/build_agent_cshared.sh`).
+///
+/// Only drivers that have actually been converted to a c-shared agent and shipped
+/// in `entry/libs/arm64-v8a/` may be listed here; anything else keeps the
+/// sandbox-exec path and therefore its `Permission denied` failure.
+#[cfg(target_env = "ohos")]
+fn ohos_bundled_agent_launch(driver_key: &str) -> Option<AgentLaunchSpec> {
+    let library = match driver_key {
+        "oracle" => "libdbx_agent_oracle.so",
+        _ => return None,
+    };
+    Some(AgentLaunchSpec::ncp(format!("{library}:Main")))
 }
