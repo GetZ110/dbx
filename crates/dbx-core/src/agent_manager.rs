@@ -546,6 +546,10 @@ pub struct AgentDriverInfo {
     pub requires_java_runtime: bool,
     pub jre: String,
     pub jre_installed: bool,
+    /// True when the agent ships inside the HAP (HarmonyOS native child process)
+    /// and therefore cannot be downloaded, upgraded or uninstalled separately.
+    #[serde(default)]
+    pub bundled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -835,6 +839,7 @@ impl AgentManager {
         self.is_driver_jar_valid(db_type)
             || self.driver_native_installed(db_type)
             || self.driver_launch_config_path(db_type).exists()
+            || ohos_bundled_agent_library(db_type).is_some()
     }
 
     pub fn is_driver_jar_valid(&self, db_type: &str) -> bool {
@@ -888,9 +893,10 @@ impl AgentManager {
         // as appspawn native child processes instead; see
         // docs/ohos-agent-exec-denied.md and `db::agent_ncp`.
         #[cfg(target_env = "ohos")]
-        if let Some(spec) = ohos_bundled_agent_launch(driver_key) {
-            log::info!("[agent:ncp] using bundled agent for {driver_key}: {}", spec.program.display());
-            return Ok(spec);
+        if let Some(library) = ohos_bundled_agent_library(driver_key) {
+            let entry = format!("{library}:Main");
+            log::info!("[agent:ncp] using bundled agent for {driver_key}: {entry}");
+            return Ok(AgentLaunchSpec::ncp(entry));
         }
         let driver_dir = self.driver_dir(driver_key);
         let config_path = self.driver_launch_config_path(driver_key);
@@ -1285,14 +1291,66 @@ fn is_executable_file(path: &Path) -> bool {
 /// Maps a driver key to the agent library bundled in the HAP's `libs/arm64/`
 /// directory (built with `harmony/tools/build_agent_cshared.sh`).
 ///
-/// Only drivers that have actually been converted to a c-shared agent and shipped
-/// in `entry/libs/arm64-v8a/` may be listed here; anything else keeps the
-/// sandbox-exec path and therefore its `Permission denied` failure.
+/// `None` means "not bundled": the driver keeps the ordinary sandbox-exec path and
+/// therefore still fails with `Permission denied` on HarmonyOS.
+///
+/// First-party agents are listed explicitly so they keep working even if the
+/// installed bundle layout changes. Everything else is discovered by probing the
+/// bundle `libs/` directory, which means **adding a new agent only requires
+/// dropping its `.so` into `entry/libs/arm64-v8a/` and rebuilding the HAP - no
+/// Rust rebuild**, because appspawn resolves the library by name at spawn time.
 #[cfg(target_env = "ohos")]
-fn ohos_bundled_agent_launch(driver_key: &str) -> Option<AgentLaunchSpec> {
-    let library = match driver_key {
-        "oracle" => "libdbx_agent_oracle.so",
-        _ => return None,
+pub fn ohos_bundled_agent_library(driver_key: &str) -> Option<String> {
+    const KNOWN_BUNDLED_AGENTS: &[&str] = &["libdbx_agent_oracle.so"];
+
+    // One build artifact can serve several connection types (hive covers
+    // hive/kyuubi/impala in the upstream driver set).
+    let canonical = match driver_key {
+        "kyuubi" | "impala" => "hive",
+        other => other,
     };
-    Some(AgentLaunchSpec::ncp(format!("{library}:Main")))
+    let name = format!("libdbx_agent_{canonical}.so");
+    let dirs = ohos_bundle_libs_dirs();
+    let probed = dirs.iter().any(|dir| dir.join(&name).is_file());
+    if KNOWN_BUNDLED_AGENTS.contains(&name.as_str()) {
+        // Diagnostics: proves the probe agrees with the explicit list, so a newly
+        // packaged agent (which is *not* listed) will be discovered too.
+        static PROBE_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        PROBE_LOGGED.get_or_init(|| {
+            log::info!("[agent:ncp] bundle libs probe: dirs={dirs:?} oracle_found={probed}");
+        });
+        return Some(name);
+    }
+    probed.then_some(name)
+}
+
+/// Directories that may hold the installed HAP's native libraries.
+///
+/// Derived from where `libdbx_ohos.so` itself was loaded (`/proc/self/maps`), so it
+/// follows the real install layout, with the well-known sandbox path as fallback.
+#[cfg(target_env = "ohos")]
+fn ohos_bundle_libs_dirs() -> &'static [std::path::PathBuf] {
+    static DIRS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIRS.get_or_init(|| {
+        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
+            for line in maps.lines() {
+                let Some(index) = line.find("/libdbx_ohos.so") else { continue };
+                let Some(parent) = std::path::Path::new(&line[index..]).parent() else { continue };
+                if !dirs.iter().any(|dir| dir == parent) {
+                    dirs.push(parent.to_path_buf());
+                }
+            }
+        }
+        let fallback = std::path::PathBuf::from("/data/storage/el1/bundle/libs/arm64");
+        if !dirs.contains(&fallback) {
+            dirs.push(fallback);
+        }
+        dirs
+    })
+}
+
+#[cfg(not(target_env = "ohos"))]
+pub fn ohos_bundled_agent_library(_driver_key: &str) -> Option<String> {
+    None
 }

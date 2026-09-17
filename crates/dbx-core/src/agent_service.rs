@@ -294,7 +294,11 @@ pub fn build_agent_list(am: &AgentManager, registry: Option<&AgentRegistry>) -> 
             let jar_valid = am.is_driver_jar_valid(key);
             let native_installed = am.driver_native_installed(key);
             let launch_config_installed = am.driver_launch_config_path(key).exists();
-            let installed = jar_valid || native_installed || launch_config_installed;
+            // Agents shipped inside the HAP run as native child processes on
+            // HarmonyOS; they are usable without any download, so present them as
+            // installed and never offer an upgrade for them.
+            let bundled = crate::agent_manager::ohos_bundled_agent_library(key).is_some();
+            let installed = jar_valid || native_installed || launch_config_installed || bundled;
             let local = local_state.installed_drivers.get(key);
             let remote = registry.and_then(|r| agent_registry_driver(r, key));
             let remote_requires_java_runtime = remote.is_some_and(remote_driver_requires_java_runtime);
@@ -320,14 +324,18 @@ pub fn build_agent_list(am: &AgentManager, registry: Option<&AgentRegistry>) -> 
                 version: remote.map(|r| r.version.clone()).unwrap_or_default(),
                 size: remote.map(|driver| driver_download_size(key, driver)).unwrap_or(0),
                 installed,
-                installed_version: local.map(|l| l.version.clone()),
-                update_available: match (local, remote) {
-                    (Some(l), Some(r)) => l.version != r.version || jre_update_available,
-                    _ => false,
-                },
+                installed_version: local.map(|l| l.version.clone()).or_else(|| {
+                    bundled.then(|| remote.map(|r| r.version.clone()).unwrap_or_else(|| "bundled".to_string()))
+                }),
+                update_available: !bundled
+                    && match (local, remote) {
+                        (Some(l), Some(r)) => l.version != r.version || jre_update_available,
+                        _ => false,
+                    },
                 requires_java_runtime,
                 jre: jre_key.clone(),
                 jre_installed: !requires_java_runtime || am.is_jre_installed(&jre_key),
+                bundled,
             }
         })
         .collect()
@@ -929,6 +937,11 @@ async fn lock_or_cancel<'a>(
 }
 
 pub async fn uninstall_agent_driver(am: &AgentManager, db_type: &str) -> Result<(), String> {
+    if crate::agent_manager::ohos_bundled_agent_library(db_type).is_some() {
+        return Err(format!(
+            "{db_type} ships inside the app as a bundled native agent and cannot be uninstalled separately"
+        ));
+    }
     let _installation_guard = am.installation_operation_lock.read().await;
     {
         let driver_lock = driver_operation_lock(am, db_type);
