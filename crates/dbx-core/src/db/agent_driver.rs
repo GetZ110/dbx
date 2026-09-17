@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -933,9 +933,9 @@ const AGENT_JAVA_TOO_OLD_MESSAGE: &str =
     "Agent requires Java 21, but DBX started it with an older Java runtime. Use DBX managed JRE 21 or select a Java 21 executable in Driver Manager.";
 
 pub struct AgentDriverClient {
-    child: Option<Child>,
-    stdin: Option<BufWriter<ChildStdin>>,
-    stdout: Option<BufReader<ChildStdout>>,
+    child: Option<AgentProcess>,
+    stdin: Option<BufWriter<Box<dyn Write + Send>>>,
+    stdout: Option<BufReader<Box<dyn Read + Send>>>,
     stderr_tail: Arc<Mutex<StderrTail>>,
     handshake: Option<AgentHandshake>,
     next_id: u64,
@@ -1645,11 +1645,8 @@ impl AgentDriverClient {
     /// they speak the DBX stdin/stdout JSON-RPC protocol.
     /// Blocks (async) until the agent writes `{"ready":true}` to stdout.
     pub async fn spawn(launch: AgentLaunchSpec) -> Result<Self, String> {
-        let mut child = spawn_agent_process(&launch)?;
-
-        let child_stdin = child.stdin.take().ok_or("Failed to capture agent stdin")?;
-        let child_stdout = child.stdout.take().ok_or("Failed to capture agent stdout")?;
-        let child_stderr = child.stderr.take().ok_or("Failed to capture agent stderr")?;
+        let SpawnedAgent { process: mut child, stdin: child_stdin, stdout: child_stdout, stderr: child_stderr } =
+            spawn_agent_io(&launch)?;
 
         let stdin = BufWriter::new(child_stdin);
         let mut stdout = BufReader::new(child_stdout);
@@ -1683,17 +1680,17 @@ impl AgentDriverClient {
         let ready_stdout = match startup_result {
             Ok(Ok(Ok(stdout))) => stdout,
             Ok(Ok(Err(e))) => {
-                return Err(format_agent_startup_error(&e, &mut child, &stderr_tail));
+                return Err(format_agent_process_startup_error(&e, &mut child, &stderr_tail));
             }
             Ok(Err(e)) => {
-                return Err(format_agent_startup_error(
+                return Err(format_agent_process_startup_error(
                     &format!("Agent startup task failed: {e}"),
                     &mut child,
                     &stderr_tail,
                 ));
             }
             Err(_) => {
-                return Err(format_agent_startup_error(
+                return Err(format_agent_process_startup_error(
                     &format!("Agent startup timed out ({STARTUP_TIMEOUT_SECS}s)"),
                     &mut child,
                     &stderr_tail,
@@ -2975,7 +2972,7 @@ impl AgentDriverClient {
         if let Some(runtime) = &self.shared_runtime {
             return runtime.child.lock().map(|child| child.id()).unwrap_or_default();
         }
-        self.child.as_ref().map(Child::id).unwrap_or_default()
+        self.child.as_ref().map(AgentProcess::id).unwrap_or_default()
     }
 
     pub fn protocol_mode(&self) -> &'static str {
@@ -3475,6 +3472,27 @@ fn child_exit_status_after_short_wait(child: &mut Child) -> Option<String> {
     }
 }
 
+fn agent_process_exit_status(child: &mut AgentProcess) -> Option<String> {
+    match child.try_wait() {
+        Ok(Some(status)) => Some(status.to_string()),
+        Ok(None) => None,
+        Err(err) => Some(format!("status unavailable: {err}")),
+    }
+}
+
+fn agent_process_exit_status_after_short_wait(child: &mut AgentProcess) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_millis(AGENT_EXIT_DIAGNOSTIC_WAIT_MS);
+    loop {
+        if let Some(status) = agent_process_exit_status(child) {
+            return Some(status);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(AGENT_EXIT_DIAGNOSTIC_POLL_MS));
+    }
+}
+
 fn stderr_tail_snapshot(stderr_tail: &Arc<Mutex<StderrTail>>) -> StderrTail {
     let snapshot = stderr_tail.lock().map(|tail| tail.snapshot()).unwrap_or_default();
     let mut tail = StderrTail::with_capacity(STDERR_TAIL_LINES);
@@ -3520,6 +3538,18 @@ fn format_agent_startup_error(base: &str, child: &mut Child, stderr_tail: &Arc<M
     format_agent_process_error(base, child_exit_status_after_short_wait(child), &stderr_tail_snapshot(stderr_tail))
 }
 
+fn format_agent_process_startup_error(
+    base: &str,
+    child: &mut AgentProcess,
+    stderr_tail: &Arc<Mutex<StderrTail>>,
+) -> String {
+    format_agent_process_error(
+        base,
+        agent_process_exit_status_after_short_wait(child),
+        &stderr_tail_snapshot(stderr_tail),
+    )
+}
+
 impl AgentDriverClient {
     #[cfg(test)]
     pub(crate) fn test_stub() -> Self {
@@ -3540,7 +3570,7 @@ impl AgentDriverClient {
     fn format_agent_process_error(&mut self, base: &str) -> String {
         // Runtime RPC errors are common SQL/driver paths. Do not wait for the
         // child to exit unless startup diagnostics already expect the process to die.
-        let exit_status = self.child.as_mut().and_then(child_exit_status);
+        let exit_status = self.child.as_mut().and_then(agent_process_exit_status);
         format_agent_process_error(base, exit_status, &stderr_tail_snapshot(&self.stderr_tail))
     }
 }

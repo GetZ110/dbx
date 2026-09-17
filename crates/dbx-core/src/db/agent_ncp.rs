@@ -80,6 +80,8 @@ mod imp {
         pid: i32,
         /// A clone of the parent socket end, kept only to shut the channel down.
         ctl: UnixStream,
+        /// Set once we asked the child to stop, so `try_wait` stops polling.
+        exited: bool,
     }
 
     /// Starts `entry` (for example `libdbx_agent_oracle.so:Main`) as a native
@@ -117,7 +119,7 @@ mod imp {
         // up as EOF instead of a half-open channel.
         drop(child_stream);
         let ctl = parent_stream.try_clone()?;
-        Ok((NcpChild { pid, ctl }, parent_stream))
+        Ok((NcpChild { pid, ctl, exited: false }, parent_stream))
     }
 
     impl NcpChild {
@@ -127,6 +129,7 @@ mod imp {
 
         pub fn kill(&mut self) -> io::Result<()> {
             let _ = self.ctl.shutdown(Shutdown::Both);
+            self.exited = true;
             let rc = unsafe { OH_Ability_KillChildProcess(self.pid) };
             if rc == 0 {
                 Ok(())
@@ -142,10 +145,14 @@ mod imp {
         /// signal, so report completion without blocking the reaper thread.
         pub fn wait(&mut self) -> io::Result<ExitStatus> {
             let _ = self.ctl.shutdown(Shutdown::Both);
+            self.exited = true;
             Ok(ExitStatus::from_raw(0))
         }
 
         pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            if self.exited {
+                return Ok(Some(ExitStatus::from_raw(0)));
+            }
             Ok(None)
         }
     }
