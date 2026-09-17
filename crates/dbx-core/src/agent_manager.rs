@@ -1326,28 +1326,68 @@ pub fn ohos_bundled_agent_library(driver_key: &str) -> Option<String> {
 
 /// Directories that may hold the installed HAP's native libraries.
 ///
-/// Derived from where `libdbx_ohos.so` itself was loaded (`/proc/self/maps`), so it
-/// follows the real install layout, with the well-known sandbox path as fallback.
+/// Primary source is `dladdr()` on one of our own statics: the dynamic linker
+/// reports exactly where this library was loaded from (what VintagePomeloPro does
+/// too). `/proc/self/maps` and the well-known sandbox path are kept as fallbacks
+/// in case a future loader hides the path.
 #[cfg(target_env = "ohos")]
 fn ohos_bundle_libs_dirs() -> &'static [std::path::PathBuf] {
     static DIRS: std::sync::OnceLock<Vec<std::path::PathBuf>> = std::sync::OnceLock::new();
     DIRS.get_or_init(|| {
         let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+        let mut push = |dir: std::path::PathBuf| {
+            if !dirs.iter().any(|existing| existing == &dir) {
+                dirs.push(dir);
+            }
+        };
+
+        if let Some(dir) = current_shared_object_dir() {
+            push(dir);
+        }
         if let Ok(maps) = std::fs::read_to_string("/proc/self/maps") {
             for line in maps.lines() {
                 let Some(index) = line.find("/libdbx_ohos.so") else { continue };
-                let Some(parent) = std::path::Path::new(&line[index..]).parent() else { continue };
-                if !dirs.iter().any(|dir| dir == parent) {
-                    dirs.push(parent.to_path_buf());
+                if let Some(parent) = std::path::Path::new(&line[index..]).parent() {
+                    push(parent.to_path_buf());
                 }
             }
         }
-        let fallback = std::path::PathBuf::from("/data/storage/el1/bundle/libs/arm64");
-        if !dirs.contains(&fallback) {
-            dirs.push(fallback);
-        }
+        push(std::path::PathBuf::from("/data/storage/el1/bundle/libs/arm64"));
         dirs
     })
+}
+
+/// Directory this shared object was loaded from, via `dladdr()`.
+#[cfg(target_env = "ohos")]
+fn current_shared_object_dir() -> Option<std::path::PathBuf> {
+    /// Any address inside this library works; a static is guaranteed to live in it.
+    static MARKER: u8 = 0;
+
+    #[repr(C)]
+    struct DlInfo {
+        dli_fname: *const std::os::raw::c_char,
+        dli_fbase: *mut std::os::raw::c_void,
+        dli_sname: *const std::os::raw::c_char,
+        dli_saddr: *mut std::os::raw::c_void,
+    }
+
+    extern "C" {
+        // Provided by musl's libc (no extra -ldl needed on OHOS).
+        fn dladdr(addr: *const std::os::raw::c_void, info: *mut DlInfo) -> std::os::raw::c_int;
+    }
+
+    let mut info = DlInfo {
+        dli_fname: std::ptr::null(),
+        dli_fbase: std::ptr::null_mut(),
+        dli_sname: std::ptr::null(),
+        dli_saddr: std::ptr::null_mut(),
+    };
+    let addr = &MARKER as *const u8 as *const std::os::raw::c_void;
+    if unsafe { dladdr(addr, &mut info) } == 0 || info.dli_fname.is_null() {
+        return None;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(info.dli_fname) }.to_string_lossy().into_owned();
+    std::path::Path::new(&path).parent().map(std::path::Path::to_path_buf)
 }
 
 #[cfg(not(target_env = "ohos"))]
