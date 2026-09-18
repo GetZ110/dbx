@@ -2,14 +2,15 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -34,6 +35,8 @@ const DEFAULT_WORKER_KILL_WAIT: Duration = Duration::from_secs(3);
 const WORKER_SHUTDOWN_EXIT_WAIT: Duration = Duration::from_millis(2500);
 const DEFAULT_WORKER_START_WAIT: Duration = Duration::from_secs(5);
 pub const DUCKDB_DRIVER_PATH_ENV: &str = "DBX_DUCKDB_DRIVER_PATH";
+/// Driver key of the DuckDB driver in `ohos_bundled_agent_library` / the driver store.
+const DUCKDB_DRIVER_KEY: &str = "duckdb";
 type PendingRequests = Arc<Mutex<HashMap<String, PendingRequest>>>;
 
 struct PendingRequest {
@@ -61,10 +64,49 @@ struct DuckDbWorkerClientInner {
     next_id: AtomicU64,
 }
 
+/// Handle to the DuckDB worker child.
+///
+/// On desktop the worker is an ordinary spawned process. On OHOS the sandbox
+/// cannot `execve` a downloaded driver ELF (BinSec / `code_protect`), so a driver
+/// bundled in the HAP runs as an appspawn native child process instead (see
+/// `db::agent_ncp` and `docs/ohos-agent-exec-denied.md`). Both variants expose the
+/// three lifecycle operations this module needs.
+enum WorkerChild {
+    Process(Child),
+    #[cfg(target_env = "ohos")]
+    Ncp(crate::db::agent_ncp::NcpChild),
+}
+
+impl WorkerChild {
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            WorkerChild::Process(child) => child.wait().await,
+            #[cfg(target_env = "ohos")]
+            WorkerChild::Ncp(child) => child.wait(),
+        }
+    }
+
+    fn start_kill(&mut self) -> io::Result<()> {
+        match self {
+            WorkerChild::Process(child) => child.start_kill(),
+            #[cfg(target_env = "ohos")]
+            WorkerChild::Ncp(child) => child.kill(),
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match self {
+            WorkerChild::Process(child) => child.try_wait(),
+            #[cfg(target_env = "ohos")]
+            WorkerChild::Ncp(child) => child.try_wait(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct WorkerProcessState {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    child: Option<WorkerChild>,
+    stdin: Option<Box<dyn AsyncWrite + Unpin + Send>>,
     connected: bool,
     generation: u64,
 }
@@ -542,18 +584,7 @@ impl DuckDbWorkerClient {
             self.inner.executable.display(),
             self.inner.executable_args
         );
-        let mut command = crate::process::new_tokio_command(&self.inner.executable);
-        command.args(&self.inner.executable_args);
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|e| format!("Failed to start DuckDB worker: {e}"))?;
-
-        let stdin = child.stdin.take().ok_or("DuckDB worker stdin unavailable")?;
-        let stdout = child.stdout.take().ok_or("DuckDB worker stdout unavailable")?;
+        let (child, stdin, stdout) = spawn_worker_process(&self.inner.executable, &self.inner.executable_args)?;
         spawn_stdout_reader(stdout, self.inner.pending.clone(), generation, permit);
 
         state.child = Some(child);
@@ -653,11 +684,57 @@ impl DuckDbWorkerClient {
     }
 }
 
+/// Starts a DuckDB worker and returns its handle plus the JSON-RPC channels.
+///
+/// On OHOS, a driver bundled in the HAP (`libdbx_agent_duckdb.so`) is preferred:
+/// it is loaded by appspawn as a native child process and the socketpair end the
+/// parent creates becomes fd 0/1 via the shim, so no executable file is involved.
+/// Everywhere else (and when no bundled library is present) this spawns the
+/// configured driver executable as an ordinary child process.
+fn spawn_worker_process(
+    executable: &Path,
+    executable_args: &[OsString],
+) -> Result<(WorkerChild, Box<dyn AsyncWrite + Unpin + Send>, Box<dyn AsyncRead + Unpin + Send>), String> {
+    #[cfg(target_env = "ohos")]
+    if let Some(library) = crate::agent_manager::ohos_bundled_agent_library(DUCKDB_DRIVER_KEY) {
+        let entry = format!("{library}:Main");
+        log::info!("[duckdb-worker:start:ncp] entry={entry}");
+        let (child, stream) = crate::db::agent_ncp::spawn(&entry)
+            .map_err(|e| format!("Failed to start DuckDB worker native child process: {e}"))?;
+        let stream = tokio::net::UnixStream::from_std(stream)
+            .map_err(|e| format!("Failed to adopt DuckDB worker socket: {e}"))?;
+        let (read_half, write_half) = stream.into_split();
+        return Ok((WorkerChild::Ncp(child), Box::new(write_half), Box::new(read_half)));
+    }
+
+    let mut command = crate::process::new_tokio_command(executable);
+    command.args(executable_args);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to start DuckDB worker: {e}"))?;
+
+    let stdin = child.stdin.take().ok_or("DuckDB worker stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("DuckDB worker stdout unavailable")?;
+    Ok((WorkerChild::Process(child), Box::new(stdin), Box::new(stdout)))
+}
+
 fn resolve_duckdb_driver_command() -> Result<(PathBuf, Vec<OsString>), String> {
     if let Some(executable) = std::env::var_os(DUCKDB_DRIVER_PATH_ENV).filter(|value| !value.is_empty()) {
         let executable = PathBuf::from(executable);
         ensure_duckdb_driver_exists(&executable)?;
         return Ok((executable, Vec::new()));
+    }
+
+    // OHOS: the driver can ship inside the HAP and be loaded by appspawn, so there
+    // is no executable path to point at; `spawn_worker_process` ignores this
+    // placeholder and starts the bundled native child process instead.
+    #[cfg(target_env = "ohos")]
+    if crate::agent_manager::ohos_bundled_agent_library(DUCKDB_DRIVER_KEY).is_some() {
+        return Ok((PathBuf::from("<bundled:duckdb>"), Vec::new()));
     }
 
     Err(format!(
@@ -730,12 +807,14 @@ fn is_transient_duckdb_file_lock_error(message: &str) -> bool {
     mentions_file_open && mentions_lock
 }
 
-fn spawn_stdout_reader(
-    stdout: tokio::process::ChildStdout,
+fn spawn_stdout_reader<R>(
+    stdout: R,
     pending: PendingRequests,
     generation: u64,
     permit: OwnedSemaphorePermit,
-) {
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     tokio::spawn(async move {
         let _permit = permit;
         let mut lines = BufReader::new(stdout).lines();

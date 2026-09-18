@@ -7,6 +7,11 @@ edition = "2021"
 license = "Apache-2.0"
 publish = false
 
+# rlib 给 bin 用；cdylib 给 OHOS native child process 用（appspawn dlopen，入口 `Main`，
+# 见 src/ohos_ncp.rs 与 harmony/tools/build_agent_rust.sh）。
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

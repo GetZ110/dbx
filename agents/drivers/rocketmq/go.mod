@@ -4,11 +4,11 @@ go 1.25.0
 
 require (
 	github.com/amigoer/rocketmq-admin-go v1.1.1
+	github.com/apache/rocketmq-client-go/v2 v2.1.2
 	golang.org/x/net v0.44.0
 )
 
 require (
-	github.com/apache/rocketmq-client-go/v2 v2.1.2 // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
 	github.com/golang/mock v1.6.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect

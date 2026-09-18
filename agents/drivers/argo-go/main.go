@@ -103,7 +103,14 @@ type runtimeServer struct {
 	sessions map[string]*agentSession
 }
 
+// main 是普通可执行入口（stdio 版 agent）。
 func main() {
+	runStdioAgent()
+}
+
+// runStdioAgent 跑 stdin/stdout 的 JSON-RPC 循环。
+// OHOS 的 native child process 版本会先把传入的 fd dup2 到 0/1 再调用它。
+func runStdioAgent() {
 	configureRuntimeParallelism()
 	runtimeServer := newRuntimeServer()
 	encoder := json.NewEncoder(os.Stdout)
