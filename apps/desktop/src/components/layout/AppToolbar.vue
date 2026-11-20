@@ -1017,6 +1017,7 @@ function setSqlLibraryMorphToBookmarkRef(el: unknown): void {
           </TooltipTrigger>
           <TooltipContent>{{ t("toolbar.immediateSync") }}</TooltipContent>
         </Tooltip>
+        </template>
         <Tooltip v-if="toolbarKey === 'alwaysOnTop' && showAlwaysOnTopButton">
           <TooltipTrigger as-child>
             <Button
