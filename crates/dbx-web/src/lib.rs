@@ -1,13 +1,18 @@
 mod auth;
+mod captcha;
+mod credentials;
+mod demo;
 mod error;
 mod routes;
 mod sse;
 mod ssh_prompt;
 mod state;
+mod web_mcp;
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::SaltString;
@@ -15,10 +20,11 @@ use argon2::{Argon2, PasswordHasher};
 use axum::body::{Body, HttpBody};
 use axum::extract::{DefaultBodyLimit, Request};
 use axum::http::{header, HeaderValue, StatusCode, Uri};
+use std::sync::atomic::Ordering;
 use axum::middleware;
 use axum::middleware::Next;
-use axum::response::{Redirect, Response};
-use axum::routing::{delete, get, post};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use dbx_core::connection::AppState;
 use dbx_core::sql_dialect::dialect_loader::{register_core_dialects, DialectPluginLoader, DialectRegistry};
@@ -471,38 +477,91 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
 
     let public_base_path = normalize_public_base_path(std::env::var("DBX_PUBLIC_BASE_PATH").ok());
 
+    let password_viewer_enabled =
+        password_viewer_enabled_from_env(std::env::var("DBX_DISABLE_PASSWORD_VIEWER").ok().as_deref());
+
+    // `DBX_WEB_CAPTCHA` pins the policy for managed deployments; otherwise the
+    // value saved from `设置 → 安全` wins, and `auto` is the default.
+    let captcha_env_raw = std::env::var("DBX_WEB_CAPTCHA").ok();
+    let captcha_env_locked = captcha_env_raw.as_deref().is_some_and(|raw| !raw.trim().is_empty());
+    let captcha_mode = match captcha_env_raw.as_deref().filter(|raw| !raw.trim().is_empty()) {
+        Some(raw) => captcha::CaptchaMode::parse(raw),
+        None => match app_state.storage.load_web_login_captcha_mode().await.unwrap_or(None).as_deref() {
+            Some(stored) => captcha::CaptchaMode::parse(stored),
+            None => captcha::CaptchaMode::Auto,
+        },
+    };
+
+    let demo_mode = demo::demo_mode_from_env();
+
+    let migration_ready = storage_migration_ready(&app_state).await;
+    let web_mcp = Arc::new(if migration_ready {
+        match web_mcp::WebMcpRuntime::load(&app_state.storage, !password_disabled && password_hash.is_some()).await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                log::error!("{}", web_mcp_startup_error(error));
+                web_mcp::WebMcpRuntime::disabled()
+            }
+        }
+    } else {
+        web_mcp::WebMcpRuntime::disabled()
+    });
+
     let web_state = Arc::new(WebState {
         app: app_state,
         data_dir,
+        notes_roots: routes::docs::notes_roots_from_env(std::env::var_os("DBX_DOCS_NOTES_ROOTS").as_deref()),
         public_base_path: public_base_path.clone(),
+        demo_mode,
         password_disabled,
+        password_viewer_enabled,
         password_hash: RwLock::new(password_hash),
         sessions: RwLock::new(HashSet::new()),
         sse_channels: RwLock::new(HashMap::new()),
         transfer_progress_channels: RwLock::new(HashMap::new()),
         table_import_channels: RwLock::new(HashMap::new()),
         sql_file_executions: RwLock::new(HashMap::new()),
+        sql_file_failure_logs: Default::default(),
+        managed_sql_previews: Default::default(),
         nacos_imports: RwLock::new(HashMap::new()),
         login_rate_limit: tokio::sync::Mutex::new(state::LoginRateLimit { fail_count: 0, locked_until: None }),
+        captchas: captcha::CaptchaStore::new(),
+        captcha_mode: tokio::sync::RwLock::new(captcha_mode),
+        captcha_env_locked,
         export_files: RwLock::new(HashMap::new()),
         ssh_prompts: Arc::new(ssh_prompt::SshPromptHub::new()),
+        migration_ready: Arc::new(AtomicBool::new(migration_ready)),
+        web_mcp,
     });
 
     ssh_prompt::install_web_ssh_prompt_bridge(web_state.ssh_prompts.clone());
 
     // API routes
     let api = Router::new()
+        .route("/migration/status", get(routes::migration::status))
+        .route("/migration/start", post(routes::migration::start))
+        .route("/migration/retry", post(routes::migration::retry))
+        .route("/migration/cleanup-backups", post(routes::migration::cleanup_backups))
+        .route("/database-backups", post(routes::scheduled_backup::command))
+        .route("/database-backups/{id}/files/{index}", get(routes::scheduled_backup::download))
+        .route("/database-backups/{id}/files/{index}/restore", post(routes::scheduled_backup::prepare_restore))
         // Auth
-        .route("/auth/login", post(auth::login))
+        // Auth payloads are tiny password strings: cap them far below the
+        // global limit so the extractor cannot buffer an unauthenticated DoS
+        // body before any rate limiting runs.
+        .route("/auth/login", post(auth::login).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)))
+        .route("/auth/captcha", get(auth::captcha))
         .route("/auth/check", get(auth::check))
-        .route("/auth/setup", post(auth::setup))
-        .route("/auth/change-password", post(auth::change_password))
+        .route("/auth/setup", post(auth::setup).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)))
+        .route("/auth/change-password", post(auth::change_password).layer(DefaultBodyLimit::max(AUTH_BODY_LIMIT_BYTES)))
         .route("/auth/logout", post(auth::logout))
         // Health / readiness probe (used by the HarmonyOS launcher before loading the Web page)
         .route("/health", get(|| async { "ok" }))
         // Connection
         .route("/connection/test", post(routes::connection::test_connection))
         .route("/connection/test-info", post(routes::connection::test_connection_with_info))
+        .route("/connection/parameters", post(routes::connection::connection_parameters))
+        .route("/connection/test-ssh-tunnel", post(routes::connection::test_ssh_tunnel))
         .route("/connection/connect", post(routes::connection::connect_db))
         .route("/connection/database-info", post(routes::connection::connected_database_info))
         .route("/connection/database-info/save", post(routes::connection::save_connection_database_info))
@@ -510,9 +569,12 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/connection/write-unlock/lock", post(routes::connection::lock_connection_writes))
         .route("/connection/write-unlock/state", post(routes::connection::connection_write_unlock_state))
         .route("/connection/final-proxy-port", post(routes::connection::connection_final_proxy_port))
-        .route("/connection/test-ssh-tunnel", post(routes::connection::test_ssh_tunnel))
         .route("/connection/disconnect", post(routes::connection::disconnect_db))
         .route("/connection/check-health", post(routes::connection::check_connection_health))
+        .route("/connection/is-open", post(routes::connection::connection_is_open))
+        .route("/connection/liveness-events", get(routes::connection::connection_liveness_events))
+        .route("/connection/idle-closed-events", get(routes::connection::connection_idle_closed_events))
+        .route("/connection/prewarm", post(routes::connection::prewarm_connection))
         .route("/connection/session-credential-status", post(routes::connection::session_credential_status))
         .route("/connection/forget-session-credential", post(routes::connection::forget_session_credential))
         .route(
@@ -526,7 +588,47 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/connection/mcp/add", post(routes::connection::mcp_add_connection))
         .route("/connection/mcp/duplicate", post(routes::connection::mcp_duplicate_connection))
         .route("/connection/mcp/remove", post(routes::connection::mcp_remove_connection))
+        .route(
+            "/connection/salesforce-oauth-browser-authorize",
+            post(routes::connection::salesforce_oauth_browser_authorize),
+        )
+        .route("/connection/salesforce-oauth-device-start", post(routes::connection::salesforce_oauth_device_start))
+        .route("/connection/salesforce-oauth-device-poll", post(routes::connection::salesforce_oauth_device_poll))
+        .route("/connection/salesforce-oauth-refresh", post(routes::connection::salesforce_oauth_refresh))
+        .route("/connection/salesforce-oauth-password-login", post(routes::connection::salesforce_oauth_password_login))
+        .route("/salesforce/current-user", get(routes::connection::salesforce_current_user))
         .route("/plugins", get(routes::plugins::list_plugins))
+        .route("/plugins/trusted-keys", get(routes::plugins::list_plugin_trusted_keys))
+        .route("/plugins/trusted-keys/save", post(routes::plugins::save_plugin_trusted_key))
+        .route("/plugins/trusted-keys/remove", post(routes::plugins::remove_plugin_trusted_key))
+        .route("/plugins/repositories", get(routes::plugins::list_plugin_repositories))
+        .route("/plugins/repositories/save", post(routes::plugins::save_plugin_repository))
+        .route("/plugins/repositories/remove", post(routes::plugins::remove_plugin_repository))
+        .route("/plugins/marketplace/catalogs", get(routes::plugins::fetch_plugin_marketplace_catalogs))
+        .route("/plugins/marketplace/install", post(routes::plugins::install_marketplace_plugin))
+        .route(
+            "/plugins/install",
+            post(routes::plugins::install_plugin).layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+        )
+        .route("/plugins/rollback", post(routes::plugins::rollback_plugin))
+        .route("/plugins/uninstall", post(routes::plugins::uninstall_plugin))
+        .route("/plugins/activate", post(routes::plugins::activate_plugin))
+        .route("/plugins/active", get(routes::plugins::list_active_plugins))
+        .route("/plugins/stop", post(routes::plugins::stop_plugin))
+        .route("/plugins/invoke", post(routes::plugins::invoke_plugin))
+        .route("/plugins/connection-action", post(routes::plugins::invoke_plugin_connection_action))
+        .route("/plugins/notify", post(routes::plugins::notify_plugin))
+        .route("/plugins/binary", post(routes::plugins::send_plugin_binary))
+        .route("/plugins/filesystem/list", post(routes::plugins::list_plugin_filesystem_entries))
+        .route("/plugins/filesystem/read", post(routes::plugins::read_plugin_filesystem_file))
+        .route("/plugins/filesystem/write", post(routes::plugins::write_plugin_filesystem_file))
+        .route("/plugins/filesystem/create-directory", post(routes::plugins::create_plugin_filesystem_directory))
+        .route("/plugins/filesystem/delete", post(routes::plugins::delete_plugin_filesystem_entry))
+        .route("/plugins/filesystem/rename", post(routes::plugins::rename_plugin_filesystem_entry))
+        .route("/plugins/events", get(routes::plugins::plugin_events))
+        .route("/plugins/{pluginId}/assets/{*path}", get(routes::plugins::plugin_asset))
+        .route("/plugins/{pluginId}/ui", get(routes::plugins::plugin_ui_entry))
+        .route("/plugins/{pluginId}/ui/{*path}", get(routes::plugins::plugin_ui_asset))
         // JDBC
         .route("/jdbc/drivers", get(routes::jdbc::list_jdbc_drivers).post(routes::jdbc::import_jdbc_drivers))
         .route(
@@ -582,6 +684,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/schema/databases", get(routes::schema::list_databases))
         .route("/schema/database-metadata", get(routes::schema::list_database_metadata))
         .route("/schema/database-storage", post(routes::schema::list_database_storage))
+        .route("/schema/xugu/tablespaces", get(routes::schema::list_xugu_tablespaces))
         .route("/schema/sqlserver/completion-context", get(routes::schema::get_sqlserver_completion_context))
         .route("/schema/doris/catalogs", get(routes::schema::list_doris_catalogs))
         .route("/schema/doris/catalog-databases", get(routes::schema::list_doris_catalog_databases))
@@ -591,36 +694,62 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/schema/sqlserver/linked-server-tables", get(routes::schema::list_sqlserver_linked_server_tables))
         .route("/schema/sqlserver/column-metadata", get(routes::schema::get_sqlserver_column_metadata))
         .route("/schema/mysql/auto-increment", get(routes::schema::get_mysql_table_auto_increment))
-        .route("/schema/xugu/tablespaces", get(routes::schema::list_xugu_tablespaces))
         .route("/schema/schemas", get(routes::schema::list_schemas))
         .route("/schema/tables", get(routes::schema::list_tables))
+        .route("/schema/table-comment", get(routes::schema::get_table_comment))
         .route("/schema/objects", get(routes::schema::list_objects))
         .route("/schema/object-statistics", get(routes::schema::list_object_statistics))
         .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
         .route("/schema/completion-assistant", post(routes::schema::completion_assistant_search))
         .route("/schema/object-source", get(routes::schema::get_object_source))
         .route("/schema/event-info", get(routes::schema::get_event_info))
-        .route("/schema/reference-key-columns", get(routes::schema::list_reference_key_columns))
-        .route("/schema/reference-keys", get(routes::schema::list_reference_keys))
-        .route("/schema/table-owner", get(routes::schema::get_table_owner))
         .route("/schema/custom-type-details", get(routes::schema::get_custom_type_details))
+        .route("/schema/native-jobs/context", post(routes::native_jobs::open_context))
+        .route("/schema/native-jobs/list", post(routes::native_jobs::list))
+        .route("/schema/native-jobs/references", post(routes::native_jobs::references))
+        .route("/schema/native-jobs/read", post(routes::native_jobs::read))
+        .route("/schema/native-jobs/prepare", post(routes::native_jobs::prepare))
+        .route("/schema/native-jobs/apply", post(routes::native_jobs::apply))
+        .route("/schema/native-jobs/status", post(routes::native_jobs::status))
+        .route("/schema/native-jobs/cancel", post(routes::native_jobs::cancel))
+        .route("/schema/oracle-type-data", post(routes::schema::verify_oracle_type_data))
+        .route("/schema/oracle-type-evolution", post(routes::schema::prepare_oracle_type_evolution))
+        .route(
+            "/schema/oracle-type-management-snapshot",
+            get(routes::schema::get_oracle_type_management_snapshot)
+                .post(routes::schema::read_oracle_type_management_snapshot),
+        )
         .route("/schema/columns", get(routes::schema::list_columns))
+        .route("/plugin/table-metadata", post(routes::schema::get_plugin_table_metadata))
         .route("/schema/all-columns", get(routes::schema::get_all_columns))
         .route("/schema/data-types", get(routes::schema::list_data_types))
         .route("/schema/indexes", get(routes::schema::list_indexes))
+        .route("/schema/reference-key-columns", get(routes::schema::list_reference_key_columns))
+        .route("/schema/reference-keys", get(routes::schema::list_reference_keys))
         .route("/schema/foreign-keys", get(routes::schema::list_foreign_keys))
+        .route("/schema/foreign-keys-for-database", get(routes::schema::list_foreign_keys_for_database))
         .route("/schema/triggers", get(routes::schema::list_triggers))
         .route("/schema/constraints", get(routes::schema::list_constraints))
         .route("/schema/partitions", get(routes::schema::list_partitions))
         .route("/schema/table-partition-status", get(routes::schema::get_table_partition_status))
+        .route("/schema/table-partitioning", get(routes::schema::get_table_partitioning))
         .route("/schema/invalid-indexes", get(routes::schema::list_invalid_indexes))
         .route("/schema/subpartitions", get(routes::schema::list_subpartitions))
         .route("/schema/functions", get(routes::schema::list_functions))
+        .route("/schema/diff-routines", get(routes::schema::load_schema_diff_routines))
+        .route("/schema/routine-save", post(routes::schema::prepare_oracle_routine_save))
+        .route("/schema/routine-plan", post(routes::schema::prepare_oracle_routine_plan))
+        .route("/schema/routine-recovery", post(routes::schema::prepare_oracle_routine_recovery))
+        .route("/schema/routine-execute", post(routes::schema::execute_oracle_routine_operation))
+        .route("/schema/routine-operation", get(routes::schema::observe_oracle_routine_operation))
+        .route("/schema/routine-operation-references", post(routes::schema::update_oracle_routine_operation_references))
         .route("/schema/sequences", get(routes::schema::list_sequences))
         .route("/schema/rules", get(routes::schema::list_rules))
         .route("/schema/owners", get(routes::schema::list_owners))
+        .route("/schema/table-owner", get(routes::schema::get_table_owner))
         .route("/schema/extensions", get(routes::schema::list_extensions))
         .route("/schema/available-extensions", get(routes::schema::list_available_extensions))
+        .route("/schema/event-triggers", get(routes::schema::list_event_triggers))
         .route("/schema/ddl", get(routes::schema::get_ddl))
         .route("/docs/snapshot", post(routes::docs::collect_snapshot))
         .route("/docs/annotations/load", post(routes::docs::load_annotations))
@@ -646,6 +775,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/tab-runtime-cache/prune", post(routes::tab_runtime_cache::prune_tab_runtime_cache))
         .route("/tab-runtime-cache/owner", delete(routes::tab_runtime_cache::delete_tab_runtime_cache_owner))
         // Query
+        .merge(routes::pl_debug::router())
         .route("/query/execute", post(routes::query::execute_query))
         .route("/query/execute-conditional-update", post(routes::query::execute_conditional_update))
         .route("/query/execute-multi", post(routes::query::execute_multi))
@@ -659,11 +789,19 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/query/build-sorted-sql", post(routes::query::build_sorted_query_sql))
         .route("/query/build-explain-sql", post(routes::query::build_explain_sql))
         .route("/query/build-dropped-file-preview-sql", post(routes::query::build_dropped_file_preview_sql))
-        .route("/query/build-dml-change-preview-sql", post(routes::query::build_dml_change_preview_sql))
         .route("/query/get-explain-info", post(routes::query::get_explain_info))
+        .route("/query/plugin-plan-capabilities", post(routes::query::get_plugin_plan_capabilities))
+        .route("/query/plugin-estimated-plan", post(routes::query::get_plugin_estimated_plan))
+        .route("/plugin/data/query", post(routes::query::query_plugin_data))
+        .route("/plugin/data/grants", post(routes::query::get_plugin_data_grants))
+        .route("/plugin/data/grant", post(routes::query::set_plugin_data_grant))
         .route("/query/build-create-user-sql", post(routes::query::build_create_user_sql))
         .route("/query/build-table-select-sql", post(routes::query::build_table_select_sql))
         .route("/query/build-database-search-sql", post(routes::query::build_database_search_sql))
+        .route("/query/build-database-search-columns-sql", post(routes::query::build_database_search_columns_sql))
+        .route("/query/build-database-search-probe-sql", post(routes::query::build_database_search_probe_sql))
+        .route("/query/build-database-structure-search-sql", post(routes::query::build_database_structure_search_sql))
+        .route("/query/supports-database-structure-search", post(routes::query::supports_database_structure_search))
         .route("/query/build-search-result-where", post(routes::query::build_search_result_where))
         .route("/query/build-rename-object-sql", post(routes::query::build_rename_object_sql))
         .route("/query/build-rename-database-sql", post(routes::query::build_rename_database_sql))
@@ -683,19 +821,37 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/query/build-drop-schema-sql", post(routes::query::build_drop_schema_sql))
         .route("/query/build-duplicate-table-structure-sql", post(routes::query::build_duplicate_table_structure_sql))
         .route("/query/build-copy-table-data-sql", post(routes::query::build_copy_table_data_sql))
+        .route("/query/build-oracle-type-management-sql", post(routes::query::build_oracle_type_management_sql))
         .route(
             "/query/build-executable-object-source-statements",
             post(routes::query::build_executable_object_source_statements),
         )
+        .route(
+            "/query/validate-oracle-executable-object-source",
+            post(routes::query::validate_oracle_executable_object_source),
+        )
+        .route("/query/prepare-oracle-trigger-sql", post(routes::query::prepare_oracle_trigger_sql))
+        .route(
+            "/query/fingerprint-oracle-routine-object-source",
+            post(routes::query::fingerprint_oracle_routine_object_source),
+        )
         .route("/query/build-executable-object-source-sql", post(routes::query::build_executable_object_source_sql))
         .route("/query/build-editable-object-source", post(routes::query::build_editable_object_source))
+        .route("/query/build-oracle-object-export-sql", post(routes::query::build_oracle_object_export_sql))
         .route(
             "/query/build-routine-rename-object-source-statements",
             post(routes::query::build_routine_rename_object_source_statements),
         )
+        .route("/query/rewrite-oracle-routine-references", post(routes::query::rewrite_oracle_routine_references))
+        .route("/query/rewrite-oracle-table-references", post(routes::query::rewrite_oracle_table_references))
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
+        .route("/query/parse-oracle-object-name", post(routes::query::parse_oracle_object_name))
+        .route("/query/build-oracle-view-rename-source", post(routes::query::build_oracle_view_rename_source))
+        .route("/query/review-oracle-view-rename-source", post(routes::query::review_oracle_view_rename_source))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
         .route("/query/build-table-owner-change-sql", post(routes::query::build_table_owner_change_sql))
+        .route("/query/build-table-partition-operation-sql", post(routes::query::build_table_partition_operation_sql))
+        .route("/query/build-create-partitioned-table-sql", post(routes::query::build_create_partitioned_table_sql))
         .route(
             "/query/preview-sqlite-table-structure-change",
             post(routes::query::preview_sqlite_table_structure_change),
@@ -719,6 +875,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
             "/query/build-data-grid-copy-insert-statement",
             post(routes::query::build_data_grid_copy_insert_statement),
         )
+        .route("/query/build-dml-change-preview-sql", post(routes::query::build_dml_change_preview_sql))
         .route(
             "/query/build-data-grid-context-filter-condition",
             post(routes::query::build_data_grid_context_filter_condition),
@@ -751,15 +908,23 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/query/cancel", post(routes::query::cancel_query))
         .route("/query/cancel-conditional-update", post(routes::query::cancel_conditional_update))
         .route("/query/close-session", post(routes::query::close_query_session))
+        .route("/query/large-value/chunk", post(routes::query::read_large_value_chunk))
+        .route("/query/large-value/release", post(routes::query::release_large_value))
+        .route("/query/large-value/download", post(routes::query::prepare_large_value_download))
+        .route("/query/large-value/export", post(routes::query::prepare_snapshot_export))
+        .route("/query/large-value/download/{id}", get(routes::query::download_large_value))
         .route("/query/close-client-session", post(routes::query::close_client_connection_session))
         .route("/export/query-result-json", post(routes::text_export::export_query_result_json))
         .route("/export/query-result-markdown", post(routes::text_export::export_query_result_markdown))
+        .route("/export/query-result-html", post(routes::text_export::export_query_result_html))
         // Redis
         .route("/redis/list-databases", post(routes::redis::list_databases))
         .route("/redis/scan-keys", post(routes::redis::scan_keys))
         .route("/redis/scan-keys-batch", post(routes::redis::scan_keys_batch))
+        .route("/redis/key-metadata-batch", post(routes::redis::key_metadata_batch))
         .route("/redis/scan-values", post(routes::redis::scan_values))
         .route("/redis/get-value", post(routes::redis::get_value))
+        .route("/redis/get-raw-value", post(routes::redis::get_raw_value))
         .route("/redis/get-ttl", post(routes::redis::get_ttl))
         .route("/redis/get-stream-entries", post(routes::redis::get_stream_entries))
         .route("/redis/get-stream-groups", post(routes::redis::get_stream_groups))
@@ -786,7 +951,10 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/redis/check-json-module", post(routes::redis::check_json_module))
         .route("/redis/set-ttl", post(routes::redis::set_ttl))
         .route("/redis/set-expire-at", post(routes::redis::set_expire_at))
+        .route("/redis/set-keys-ttl", post(routes::redis::set_keys_ttl))
+        .route("/redis/set-keys-expire-at", post(routes::redis::set_keys_expire_at))
         .route("/redis/delete-keys", post(routes::redis::delete_keys))
+        .route("/redis/delete-keys-by-pattern", post(routes::redis::delete_keys_by_pattern))
         .route("/redis/flush-db", post(routes::redis::flush_db))
         .route("/redis/execute-command", post(routes::redis::execute_command))
         .route("/redis/pubsub/publish", post(routes::redis::publish_message))
@@ -977,8 +1145,8 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         // MongoDB
         .route("/mongo/list-databases", post(routes::mongo::list_databases))
         .route("/mongo/list-collections", post(routes::mongo::list_collections))
-        .route("/vector/collection-detail", post(routes::vector::collection_detail))
         .route("/mongo/vector-collection-detail", post(routes::vector::collection_detail))
+        .route("/vector/collection-detail", post(routes::vector::collection_detail))
         .route("/vector/drop-database", post(routes::vector::drop_database))
         .route("/vector/drop-collection", post(routes::vector::drop_collection))
         .route("/vector/rename-collection", post(routes::vector::rename_collection))
@@ -1022,6 +1190,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/document-store/meilisearch/settings/update", post(routes::document_store::meilisearch_update_settings))
         .route("/document-store/meilisearch/stats", post(routes::document_store::meilisearch_get_stats))
         .route("/document-store/meilisearch/overview", post(routes::document_store::meilisearch_get_overview))
+        .route("/document-store/meilisearch/index/create", post(routes::document_store::meilisearch_create_index))
         .route("/document-store/meilisearch/index/delete", post(routes::document_store::meilisearch_delete_index))
         .route(
             "/document-store/meilisearch/system/overview",
@@ -1058,11 +1227,47 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/mongo/insert-documents", post(routes::mongo::insert_documents))
         .route("/mongo/update-document", post(routes::mongo::update_document))
         .route("/mongo/update-documents", post(routes::mongo::update_documents))
+        .route("/mongo/replace-document", post(routes::mongo::replace_document))
+        .route("/mongo/bulk-write", post(routes::mongo::bulk_write))
         .route("/mongo/delete-document", post(routes::mongo::delete_document))
         .route("/mongo/delete-documents", post(routes::mongo::delete_documents))
         .route("/mongo/find-one-and-update", post(routes::mongo::find_one_and_update))
         .route("/mongo/find-one-and-replace", post(routes::mongo::find_one_and_replace))
         .route("/mongo/find-one-and-delete", post(routes::mongo::find_one_and_delete))
+        .route(
+            "/mongo/import/preview",
+            post(routes::mongodb_import_export::preview_import).layer(DefaultBodyLimit::max(
+                routes::table_import::import_request_body_limit_for_upload(web_body_limit_bytes()),
+            )),
+        )
+        .route("/mongo/import/preview-source", post(routes::mongodb_import_export::preview_uploaded_import))
+        .route("/mongo/import/source/release", post(routes::mongodb_import_export::release_import_source))
+        .route("/mongo/import/execute", post(routes::mongodb_import_export::execute_import))
+        .route("/mongo/import/progress/{importId}", get(routes::mongodb_import_export::import_progress))
+        .route("/mongo/import/cancel", post(routes::mongodb_import_export::cancel_import))
+        .route("/mongo/export", post(routes::mongodb_import_export::start_export))
+        .route("/mongo/export/progress/{exportId}", get(routes::mongodb_import_export::export_progress))
+        .route("/mongo/export/download/{exportId}", get(routes::mongodb_import_export::export_download))
+        .route("/mongo/export/cancel", post(routes::mongodb_import_export::cancel_export))
+        .route("/mongo/dump/catalog", post(routes::mongodb_dump::catalog))
+        .route(
+            "/mongo/dump/source",
+            post(routes::mongodb_dump::prepare_source).layer(DefaultBodyLimit::max(
+                routes::table_import::import_request_body_limit_for_upload(web_body_limit_bytes()),
+            )),
+        )
+        .route("/mongo/dump/source/release", post(routes::mongodb_dump::release_source))
+        .route("/mongo/dump/upload-limit", get(routes::mongodb_dump::upload_limit))
+        .route(
+            "/mongo/dump/source/upload",
+            post(routes::mongodb_dump::upload_restore_source).layer(DefaultBodyLimit::max(
+                routes::table_import::import_request_body_limit_for_upload(web_body_limit_bytes()),
+            )),
+        )
+        .route("/mongo/dump/export", post(routes::mongodb_dump::start_dump))
+        .route("/mongo/dump/restore", post(routes::mongodb_dump::start_restore))
+        .route("/mongo/dump/progress/{taskId}", get(routes::mongodb_dump::progress))
+        .route("/mongo/dump/cancel", post(routes::mongodb_dump::cancel))
         // History
         .route("/history", get(routes::history::load_history).delete(routes::history::clear_history))
         .route("/history/save", post(routes::history::save_history))
@@ -1078,6 +1283,7 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
             "/saved-sql/{id}",
             get(routes::saved_sql::load_saved_sql_file).delete(routes::saved_sql::delete_saved_sql_file),
         )
+        .route("/saved-sql/{id}/default-content", post(routes::saved_sql::save_default_query_content))
         .route("/saved-sql/folders", post(routes::saved_sql::save_saved_sql_folder))
         .route("/saved-sql/folders/{id}", delete(routes::saved_sql::delete_saved_sql_folder))
         // AI
@@ -1096,6 +1302,12 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/ai/stream", post(routes::ai::ai_stream))
         .route("/ai/agent-stream", post(routes::ai::ai_agent_stream))
         .route("/ai/cancel-stream", post(routes::ai::ai_cancel_stream))
+        .route("/ai/tool-approval", post(routes::ai::ai_resolve_tool_approval))
+        .route(
+            "/ai/plugin-tools/plugins",
+            get(routes::ai::get_ai_plugin_tool_plugins).post(routes::ai::set_ai_plugin_tool_plugin_enabled),
+        )
+        .route("/ai/plugin-tools/preview", post(routes::ai::preview_plugin_ai_tools))
         .route("/ai/test-connection", post(routes::ai::ai_test_connection))
         .route("/ai/models", post(routes::ai::ai_list_models))
         .route("/ai/model-effort", post(routes::ai::ai_resolve_model_effort))
@@ -1112,6 +1324,9 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         // Transfer
         .route("/transfer/start", post(routes::transfer::start_transfer))
         .route("/transfer/ownership-preview", post(routes::transfer::preview_transfer_ownership))
+        .route("/task-runs", get(routes::task_history::list_task_runs))
+        .route("/task-runs/{run_id}", get(routes::task_history::get_task_run))
+        .route("/task-runs/{run_id}/items", get(routes::task_history::list_task_run_items))
         .route("/transfer/progress/{transferId}", get(routes::transfer::transfer_progress))
         .route("/transfer/cancel", post(routes::transfer::cancel_transfer))
         .route("/transfer/sort-tables-by-fk", post(routes::transfer::sort_tables_by_fk_dependency))
@@ -1140,11 +1355,19 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route(
             "/sql-file/preview",
             post(routes::sql_file::preview_sql_file)
-                .layer(DefaultBodyLimit::max(routes::sql_file::SQL_FILE_UPLOAD_MAX_BYTES.saturating_add(1024 * 1024))),
+                // Upper bound only; the effective (possibly lower) limit configured via
+                // Settings > SQL File Size is enforced inside the handler at request time.
+                .layer(DefaultBodyLimit::max(routes::sql_file::sql_file_upload_hard_cap_bytes())),
         )
         .route("/sql-file/execute", post(routes::sql_file::execute_sql_file))
+        .route("/sql-file/preview/refresh", post(routes::sql_file::refresh_sql_file_preview))
+        .route("/sql-file/preview/release", post(routes::sql_file::release_sql_file_preview))
+        .route("/sql-file/tables", post(routes::sql_file::inspect_sql_file_tables))
         .route("/sql-file/progress/{executionId}", get(routes::sql_file::sql_file_progress))
         .route("/sql-file/cancel", post(routes::sql_file::cancel_sql_file))
+        .route("/sql-file/failure-log/text", post(routes::sql_file::sql_file_failure_log_text))
+        .route("/sql-file/failure-log/{executionId}", get(routes::sql_file::sql_file_failure_log_download))
+        .route("/sql-file/failure-log/{executionId}/info", get(routes::sql_file::sql_file_failure_log_info))
         // Table import
         .route(
             "/import/preview",
@@ -1161,8 +1384,18 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         .route("/version", get(routes::update::get_version))
         .route("/update/check", get(routes::update::check_for_updates))
         .route("/changelog", get(routes::update::fetch_changelog))
+        .route("/changelog/index", get(routes::update::fetch_changelog_index))
+        .route("/changelog/releases/{tag}", get(routes::update::fetch_changelog_release))
         // Layout
         .route("/layout/sidebar", post(routes::layout::save_sidebar_layout).get(routes::layout::load_sidebar_layout))
+        .route(
+            "/layout/table-vgroups",
+            post(routes::layout::save_table_vgroups).get(routes::layout::load_table_vgroups),
+        )
+        .route(
+            "/layout/table-vgroups/connection/{connection_id}",
+            delete(routes::layout::delete_table_vgroups_for_connection),
+        )
         // App settings
         .route(
             "/app-settings/pinned-tree-node-ids",
@@ -1173,9 +1406,36 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
             get(routes::app_settings::load_mcp_global_policy).put(routes::app_settings::save_mcp_global_policy),
         )
         .route(
+            "/app-settings/web-login-captcha",
+            get(routes::app_settings::load_web_login_captcha).put(routes::app_settings::save_web_login_captcha),
+        )
+        .route("/app-settings/mcp-tool-catalog", get(routes::app_settings::load_mcp_tool_catalog))
+        .route("/app-settings/mcp-access-policy", get(routes::app_settings::load_mcp_access_policy))
+        .route("/app-settings/mcp-access-policy/recover", post(routes::app_settings::reset_invalid_mcp_access_policy))
+        .route("/app-settings/mcp-access-policy/plugin-scope", put(routes::app_settings::set_mcp_plugin_scope_rule))
+        .route("/app-settings/plugin-mcp", get(routes::app_settings::list_plugin_mcp_views))
+        .route("/app-settings/plugin-mcp/view", post(routes::app_settings::load_plugin_mcp_view))
+        .route("/app-settings/plugin-mcp/scopes", post(routes::app_settings::list_plugin_mcp_scopes))
+        .route("/app-settings/plugin-mcp/grant", put(routes::app_settings::save_plugin_mcp_grant))
+        .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
+        .route("/app-settings/mcp-http", put(routes::app_settings::save_web_mcp_http_settings))
+        .route("/app-settings/mcp-http/rotate-token", post(routes::app_settings::rotate_web_mcp_token))
+        .route("/app-settings/web-capabilities", get(routes::app_settings::load_web_capabilities))
+        .route(
             "/app-settings/max-agent-turns",
             get(routes::app_settings::load_max_agent_turns).put(routes::app_settings::save_max_agent_turns),
         )
+        .route(
+            "/app-settings/history-retention-limit",
+            get(routes::app_settings::load_history_retention_limit)
+                .put(routes::app_settings::save_history_retention_limit),
+        )
+        .route(
+            "/app-settings/mcp-history-retention-limit",
+            get(routes::app_settings::load_mcp_history_retention_limit)
+                .put(routes::app_settings::save_mcp_history_retention_limit),
+        )
+        .route("/app-settings/mcp-history-retention-cleanup", post(routes::app_settings::cleanup_mcp_history_retention))
         .route(
             "/app-settings/max-retries",
             get(routes::app_settings::load_max_retries).put(routes::app_settings::save_max_retries),
@@ -1186,7 +1446,6 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
                 .put(routes::app_settings::save_sql_file_upload_max_mb),
         )
         .route("/app-settings/config/decrypt", post(routes::app_settings::decrypt_config))
-        .route("/app-settings/mcp-http-status", get(routes::app_settings::load_web_mcp_http_status))
         // Cloud sync
         .route("/cloud-sync/webdav/test", post(routes::cloud_sync::webdav_sync_test))
         .route("/cloud-sync/webdav/password-status", post(routes::cloud_sync::webdav_password_status))
@@ -1202,15 +1461,21 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
             post(routes::cloud_sync::forget_webdav_sync_secrets_passphrase),
         )
         .route("/cloud-sync/webdav/upload", post(routes::cloud_sync::webdav_sync_upload))
+        .route("/cloud-sync/catalog/local", post(routes::cloud_sync::cloud_sync_local_catalog))
+        .route("/cloud-sync/webdav/inspect", post(routes::cloud_sync::webdav_sync_inspect))
         .route("/cloud-sync/webdav/download", post(routes::cloud_sync::webdav_sync_download))
         .route("/cloud-sync/snippet/test", post(routes::cloud_sync::snippet_sync_test))
         .route("/cloud-sync/snippet/token-status", post(routes::cloud_sync::snippet_token_status))
         .route("/cloud-sync/snippet/save-token", post(routes::cloud_sync::save_snippet_saved_token))
         .route("/cloud-sync/snippet/forget-token", post(routes::cloud_sync::forget_snippet_saved_token))
+        .route("/cloud-sync/snippet/passphrase-status", post(routes::cloud_sync::snippet_passphrase_status))
+        .route("/cloud-sync/snippet/save-passphrase", post(routes::cloud_sync::save_snippet_saved_passphrase))
+        .route("/cloud-sync/snippet/forget-passphrase", post(routes::cloud_sync::forget_snippet_saved_passphrase))
         .route("/cloud-sync/snippet/settings", post(routes::cloud_sync::snippet_sync_settings))
         .route("/cloud-sync/snippet/save-id", post(routes::cloud_sync::save_snippet_sync_id))
         .route("/cloud-sync/snippet/retry-legacy-cleanup", post(routes::cloud_sync::retry_snippet_legacy_cleanup))
         .route("/cloud-sync/snippet/upload", post(routes::cloud_sync::snippet_sync_upload))
+        .route("/cloud-sync/snippet/inspect", post(routes::cloud_sync::snippet_sync_inspect))
         .route("/cloud-sync/snippet/download", post(routes::cloud_sync::snippet_sync_download));
 
     // Do not expose DuckDB-only handlers from builds that omit DuckDB sidecar support.
@@ -1219,15 +1484,19 @@ pub async fn run_server_with_shutdown(shutdown: CancellationToken) {
         api.route("/query/build-duckdb-attach-database-sql", post(routes::query::build_duckdb_attach_database_sql));
 
     let api = add_mq_routes(api)
+        .layer(middleware::from_fn_with_state(web_state.clone(), migration_gate))
+        .layer(middleware::from_fn_with_state(web_state.clone(), demo::demo_mode_gate))
         .layer(middleware::from_fn_with_state(web_state.clone(), auth::auth_middleware))
         .with_state(web_state.clone());
+
+    // Build app
 
     // MCP Streamable HTTP server (native MCP over the same local port)
     let mcp_session_manager = Arc::new(LocalSessionManager::default());
     let mcp_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(["127.0.0.1", "localhost", "0.0.0.0"])
         .with_json_response(true)
-        .with_stateful_mode(false);
+        .with_legacy_session_mode(false);
     let mcp_service = StreamableHttpService::new(
         move || -> std::io::Result<DbxMcpServer> { Ok(DbxMcpServer::new(mcp_backend.clone())) },
         mcp_session_manager,
@@ -1500,4 +1769,44 @@ mod tests {
         server.abort();
         std::fs::remove_dir_all(static_dir).expect("remove static directory");
     }
+}
+
+fn password_viewer_enabled_from_env(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+async fn storage_migration_ready(app: &Arc<AppState>) -> bool {
+    app.storage.inspect_data_migration().await.map(|status| status.is_ready()).unwrap_or(false)
+}
+
+fn web_mcp_startup_error(error: String) -> String {
+    format!("Failed to start DBX Web: invalid Web MCP configuration: {error}")
+}
+
+/// Login/setup payloads are one password field; 64 KiB is generous.
+const AUTH_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
+async fn migration_gate(
+    state: axum::extract::State<Arc<WebState>>,
+    request: Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let suffix = auth::middleware_api_path_suffix(request.uri().path(), &state.public_base_path);
+    let allowed = suffix.is_some_and(|path| {
+        matches!(
+            path,
+            "migration/status" | "migration/start" | "migration/retry" | "migration/cleanup-backups" | "ping"
+        ) || path.starts_with("auth/")
+    });
+    if !allowed && !state.migration_ready.load(Ordering::Acquire) {
+        return (
+            StatusCode::LOCKED,
+            axum::Json(serde_json::json!({
+                "code": "DATA_MIGRATION_REQUIRED",
+                "message": "Complete the data security migration before using DBX"
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
 }

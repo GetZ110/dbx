@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	rmq "github.com/apache/rocketmq-clients/golang/v5"
 )
 
 const maxRPCMessageBytes = 32 * 1024 * 1024
@@ -30,12 +32,16 @@ type rpcResponse struct {
 
 // main 是普通可执行入口（stdio 版 agent）。
 func main() {
+func main() {
 	runStdioAgent()
 }
 
 // runStdioAgent 跑 stdin/stdout 的 JSON-RPC 循环。
 // OHOS 的 native child process 版本会先把传入的 fd dup2 到 0/1 再调用它。
 func runStdioAgent() {
+	// stdout carries JSON-RPC exclusively, regardless of the parent environment.
+	_ = os.Setenv(rmq.ENABLE_CONSOLE_APPENDER, "false")
+	rmq.ResetLogger()
 	agent := newRocketMQAgent()
 	defer agent.close()
 

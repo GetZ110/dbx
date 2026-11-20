@@ -39,6 +39,7 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
   const detailValueDiffSnapshot = ref<Readonly<JsonValueDiffSnapshot> | null>(null);
   let allowActiveCellDetailResync = false;
   let lastSyncedDetailCellKey: string | null = null;
+  let detailEditGeneration = 0;
 
   const hasPendingDetailEditorDraft = computed(() => isEditingDetail.value && detailEditValue.value !== detailEditOriginalValue.value);
   const detailJsonDiffContext = computed<JsonValueDiffContext | null>(() => {
@@ -79,7 +80,19 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
     return editorText(detail.value, detail.colIndex);
   }
 
+  /**
+   * Structured values open in the value editor as a pretty-printed draft
+   * (issue #12416). The baseline is formatted too, so an untouched draft still
+   * commits the stored raw text — `commitDetailEdit` falls back to
+   * `detail.value` while the draft matches its baseline.
+   */
+  function autoFormattedEditorText(value: string, columnType?: string): string {
+    if (!canFormatCellDetailJson(value, columnType)) return value;
+    return formatJsonText(value) ?? value;
+  }
+
   function resetDetailEdit() {
+    detailEditGeneration += 1;
     isEditingDetail.value = false;
     detailEditValue.value = "";
     detailEditOriginalValue.value = "";
@@ -109,23 +122,26 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
     lastSyncedDetailCellKey = cellKey;
     if (isSameCellStillEditing && !allowActiveCellDetailResync) return;
     allowActiveCellDetailResync = false;
-    const value = editorText(detail.value, detail.colIndex);
+    const value = autoFormattedEditorText(editorText(detail.value, detail.colIndex), detail.type);
     detailEditValue.value = value;
     detailEditOriginalValue.value = value;
     syncEditorFromDetailEdit();
     isEditingDetail.value = true;
   });
 
-  async function startDetailEdit() {
+  async function startDetailEdit(generation = detailEditGeneration) {
     const initialDetail = options.activeDetail.value;
     if (!initialDetail || !initialDetail.isEditable) return;
+    const initialCellKey = `${initialDetail.rowId}:${initialDetail.colIndex}`;
     if (!(await options.hydrateLargeValueCell(initialDetail.rowId, initialDetail.colIndex))) return;
+    if (generation !== detailEditGeneration) return;
     const detail = options.activeDetail.value;
-    if (!detail || !detail.isEditable) return;
+    if (!detail || !detail.isEditable || `${detail.rowId}:${detail.colIndex}` !== initialCellKey) return;
     options.warnFormattedJsonEdit(detail);
-    const value = activeDetailEditorText(detail);
+    const value = autoFormattedEditorText(activeDetailEditorText(detail), detail.type);
     detailEditValue.value = value;
     detailEditOriginalValue.value = value;
+    syncEditorFromDetailEdit();
     isEditingDetail.value = true;
   }
 
@@ -198,6 +214,15 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
     options.warnFormattedJsonEdit(detail, true);
   }
 
+  // 与 formatValueEditorJson 相同的草稿格式化，但不弹「正在编辑格式化后的 JSON」
+  // 提示：用户是在单元格详情面板里主动点「格式化 JSON」展开草稿（issue #9832）。
+  function formatDetailJsonDraft() {
+    const detail = options.activeDetail.value;
+    if (!detail || !canFormatCellDetailJson(detailEditValue.value, detail.type)) return;
+    detailEditValue.value = formatJsonText(detailEditValue.value) ?? detailEditValue.value;
+    syncEditorFromDetailEdit();
+  }
+
   function compactDetailJson() {
     const detail = options.activeDetail.value;
     if (!detail || !canFormatCellDetailJson(detailEditValue.value, detail.type)) return;
@@ -245,6 +270,7 @@ export function useDataGridCellDetailEdit(options: UseDataGridCellDetailEditOpti
     restoreDetailOriginalValue,
     setValueEditorNull,
     formatValueEditorJson,
+    formatDetailJsonDraft,
     compactDetailJson,
     openDetailJsonCompare,
     setDetailNull,
